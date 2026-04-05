@@ -9,15 +9,19 @@ use std::{
 use tokio::{select, sync::mpsc::UnboundedSender, time::interval};
 use tracing::{error, warn};
 
-pub async fn fetch_depth_snapshot(symbol: &str) -> Result<String, reqwest::Error> {
-    reqwest::Client::new()
+pub async fn fetch_depth_snapshot(
+    client: &reqwest::Client,
+    symbol: &str,
+) -> Result<bytes::Bytes, reqwest::Error> {
+    client
         .get(format!(
-            "https://api.binance.com/api/v3/depth?symbol={symbol}&limit=1000"
+            "https://api.binance.com/api/v3/depth?symbol={}&limit=1000",
+            symbol.to_uppercase()
         ))
         .header("Accept", "application/json")
         .send()
         .await?
-        .text()
+        .bytes()
         .await
 }
 

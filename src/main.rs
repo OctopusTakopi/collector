@@ -130,5 +130,6 @@ async fn main() -> Result<(), anyhow::Error> {
         }
     }
     // let _ = handle.await;
+    writer.close();
     Ok(())
 }

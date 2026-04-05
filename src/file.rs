@@ -1,41 +1,40 @@
 use std::{collections::HashMap, fs::File, io, io::Write};
 
 use bytes::BufMut;
-use flate2::{Compression, write::GzEncoder};
 use jiff::Timestamp;
-use tracing::info;
+use tracing::{error, info, warn};
+use zstd::stream::write::Encoder as ZstdEncoder;
 
 pub struct RotatingFile {
     next_rotation: i64,
     path: String,
-    file: Option<GzEncoder<File>>,
+    file: Option<ZstdEncoder<'static, File>>,
     buf: bytes::BytesMut,
 }
 
 impl RotatingFile {
-    fn create(timestamp: Timestamp, path: &str) -> Result<(GzEncoder<File>, i64), io::Error> {
+    fn create(
+        timestamp: Timestamp,
+        path: &str,
+    ) -> Result<(ZstdEncoder<'static, File>, i64), io::Error> {
         let zoned = timestamp.to_zoned(jiff::tz::TimeZone::UTC);
         let date_str = zoned.date().strftime("%Y%m%d");
         let file = File::options()
             .create(true)
-            .write(true)
-            .open(format!("{path}_{date_str}.gz"))?;
+            .append(true)
+            .open(format!("{path}_{date_str}.zst"))?;
 
-        // Calculate next rotation time (midnight UTC of the next day)
         let next_rotation = zoned
             .date()
             .tomorrow()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+            .map_err(io::Error::other)?
             .at(0, 0, 0, 0)
             .to_zoned(jiff::tz::TimeZone::UTC)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+            .map_err(io::Error::other)?
             .timestamp()
             .as_nanosecond();
 
-        Ok((
-            GzEncoder::new(file, Compression::fast()),
-            next_rotation as i64,
-        ))
+        Ok((ZstdEncoder::new(file, 1)?, next_rotation as i64))
     }
 
     pub fn new(timestamp: Timestamp, path: String) -> Result<Self, io::Error> {
@@ -48,11 +47,23 @@ impl RotatingFile {
         })
     }
 
+    pub fn finalize(&mut self) -> io::Result<()> {
+        let Some(encoder) = self.file.take() else {
+            return Ok(());
+        };
+
+        match encoder.finish() {
+            Ok(file) => file.sync_all(),
+            Err(error) => Err(error),
+        }
+    }
+
     pub fn write(&mut self, timestamp: Timestamp, data: bytes::Bytes) -> Result<(), io::Error> {
         let ts_nanos = timestamp.as_nanosecond();
         if ts_nanos >= self.next_rotation as i128 {
-            let file = self.file.take().unwrap();
-            let _ = file.finish();
+            if let Err(error) = self.finalize() {
+                error!(path = %self.path, %error, "failed to finalize file on rotation");
+            }
             let (new_file, next_rotation) = Self::create(timestamp, &self.path)?;
             self.file = Some(new_file);
             self.next_rotation = next_rotation;
@@ -74,8 +85,8 @@ impl RotatingFile {
 
 impl Drop for RotatingFile {
     fn drop(&mut self) {
-        if let Some(file) = self.file.take() {
-            let _ = file.finish();
+        if let Err(error) = self.finalize() {
+            warn!(path = %self.path, %error, "failed to finalize file on drop");
         }
     }
 }
@@ -109,5 +120,15 @@ impl Writer {
             self.files.insert(symbol.to_string(), rotating_file);
         }
         Ok(())
+    }
+
+    pub fn close(&mut self) {
+        for (symbol, file) in &mut self.files {
+            match file.finalize() {
+                Ok(()) => info!(symbol = %symbol, "file closed cleanly"),
+                Err(error) => error!(symbol = %symbol, %error, "failed to close file"),
+            }
+        }
+        self.files.clear();
     }
 }
