@@ -21,13 +21,13 @@ tokio-rustls = "0.26"
 webpki-roots = "1.0"
 http-body-util = "0.1"
 futures-util = "0.3.32"
-serde_json_borrow = "0.9.0"
 hyper = { version = "1.10", features = ["full"] }
 tokio = { version = "1.52", features = ["full"] }
 reqwest = { version = "0.13", features = ["json"] }
 clap = { version = "4.6.2", features = ["derive"] }
 hyper-util = { version = "0.1", features = ["full"] }
 serde = { version = "1.0.228", features = ["derive"] }
+serde_json = { version = "1.0", features = ["raw_value"] }
 zstd = "0.13"
 tracing-subscriber = { version = "0.3.23", features = [] }
 fastwebsockets = { version = "0.10.0", features = ["upgrade", "unstable-split"] }
@@ -42,3 +42,6 @@ strip = true
 panic = "abort"
 incremental = false
 codegen-units = 1
+
+[dev-dependencies]
+tokio = { version = "1.52", features = ["full", "test-util"] }

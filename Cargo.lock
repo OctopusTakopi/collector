@@ -244,7 +244,7 @@ dependencies = [
  "reqwest",
  "rustls",
  "serde",
- "serde_json_borrow",
+ "serde_json",
  "sha2",
  "thiserror 2.0.18",
  "tokio",
@@ -1548,16 +1548,6 @@ dependencies = [
  "serde",
  "serde_core",
  "zmij",
-]
-
-[[package]]
-name = "serde_json_borrow"
-version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2780994ebdf8677793192229715c7f5d9dd4c37cefc7fb760b9418903ffb5c34"
-dependencies = [
- "serde",
- "serde_json",
 ]
 
 [[package]]

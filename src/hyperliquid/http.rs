@@ -5,97 +5,150 @@ use std::{
 };
 
 use anyhow::Error;
-use fastwebsockets::{Frame, OpCode, Payload};
+use fastwebsockets::OpCode;
 use jiff::Timestamp;
-use tokio::{select, sync::mpsc::UnboundedSender};
-use tracing::{error, info, warn};
+use tokio::{select, sync::mpsc::Sender, time::timeout};
+use tracing::{debug, error, info, warn};
 
-pub async fn connect(
-    url: &str,
-    subscriptions: Vec<String>,
-    ws_tx: UnboundedSender<(Timestamp, bytes::Bytes)>,
-) -> Result<(), anyhow::Error> {
-    let mut ws = crate::ws::connect(url).await?;
-    println!("connected:");
-    for text in subscriptions {
-        println!("sub: {text}");
-        ws.write_frame(Frame::text(Payload::Owned(text.into_bytes())))
-            .await?;
-    }
+use crate::ws::{self, Delivery, FrameSender, Overflow};
 
-    let mut ping_interval = tokio::time::interval(Duration::from_secs(30));
+const PING_INTERVAL: Duration = Duration::from_secs(30);
+/// Every ping is answered with a `{"channel":"pong"}` frame, so the socket is
+/// never silent for two ping periods unless it is dead.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+/// Hyperliquid allows 2000 outgoing websocket messages per minute; 35 ms
+/// between subscribe frames stays comfortably under that.
+const SUBSCRIBE_PACE: Duration = Duration::from_millis(35);
+
+/// The subscriptions and the ping timer both live off the read path.
+///
+/// Sending 1000 paced subscriptions inline before the first read would leave
+/// the socket unread for ~35 s, skewing every receive timestamp in that window
+/// and letting the kernel buffer back up. Running them here means data is being
+/// read from the very first frame.
+async fn control_loop(sender: FrameSender, subscriptions: Vec<String>) {
+    let mut ping_interval = tokio::time::interval(PING_INTERVAL);
+    ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut pacer = tokio::time::interval(SUBSCRIBE_PACE);
+    pacer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut to_send = subscriptions.into_iter();
 
     loop {
         select! {
             _ = ping_interval.tick() => {
-                let ping_msg = r#"{"method":"ping"}"#;
-                // use Owned because Payload::Borrowed needs lifetime same as string
-                ws.write_frame(Frame::text(Payload::Owned(ping_msg.as_bytes().to_vec()))).await?;
+                if sender.text(br#"{"method":"ping"}"#.to_vec()).await.is_err() {
+                    return;
+                }
             }
-            frame_res = ws.read_frame() => {
-                match frame_res {
-                    Ok(frame) => {
-                        match frame.opcode {
-                            OpCode::Text => {
-                                let recv_time = Timestamp::now();
-                                let data = match frame.payload {
-                                    Payload::Owned(v) => bytes::Bytes::from(v),
-                                    Payload::Borrowed(v) => bytes::Bytes::copy_from_slice(v),
-                                    Payload::BorrowedMut(v) => bytes::Bytes::copy_from_slice(v),
-                                    Payload::Bytes(v) => v.freeze(),
-                                };
-                                if ws_tx.send((recv_time, data)).is_err() {
-                                    break;
-                                }
-                            }
-                            OpCode::Close => {
-                                warn!("connection closed");
-                                return Err(Error::from(io::Error::new(
-                                    ErrorKind::ConnectionAborted,
-                                    "connection closed",
-                                )));
-                            }
-                            _ => {}
-                        }
-                    }
-                    Err(e) => {
-                         return Err(Error::from(e));
-                    }
+            _ = pacer.tick() => {
+                let Some(text) = to_send.next() else {
+                    continue;
+                };
+                debug!(%text, "sending subscription");
+                if sender.text(text.into_bytes()).await.is_err() {
+                    return;
                 }
             }
         }
     }
-    Ok(())
+}
+
+pub async fn connect(
+    url: &str,
+    subscriptions: Vec<String>,
+    ws_tx: Sender<(Timestamp, bytes::Bytes)>,
+) -> Result<(), anyhow::Error> {
+    let mut conn = ws::connect(url).await?;
+    let sender = conn.sender();
+    let mut overflow = Overflow::new("hyperliquid");
+
+    let control = control_loop(sender.clone(), subscriptions);
+    tokio::pin!(control);
+
+    loop {
+        // `read` is not cancel-safe, so every arm racing it must be terminal.
+        let message = select! {
+            biased;
+            _ = &mut control => {
+                return Err(anyhow::anyhow!("websocket writer stopped"));
+            }
+            result = timeout(IDLE_TIMEOUT, conn.read()) => match result {
+                Ok(message) => message?,
+                Err(_) => {
+                    warn!(?IDLE_TIMEOUT, "no websocket frame received; reconnecting");
+                    return Err(Error::from(io::Error::new(ErrorKind::TimedOut, "idle")));
+                }
+            },
+        };
+
+        match message.opcode {
+            OpCode::Text => {
+                let recv_time = Timestamp::now();
+                let delivery = ws::deliver(
+                    &ws_tx,
+                    &mut overflow,
+                    (recv_time, message.payload),
+                    // Rejections arrive on the `error` channel. Shedding one
+                    // would hide a permanently incomplete feed.
+                    |(_, payload)| !ws::payload_contains(payload, br#""error""#),
+                )
+                .await;
+                match delivery {
+                    Delivery::Sent | Delivery::Dropped => {}
+                    // Receiver dropped: the collector is shutting down.
+                    Delivery::Closed => return Ok(()),
+                    Delivery::Undeliverable => {
+                        return Err(anyhow::anyhow!(
+                            "an error response could not be delivered; reconnecting"
+                        ));
+                    }
+                }
+            }
+            OpCode::Ping => {
+                sender.pong(message.payload.to_vec()).await?;
+            }
+            OpCode::Close => {
+                warn!("connection closed by server");
+                return Err(Error::from(io::Error::new(
+                    ErrorKind::ConnectionAborted,
+                    "connection closed",
+                )));
+            }
+            _ => {}
+        }
+    }
 }
 
 pub async fn keep_connection(
     subscription_types: Vec<String>,
     symbol_list: Vec<String>,
-    ws_tx: UnboundedSender<(Timestamp, bytes::Bytes)>,
+    ws_tx: Sender<(Timestamp, bytes::Bytes)>,
 ) {
+    let subscriptions: Vec<String> = symbol_list
+        .iter()
+        .flat_map(|symbol| {
+            subscription_types.iter().map(move |sub_type| {
+                format!(
+                    r#"{{"method":"subscribe","subscription":{{"type":"{sub_type}","coin":"{symbol}"}}}}"#
+                )
+            })
+        })
+        .collect();
+
+    info!(
+        subscriptions = subscriptions.len(),
+        "connecting to the Hyperliquid websocket"
+    );
+
     let mut error_count = 0;
     loop {
         let connect_time = Instant::now();
-
-        let subscriptions: Vec<String> = symbol_list
-            .iter()
-            .flat_map(|symbol| {
-                subscription_types.iter().map(move |sub_type| {
-                    format!(
-                        r#"{{"method":"subscribe","subscription":{{"type":"{}","coin":"{}"}}}}"#,
-                        sub_type, symbol
-                    )
-                })
-            })
-            .collect();
-
-        info!(
-            "Connecting to Hyperliquid WebSocket with {} subscriptions",
-            subscriptions.len()
-        );
-
-        if let Err(error) =
-            connect("wss://api.hyperliquid.xyz/ws", subscriptions, ws_tx.clone()).await
+        if let Err(error) = connect(
+            "wss://api.hyperliquid.xyz/ws",
+            subscriptions.clone(),
+            ws_tx.clone(),
+        )
+        .await
         {
             error!(?error, "websocket error");
             error_count += 1;
