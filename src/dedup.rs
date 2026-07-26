@@ -13,6 +13,18 @@
 //! of which field is the sequence number, and no gap when a venue emits a
 //! message type that carries no id at all (Binance `forceOrder`, for instance).
 //!
+//! That property is a fact about each venue's encoding, not a law, and it must
+//! be measured before trusting it on a new one. It holds for every JSON stream
+//! here: two connections recording the same 60 s window produced 34,008 rows
+//! with zero duplicates, and zero even when event and transact times were
+//! ignored — so those timestamps come from the matching engine, identical for
+//! all subscribers. It does *not* hold for Binance's SBE streams, which stamp
+//! `eventTime` per connection at serialisation and land tens of microseconds
+//! apart; the sister `sbe-collector` has to cut that field out of the key. A
+//! venue that stamps per connection will silently record every copy, so the
+//! check on a new feed is: run two connections for a minute and confirm the
+//! row count does not double.
+//!
 //! Almost every stream makes distinct events distinguishable: depth updates
 //! carry a sequence id, trades a trade id, book tickers an update id. The
 //! residual risk is a stream whose only discriminator is a millisecond

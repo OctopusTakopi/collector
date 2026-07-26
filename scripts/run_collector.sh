@@ -2,7 +2,7 @@
 
 COLLECTOR_EXE="/home/ec2-user/collector"
 BASE_DATA_DIR="/home/ec2-user/data/raw"
-COINS=("btc" "eth" "sol")
+COINS=("btc" "eth" "bnb" "xrp" "sol" "trx" "doge")
 
 MAPPINGS=(
     "binancespot:binance/spot"
@@ -11,7 +11,7 @@ MAPPINGS=(
     "hyperliquid:hyperliquid"
 )
 
-SESSION_NAME="hft_collection"
+SESSION_NAME="json_collector"
 
 # Kill existing session to start fresh
 tmux kill-session -t $SESSION_NAME 2>/dev/null
@@ -37,7 +37,7 @@ for MAP in "${MAPPINGS[@]}"; do
 
     # Create one window per exchange and run the command once
     tmux new-window -t $SESSION_NAME -n "$EXCH"
-    CMD="$COLLECTOR_EXE $TARGET_DIR $EXCH $SYMBOLS_LIST"
+    CMD="$COLLECTOR_EXE -c 2 $TARGET_DIR $EXCH $SYMBOLS_LIST"
     
     tmux send-keys -t "$SESSION_NAME:$EXCH" "$CMD" C-m
 done
