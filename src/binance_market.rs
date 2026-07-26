@@ -37,6 +37,21 @@ use crate::{
     ws::{self, Delivery, Overflow},
 };
 
+/// Minimum spacing between snapshot requests.
+///
+/// A round used to issue every symbol back to back, spending its whole request
+/// weight in one burst. The window admits that, but it only knows what this
+/// process has spent, so restarts inside a minute stack burst on burst with
+/// nothing in a position to notice. Spacing the requests means a restart costs
+/// one snapshot rather than a whole round.
+const SNAPSHOT_PACE: Duration = Duration::from_secs(2);
+
+/// How long to wait before the first request of the process.
+///
+/// A collector that crash-loops then spends no weight at all, instead of
+/// burning a round every time it comes up.
+const SNAPSHOT_START_DELAY: Duration = Duration::from_secs(5);
+
 /// How far a depth update id may fall below the last one seen before the
 /// stream is treated as restarted rather than merely reordered.
 ///
@@ -73,6 +88,7 @@ pub struct Endpoint {
 pub async fn fetch_depth_snapshot(
     endpoint: &Endpoint,
     client: &reqwest::Client,
+    throttler: &Throttler,
     symbol: &str,
 ) -> Result<bytes::Bytes, anyhow::Error> {
     let response = client
@@ -85,8 +101,22 @@ pub async fn fetch_depth_snapshot(
         .send()
         .await?;
     let status = response.status();
+    // Headers must be read before the body consumes the response.
+    let retry_after = response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
     let body = response.bytes().await?;
     if !status.is_success() {
+        // 418 is Binance's ban; 429 is the warning shot before one. Recording
+        // it gates every later request instead of only failing this one.
+        if matches!(status.as_u16(), 418 | 429)
+            && let Some(until) =
+                crate::throttler::ban_expiry(retry_after.as_deref(), &body, Timestamp::now())
+        {
+            throttler.note_ban(until);
+        }
         // Keep the Binance error code and message; the bare status cannot tell
         // an invalid symbol from an IP ban.
         let preview = &body[..body.len().min(1024)];
@@ -245,10 +275,15 @@ async fn handle(
                     let symbol_ = Symbol::clone(&symbol);
                     let writer_tx_ = writer_tx.clone();
                     let client_ = client.clone();
-                    let mut throttler_ = throttler.clone();
+                    let throttler_ = throttler.clone();
                     tasks.spawn(async move {
                         match throttler_
-                            .execute(fetch_depth_snapshot(endpoint, &client_, &symbol_))
+                            .execute(fetch_depth_snapshot(
+                                endpoint,
+                                &client_,
+                                &throttler_,
+                                &symbol_,
+                            ))
                             .await
                         {
                             Some(Ok(data)) => {
@@ -299,17 +334,23 @@ async fn snapshot_loop(
     symbols: Vec<Symbol>,
     writer_tx: Sender<WriteRecord>,
     client: reqwest::Client,
-    mut throttler: Throttler,
+    throttler: Throttler,
     interval_secs: u64,
 ) {
+    tokio::time::sleep(SNAPSHOT_START_DELAY).await;
+
     let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
+    let mut pacer = tokio::time::interval(SNAPSHOT_PACE);
+    // A round that overruns its spacing must not then fire the backlog at once.
+    pacer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
         ticker.tick().await;
 
         for symbol in &symbols {
+            pacer.tick().await;
             match throttler
-                .execute(fetch_depth_snapshot(endpoint, &client, symbol))
+                .execute(fetch_depth_snapshot(endpoint, &client, &throttler, symbol))
                 .await
             {
                 Some(Ok(data)) => {
