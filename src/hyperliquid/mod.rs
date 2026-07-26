@@ -108,11 +108,16 @@ pub async fn run_collection(
     connections: usize,
 ) -> Result<(), anyhow::Error> {
     let connections = connections.max(1);
-    // The limit is per connection, so redundancy does not change it.
-    let subscription_count = subscriptions.len().saturating_mul(symbols.len());
+    // Hyperliquid's caps are per IP "across all websocket connections", not per
+    // socket, so redundancy spends the same budget N times over: each
+    // connection subscribes to the full set for itself.
+    let per_connection = subscriptions.len().saturating_mul(symbols.len());
+    let subscription_count = per_connection.saturating_mul(connections);
     if subscription_count > 1_000 {
         anyhow::bail!(
-            "Hyperliquid allows at most 1000 websocket subscriptions; requested {subscription_count}"
+            "Hyperliquid allows at most 1000 websocket subscriptions per IP across all \
+             connections; {connections} connection(s) x {per_connection} subscriptions = \
+             {subscription_count}"
         );
     }
 
@@ -131,7 +136,7 @@ pub async fn run_collection(
         let ws_tx = ws_tx.clone();
         tasks.spawn(async move {
             tokio::time::sleep(crate::CONNECT_STAGGER * connection as u32).await;
-            keep_connection(subscriptions, symbols, connection, ws_tx).await;
+            keep_connection(subscriptions, symbols, connection, connections, ws_tx).await;
             error!(connection, "the websocket connection task exited");
         });
     }

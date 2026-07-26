@@ -29,6 +29,20 @@ async fn handle(
     recv_time: Timestamp,
     data: bytes::Bytes,
 ) -> Result<(), ConnectorError> {
+    // Before parsing: with N connections, N-1 of every N market-data frames are
+    // discarded, and parsing them first would multiply the JSON cost on the one
+    // consumer task that the shared queue already backs up against. Acks and
+    // rejections are per-connection state and must not be collapsed, so they
+    // are excluded here rather than filtered later — `"topic"` sits at the
+    // front of a market-data frame, so the scan exits immediately, and the full
+    // scan only happens for the small control frames that lack it.
+    if dedup.is_enabled()
+        && crate::ws::payload_contains(&data, br#""topic""#)
+        && dedup.is_duplicate(&data)
+    {
+        return Ok(());
+    }
+
     let message: BybitMessage<'_> = serde_json::from_slice(&data)?;
     if let Some(op) = message.op {
         if op == "subscribe" {
@@ -63,13 +77,6 @@ async fn handle(
         return Ok(());
     }
     if let Some(topic) = message.topic {
-        // Only market data is deduplicated. The acks and rejections handled
-        // above are per-connection state, and collapsing two connections'
-        // rejections would leave one of them silently unsubscribed.
-        if dedup.is_duplicate(&data) {
-            return Ok(());
-        }
-
         let symbol_raw = topic
             .split('.')
             .next_back()

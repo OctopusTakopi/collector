@@ -18,7 +18,22 @@ const PING_INTERVAL: Duration = Duration::from_secs(30);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 /// Hyperliquid allows 2000 outgoing websocket messages per minute; 35 ms
 /// between subscribe frames stays comfortably under that.
+///
+/// The budget is per IP "across all websocket connections", so with redundancy
+/// this is multiplied by the connection count — see [`subscribe_pace`].
 const SUBSCRIBE_PACE: Duration = Duration::from_millis(35);
+
+/// The per-connection subscribe interval that keeps `connections` sockets
+/// inside one shared outgoing-message budget.
+///
+/// Staggering the connect does not help here: a large symbol list keeps a
+/// connection subscribing for tens of seconds, so every connection is pacing
+/// at once and their rates add. Rejections land on the `error` channel and
+/// Hyperliquid offers no way to retry them, so exceeding the budget costs
+/// those symbols for the lifetime of the connection.
+fn subscribe_pace(connections: usize) -> Duration {
+    SUBSCRIBE_PACE * connections.max(1) as u32
+}
 
 /// The subscriptions and the ping timer both live off the read path.
 ///
@@ -26,10 +41,10 @@ const SUBSCRIBE_PACE: Duration = Duration::from_millis(35);
 /// the socket unread for ~35 s, skewing every receive timestamp in that window
 /// and letting the kernel buffer back up. Running them here means data is being
 /// read from the very first frame.
-async fn control_loop(sender: FrameSender, subscriptions: Vec<String>) {
+async fn control_loop(sender: FrameSender, subscriptions: Vec<String>, connections: usize) {
     let mut ping_interval = tokio::time::interval(PING_INTERVAL);
     ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut pacer = tokio::time::interval(SUBSCRIBE_PACE);
+    let mut pacer = tokio::time::interval(subscribe_pace(connections));
     pacer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut to_send = subscriptions.into_iter();
 
@@ -57,13 +72,14 @@ pub async fn connect(
     url: &str,
     subscriptions: Vec<String>,
     connection: usize,
+    connections: usize,
     ws_tx: Sender<(Timestamp, bytes::Bytes)>,
 ) -> Result<(), anyhow::Error> {
     let mut conn = ws::connect(url).await?;
     let sender = conn.sender();
     let mut overflow = Overflow::new("hyperliquid");
 
-    let control = control_loop(sender.clone(), subscriptions);
+    let control = control_loop(sender.clone(), subscriptions, connections);
     tokio::pin!(control);
 
     loop {
@@ -124,6 +140,7 @@ pub async fn keep_connection(
     subscription_types: Vec<String>,
     symbol_list: Vec<String>,
     connection: usize,
+    connections: usize,
     ws_tx: Sender<(Timestamp, bytes::Bytes)>,
 ) {
     let subscriptions: Vec<String> = symbol_list
@@ -139,7 +156,9 @@ pub async fn keep_connection(
 
     info!(
         subscriptions = subscriptions.len(),
-        connection, "connecting to the Hyperliquid websocket"
+        connection,
+        subscribe_pace = ?subscribe_pace(connections),
+        "connecting to the Hyperliquid websocket"
     );
 
     let mut error_count = 0;
@@ -149,6 +168,7 @@ pub async fn keep_connection(
             "wss://api.hyperliquid.xyz/ws",
             subscriptions.clone(),
             connection,
+            connections,
             ws_tx.clone(),
         )
         .await

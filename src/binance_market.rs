@@ -235,7 +235,12 @@ async fn handle(
                         }
                     });
                 }
-                *prev_u = u;
+                // Only ever forwards. Redundant connections can deliver an
+                // event whose predecessor has not arrived yet (see `dedup`), and
+                // rewinding here would make the *next* in-order frame look like
+                // a gap too, turning one reorder into a snapshot fetch per frame
+                // until the streams realign.
+                *prev_u = u.max(*prev_u);
             }
             None => {
                 // First update for this symbol. `snapshot_loop` already fetches a
@@ -646,6 +651,37 @@ mod tests {
             harness.tasks.is_empty(),
             "the surviving connection covered the reconnect, so there is no gap \
              and no recovery snapshot to fetch"
+        );
+    }
+
+    /// A frame that arrives after a later one — possible once redundant
+    /// connections can be skewed past the dedup window — costs one gap, not a
+    /// gap on every frame after it. Rewinding `prev_u` would make the next
+    /// in-order update mismatch too, and so on until the streams realign.
+    #[tokio::test]
+    async fn an_out_of_order_frame_does_not_rewind_the_sequence() {
+        let (writer_tx, _writer_rx) = channel(16);
+        let mut harness = Harness::with_connections("BTCUSDT", 2);
+
+        harness.feed(&FUTURES, &writer_tx, DEPTH[0]).await.unwrap();
+        harness.feed(&FUTURES, &writer_tx, DEPTH[2]).await.unwrap();
+        assert_eq!(harness.prev_u_map["btcusdt"], 7);
+        let after_skip = harness.tasks.len();
+        assert_eq!(after_skip, 1, "the skipped frame is a genuine gap");
+
+        // The straggler arrives late. It is a gap too, but it must not drag
+        // `prev_u` back to 5 and make the *next* frame look like one as well.
+        harness.feed(&FUTURES, &writer_tx, DEPTH[1]).await.unwrap();
+        assert_eq!(
+            harness.prev_u_map["btcusdt"], 7,
+            "sequence only moves forward"
+        );
+
+        harness.feed(&FUTURES, &writer_tx, DEPTH[3]).await.unwrap();
+        assert_eq!(
+            harness.tasks.len(),
+            after_skip + 1,
+            "the reorder costs one gap, not one per frame afterwards"
         );
     }
 

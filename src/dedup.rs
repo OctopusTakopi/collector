@@ -13,9 +13,17 @@
 //! of which field is the sequence number, and no gap when a venue emits a
 //! message type that carries no id at all (Binance `forceOrder`, for instance).
 //!
-//! Distinct events are never byte-identical in practice: every venue stamps its
-//! frames with a sequence id, a trade id, or at minimum an event time, so two
-//! different events differ somewhere in the payload.
+//! Almost every stream makes distinct events distinguishable: depth updates
+//! carry a sequence id, trades a trade id, book tickers an update id. The
+//! residual risk is a stream whose only discriminator is a millisecond
+//! timestamp — Binance `forceOrder`, Hyperliquid `bbo` — where two genuinely
+//! distinct events inside the same millisecond, with every other field equal,
+//! would serialise identically and the second would be dropped as a duplicate.
+//! No content-based filter can separate those, and a sequence-based one cannot
+//! handle `forceOrder` at all. The exposure is small (Binance pushes at most
+//! one `forceOrder` per symbol per second) but it is not zero, and unlike a
+//! shed frame the loss is counted as a successful suppression rather than
+//! logged. Weigh that against the gap redundancy removes.
 //!
 //! # Ordering
 //!
@@ -36,7 +44,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use tracing::info;
+use tracing::{info, warn};
 
 /// How far back duplicates are remembered.
 ///
@@ -46,8 +54,15 @@ use tracing::info;
 pub const DEDUP_WINDOW: Duration = Duration::from_secs(30);
 
 /// Hard ceiling on remembered keys per generation, so an unexpected message
-/// rate cannot turn the window into unbounded memory. Two generations are live
-/// at once, so the real bound is twice this — about 16 MiB of keys.
+/// rate cannot turn the window into unbounded memory.
+///
+/// Reaching it rotates early, which shortens the window below [`DEDUP_WINDOW`]
+/// — `Dedup` logs when that happens, because a window shorter than the skew
+/// between connections lets duplicates through.
+///
+/// Two generations are live at once and `hashbrown` rounds up to a power of two
+/// at a 7/8 load factor, so 500k keys reserve 2^20 buckets of 17 bytes per
+/// generation: about 36 MiB in total, retained once reached.
 pub const DEDUP_MAX_ENTRIES: usize = 500_000;
 
 const REPORT_INTERVAL: Duration = Duration::from_secs(300);
@@ -63,7 +78,8 @@ const CLOCK_CHECK_INTERVAL: u32 = 1_024;
 /// Keys are held in two generations that rotate on a timer. A lookup checks
 /// both, so anything inserted is remembered for at least [`DEDUP_WINDOW`] and
 /// at most twice that, without storing a timestamp per key or ever walking the
-/// set to expire it.
+/// set to expire it — unless [`DEDUP_MAX_ENTRIES`] forces an early rotation,
+/// which is logged.
 pub struct Dedup {
     /// `false` for a single connection, where no message can be a duplicate.
     /// Checked before hashing, so the whole module costs one branch.
@@ -77,12 +93,21 @@ pub struct Dedup {
     unique: u64,
     duplicate: u64,
     last_report: Instant,
+    last_ceiling_warning: Option<Instant>,
 }
 
 impl Dedup {
     /// A no-op filter, for a single connection.
     pub fn disabled() -> Self {
         Self::build(false, DEDUP_WINDOW, DEDUP_MAX_ENTRIES)
+    }
+
+    /// Whether this filter can ever report a duplicate.
+    ///
+    /// Lets a caller skip classifying a message it would not have filtered
+    /// anyway, so a single connection pays nothing for the check.
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
     }
 
     pub fn new(window: Duration, max_entries: usize) -> Self {
@@ -111,6 +136,7 @@ impl Dedup {
             unique: 0,
             duplicate: 0,
             last_report: now,
+            last_ceiling_warning: None,
         }
     }
 
@@ -154,7 +180,29 @@ impl Dedup {
     fn maintain(&mut self) {
         let now = Instant::now();
 
-        if now >= self.rotate_at || self.current.len() >= self.max_entries {
+        let full = self.current.len() >= self.max_entries;
+        if now >= self.rotate_at || full {
+            // The effective window is now however long it took to fill a
+            // generation, not `self.window`. Any connection whose skew exceeds
+            // that leaks duplicates past the filter, so this must not be
+            // silent — but a ceiling that keeps being hit would log on every
+            // rotation, so restate it at the reporting cadence instead.
+            if full
+                && self
+                    .last_ceiling_warning
+                    .is_none_or(|last| now.duration_since(last) >= REPORT_INTERVAL)
+            {
+                let held = self
+                    .window
+                    .saturating_sub(self.rotate_at.saturating_duration_since(now));
+                warn!(
+                    entries = self.current.len(),
+                    ?held,
+                    configured = ?self.window,
+                    "dedup entry ceiling reached; the duplicate window is shorter than configured"
+                );
+                self.last_ceiling_warning = Some(now);
+            }
             // `clear` keeps the allocation, and the swap hands it to `current`,
             // so steady-state rotation does not allocate.
             self.previous.clear();
@@ -243,6 +291,42 @@ mod tests {
 
         assert!(dedup.current.len() <= 16);
         assert!(dedup.previous.len() <= 16);
+    }
+
+    /// A ceiling-forced rotation shortens the window below what was asked for,
+    /// so it has to leave a trace rather than silently letting duplicates
+    /// through later.
+    #[test]
+    fn a_ceiling_forced_rotation_is_reported() {
+        let mut dedup = Dedup::new(Duration::from_secs(3_600), 16);
+        assert!(dedup.last_ceiling_warning.is_none());
+
+        for id in 0..64 {
+            dedup.is_duplicate(format!("{id}").as_bytes());
+        }
+
+        assert!(
+            dedup.last_ceiling_warning.is_some(),
+            "hitting the ceiling must not be silent"
+        );
+    }
+
+    /// A timed rotation is the normal path and must stay quiet.
+    #[test]
+    fn a_timed_rotation_is_not_reported() {
+        let mut dedup = Dedup::new(Duration::ZERO, DEDUP_MAX_ENTRIES);
+
+        dedup.is_duplicate(b"first");
+        dedup.maintain();
+
+        assert!(dedup.last_ceiling_warning.is_none());
+    }
+
+    /// A single connection must let a caller skip classification entirely.
+    #[test]
+    fn is_enabled_matches_the_connection_count() {
+        assert!(!Dedup::for_connections(1).is_enabled());
+        assert!(Dedup::for_connections(2).is_enabled());
     }
 
     /// Both counters have to move, or the health signal in the log is a lie.
