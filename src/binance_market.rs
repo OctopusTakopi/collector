@@ -27,6 +27,7 @@ use tokio::{
 use tracing::{error, warn};
 
 use crate::{
+    dedup::Dedup,
     error::ConnectorError,
     feed::Feed,
     file::WriteRecord,
@@ -91,6 +92,7 @@ pub async fn fetch_depth_snapshot(
 pub async fn connect(
     endpoint: &Endpoint,
     url: &str,
+    connection: usize,
     ws_tx: Sender<(Timestamp, bytes::Bytes)>,
 ) -> Result<(), anyhow::Error> {
     let mut conn = ws::connect(url).await?;
@@ -106,6 +108,7 @@ pub async fn connect(
             Err(_) => {
                 warn!(
                     endpoint = endpoint.label,
+                    connection,
                     idle_timeout = ?endpoint.idle_timeout,
                     "no websocket frame received; reconnecting"
                 );
@@ -140,7 +143,10 @@ pub async fn connect(
                 sender.pong(message.payload.to_vec()).await?;
             }
             OpCode::Close => {
-                warn!(endpoint = endpoint.label, "connection closed by server");
+                warn!(
+                    endpoint = endpoint.label,
+                    connection, "connection closed by server"
+                );
                 return Err(Error::from(io::Error::new(
                     ErrorKind::ConnectionAborted,
                     "closed",
@@ -158,12 +164,21 @@ async fn handle(
     prev_u_map: &mut HashMap<Symbol, i64>,
     writer_tx: &Sender<WriteRecord>,
     symbols: &mut SymbolCache,
+    dedup: &mut Dedup,
     recv_time: Timestamp,
     data: bytes::Bytes,
     client: &reqwest::Client,
     throttler: &Throttler,
     tasks: &mut JoinSet<()>,
 ) -> Result<(), ConnectorError> {
+    // Before anything reads sequence numbers. A second copy of a depth update
+    // carries the `pu` of the update *before* it, which no longer matches the
+    // `prev_u` the first copy just advanced — every duplicate would be reported
+    // as a gap and would refetch a snapshot.
+    if dedup.is_duplicate(&data) {
+        return Ok(());
+    }
+
     let message: BinanceMessage<'_> = serde_json::from_slice(&data)?;
     // Control frames from the combined endpoint (`{"result":null,"id":1}`) have
     // no `data` and are not an error.
@@ -283,9 +298,15 @@ pub async fn run_collection(
     symbols: Vec<String>,
     writer_tx: Sender<WriteRecord>,
     shutdown: watch::Receiver<bool>,
+    connections: usize,
 ) -> Result<(), anyhow::Error> {
+    let connections = connections.max(1);
     let mut prev_u_map = HashMap::new();
-    let (ws_tx, ws_rx) = channel::<(Timestamp, bytes::Bytes)>(crate::WS_QUEUE_CAPACITY);
+    let mut dedup = Dedup::for_connections(connections);
+    // All connections share the queue, so it is sized per connection to keep
+    // the burst each one can absorb independent of how many there are.
+    let (ws_tx, ws_rx) =
+        channel::<(Timestamp, bytes::Bytes)>(crate::WS_QUEUE_CAPACITY.saturating_mul(connections));
     let mut feed = Feed::new(ws_rx, shutdown);
     let mut tasks = JoinSet::new();
     let mut symbol_cache = SymbolCache::new(&symbols);
@@ -293,13 +314,22 @@ pub async fn run_collection(
         .iter()
         .map(|symbol| symbol_cache.resolve(symbol))
         .collect();
-    tasks.spawn(async move {
-        keep_connection(endpoint, streams, symbols, ws_tx).await;
-        error!(
-            endpoint = endpoint.label,
-            "the websocket connection task exited"
-        );
-    });
+    for connection in 0..connections {
+        let streams = streams.clone();
+        let symbols = symbols.clone();
+        let ws_tx = ws_tx.clone();
+        tasks.spawn(async move {
+            tokio::time::sleep(crate::CONNECT_STAGGER * connection as u32).await;
+            keep_connection(endpoint, streams, symbols, connection, ws_tx).await;
+            error!(
+                endpoint = endpoint.label,
+                connection, "the websocket connection task exited"
+            );
+        });
+    }
+    // The clones above are the only senders that should keep the feed open;
+    // holding this one would stop `Feed` from ever seeing the queue close.
+    drop(ws_tx);
     // https://www.binance.com/en/support/faq/rate-limits-on-binance-futures-281596e222414cdd9051664ea621cdc3
     // The default rate limit per IP is 2,400/min and the weight is 20 at a depth of 1000.
     // The maximum request rate for fetching snapshots is 120 per minute.
@@ -349,6 +379,7 @@ pub async fn run_collection(
             &mut prev_u_map,
             &writer_tx,
             &mut symbol_cache,
+            &mut dedup,
             recv_time,
             data,
             &client,
@@ -370,6 +401,7 @@ pub async fn keep_connection(
     endpoint: &Endpoint,
     streams: Vec<String>,
     symbol_list: Vec<String>,
+    connection: usize,
     ws_tx: Sender<(Timestamp, bytes::Bytes)>,
 ) {
     let streams_str = symbol_list
@@ -387,10 +419,20 @@ pub async fn keep_connection(
     let mut error_count = 0;
     loop {
         let connect_time = Instant::now();
-        if let Err(error) = connect(endpoint, &url, ws_tx.clone()).await {
-            error!(endpoint = endpoint.label, ?error, "websocket error");
+        if let Err(error) = connect(endpoint, &url, connection, ws_tx.clone()).await {
+            let lifetime = connect_time.elapsed();
+            // The lifetime is what separates a venue recycling a healthy
+            // connection from this side failing: an `Unexpected EOF` after an
+            // hour is the former, one after a few seconds is the latter.
+            error!(
+                endpoint = endpoint.label,
+                connection,
+                ?error,
+                ?lifetime,
+                "websocket error"
+            );
             error_count += 1;
-            if connect_time.elapsed() > Duration::from_secs(30) {
+            if lifetime > Duration::from_secs(30) {
                 error_count = 0;
             }
             if error_count > 20 {
@@ -429,6 +471,7 @@ mod tests {
     struct Harness {
         prev_u_map: HashMap<Symbol, i64>,
         symbols: SymbolCache,
+        dedup: Dedup,
         client: reqwest::Client,
         throttler: Throttler,
         tasks: JoinSet<()>,
@@ -436,9 +479,14 @@ mod tests {
 
     impl Harness {
         fn new(symbol: &str) -> Self {
+            Self::with_connections(symbol, 1)
+        }
+
+        fn with_connections(symbol: &str, connections: usize) -> Self {
             Self {
                 prev_u_map: HashMap::new(),
                 symbols: SymbolCache::new(&[symbol.to_owned()]),
+                dedup: Dedup::for_connections(connections),
                 client: reqwest::Client::new(),
                 throttler: Throttler::new(1),
                 tasks: JoinSet::new(),
@@ -456,6 +504,7 @@ mod tests {
                 &mut self.prev_u_map,
                 writer_tx,
                 &mut self.symbols,
+                &mut self.dedup,
                 Timestamp::now(),
                 bytes::Bytes::from_static(raw),
                 &self.client,
@@ -535,6 +584,87 @@ mod tests {
             );
             assert_eq!(harness.prev_u_map["btcusdt"], 5);
         }
+    }
+
+    /// Depth frames, in order, as futures sends them (`pu` chains to the
+    /// previous `u`).
+    const DEPTH: [&[u8]; 4] = [
+        br#"{"stream":"btcusdt@depth","data":{"e":"depthUpdate","E":1,"s":"BTCUSDT","U":2,"u":3,"pu":1,"b":[],"a":[]}}"#,
+        br#"{"stream":"btcusdt@depth","data":{"e":"depthUpdate","E":2,"s":"BTCUSDT","U":4,"u":5,"pu":3,"b":[],"a":[]}}"#,
+        br#"{"stream":"btcusdt@depth","data":{"e":"depthUpdate","E":3,"s":"BTCUSDT","U":6,"u":7,"pu":5,"b":[],"a":[]}}"#,
+        br#"{"stream":"btcusdt@depth","data":{"e":"depthUpdate","E":4,"s":"BTCUSDT","U":8,"u":9,"pu":7,"b":[],"a":[]}}"#,
+    ];
+
+    /// The second connection's copy must be dropped *before* the continuity
+    /// check. Its `pu` points at the update the first copy already consumed, so
+    /// letting it through would report a gap on every single message.
+    #[tokio::test]
+    async fn a_second_connections_copy_is_neither_written_nor_read_as_a_gap() {
+        let (writer_tx, mut writer_rx) = channel(16);
+        let mut harness = Harness::with_connections("BTCUSDT", 2);
+
+        for frame in DEPTH {
+            // Both connections deliver every frame.
+            harness.feed(&FUTURES, &writer_tx, frame).await.unwrap();
+            harness.feed(&FUTURES, &writer_tx, frame).await.unwrap();
+        }
+
+        let mut written = Vec::new();
+        while let Ok((_, _, data)) = writer_rx.try_recv() {
+            written.push(data);
+        }
+        assert_eq!(written.len(), DEPTH.len(), "each frame is recorded once");
+        assert!(harness.tasks.is_empty(), "no gap should have been reported");
+        assert_eq!(harness.prev_u_map["btcusdt"], 9);
+    }
+
+    /// The point of the whole feature: one connection dropping mid-stream
+    /// leaves no hole, because the other one covers the frames it missed.
+    #[tokio::test]
+    async fn a_reconnect_on_one_connection_leaves_no_gap() {
+        let (writer_tx, mut writer_rx) = channel(16);
+        let mut harness = Harness::with_connections("BTCUSDT", 2);
+
+        // Both connections are up for the first two frames.
+        for frame in &DEPTH[..2] {
+            harness.feed(&FUTURES, &writer_tx, frame).await.unwrap();
+            harness.feed(&FUTURES, &writer_tx, frame).await.unwrap();
+        }
+        // Connection 0 drops here and misses DEPTH[2] entirely; only
+        // connection 1 delivers it.
+        harness.feed(&FUTURES, &writer_tx, DEPTH[2]).await.unwrap();
+        // Connection 0 is back, and both deliver the next frame.
+        harness.feed(&FUTURES, &writer_tx, DEPTH[3]).await.unwrap();
+        harness.feed(&FUTURES, &writer_tx, DEPTH[3]).await.unwrap();
+
+        let mut written = Vec::new();
+        while let Ok((_, _, data)) = writer_rx.try_recv() {
+            written.push(data);
+        }
+        assert_eq!(written.len(), DEPTH.len(), "the stream is still complete");
+        assert!(
+            harness.tasks.is_empty(),
+            "the surviving connection covered the reconnect, so there is no gap \
+             and no recovery snapshot to fetch"
+        );
+    }
+
+    /// With redundancy off, nothing is filtered — a single connection cannot
+    /// produce a duplicate, and paying for the filter would be pure overhead.
+    #[tokio::test]
+    async fn a_single_connection_records_every_frame_it_receives() {
+        let (writer_tx, mut writer_rx) = channel(16);
+        let mut harness = Harness::new("BTCUSDT");
+
+        for frame in DEPTH {
+            harness.feed(&FUTURES, &writer_tx, frame).await.unwrap();
+        }
+
+        let mut count = 0;
+        while writer_rx.try_recv().is_ok() {
+            count += 1;
+        }
+        assert_eq!(count, DEPTH.len());
     }
 
     #[tokio::test]

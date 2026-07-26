@@ -21,8 +21,8 @@ use tokio::{
 use tracing::error;
 
 use crate::{
-    error::ConnectorError, feed::Feed, file::WriteRecord, routing::HyperliquidMessage,
-    symbol::SymbolCache,
+    dedup::Dedup, error::ConnectorError, feed::Feed, file::WriteRecord,
+    routing::HyperliquidMessage, symbol::SymbolCache,
 };
 
 /// How often to restate that requests were rejected, so an incomplete feed
@@ -63,6 +63,7 @@ async fn handle(
     writer_tx: &Sender<WriteRecord>,
     symbols: &mut SymbolCache,
     rejections: &Rejections,
+    dedup: &mut Dedup,
     recv_time: Timestamp,
     data: bytes::Bytes,
 ) -> Result<(), ConnectorError> {
@@ -83,6 +84,13 @@ async fn handle(
         return Ok(());
     };
 
+    // Only market data is deduplicated. Rejections above are per-connection —
+    // each connection subscribes for itself, so two identical rejections mean
+    // two connections are degraded, and collapsing them would hide one.
+    if dedup.is_duplicate(&data) {
+        return Ok(());
+    }
+
     let symbol = symbols.resolve(symbol_raw);
 
     writer_tx
@@ -97,7 +105,10 @@ pub async fn run_collection(
     symbols: Vec<String>,
     writer_tx: Sender<WriteRecord>,
     shutdown: watch::Receiver<bool>,
+    connections: usize,
 ) -> Result<(), anyhow::Error> {
+    let connections = connections.max(1);
+    // The limit is per connection, so redundancy does not change it.
     let subscription_count = subscriptions.len().saturating_mul(symbols.len());
     if subscription_count > 1_000 {
         anyhow::bail!(
@@ -105,20 +116,39 @@ pub async fn run_collection(
         );
     }
 
-    let (ws_tx, ws_rx) = channel::<(Timestamp, bytes::Bytes)>(crate::WS_QUEUE_CAPACITY);
+    let mut dedup = Dedup::for_connections(connections);
+    // Sized per connection: they share the queue, so the burst each one can
+    // absorb stays the same however many there are.
+    let (ws_tx, ws_rx) =
+        channel::<(Timestamp, bytes::Bytes)>(crate::WS_QUEUE_CAPACITY.saturating_mul(connections));
     let mut feed = Feed::new(ws_rx, shutdown);
     let mut tasks = JoinSet::new();
     let mut symbol_cache = SymbolCache::new(&symbols);
     let rejections = Arc::new(Rejections::default());
-    tasks.spawn(async move {
-        keep_connection(subscriptions, symbols, ws_tx).await;
-        error!("the websocket connection task exited");
-    });
+    for connection in 0..connections {
+        let subscriptions = subscriptions.clone();
+        let symbols = symbols.clone();
+        let ws_tx = ws_tx.clone();
+        tasks.spawn(async move {
+            tokio::time::sleep(crate::CONNECT_STAGGER * connection as u32).await;
+            keep_connection(subscriptions, symbols, connection, ws_tx).await;
+            error!(connection, "the websocket connection task exited");
+        });
+    }
+    // The clones above are the only senders that should keep the feed open.
+    drop(ws_tx);
     tasks.spawn(report_rejections(Arc::clone(&rejections)));
 
     while let Some((recv_time, data)) = feed.recv(&mut tasks).await {
-        if let Err(error) =
-            handle(&writer_tx, &mut symbol_cache, &rejections, recv_time, data).await
+        if let Err(error) = handle(
+            &writer_tx,
+            &mut symbol_cache,
+            &rejections,
+            &mut dedup,
+            recv_time,
+            data,
+        )
+        .await
         {
             if matches!(&error, ConnectorError::WriterClosed) {
                 return Err(error.into());
@@ -138,6 +168,7 @@ mod tests {
         let (writer_tx, mut writer_rx) = channel(1);
         let mut symbols = SymbolCache::new(&[]);
         let rejections = Rejections::default();
+        let mut dedup = Dedup::disabled();
         let data = bytes::Bytes::from_static(
             br#"{"channel":"error","data":"Too many websocket messages"}"#,
         );
@@ -146,6 +177,7 @@ mod tests {
             &writer_tx,
             &mut symbols,
             &rejections,
+            &mut dedup,
             Timestamp::now(),
             data,
         )
@@ -163,6 +195,7 @@ mod tests {
         let (writer_tx, mut writer_rx) = channel(1);
         let mut symbols = SymbolCache::new(&["BTC".to_owned()]);
         let rejections = Rejections::default();
+        let mut dedup = Dedup::disabled();
         let data = bytes::Bytes::from_static(
             br#"{"channel":"trades","data":[{"coin":"BTC","side":"B","px":"1","sz":"2"}]}"#,
         );
@@ -171,6 +204,7 @@ mod tests {
             &writer_tx,
             &mut symbols,
             &rejections,
+            &mut dedup,
             Timestamp::now(),
             data.clone(),
         )
@@ -180,5 +214,39 @@ mod tests {
         let (_, symbol, written) = writer_rx.try_recv().unwrap();
         assert_eq!(symbol.as_ref(), "btc");
         assert_eq!(written, data);
+    }
+
+    /// Market data is collapsed across connections; a rejection is not, because
+    /// each connection subscribes for itself and two rejections mean two
+    /// degraded connections.
+    #[tokio::test]
+    async fn redundant_copies_are_collapsed_but_rejections_are_not() {
+        let (writer_tx, mut writer_rx) = channel(8);
+        let mut symbols = SymbolCache::new(&["BTC".to_owned()]);
+        let rejections = Rejections::default();
+        let mut dedup = Dedup::for_connections(2);
+        let trade = bytes::Bytes::from_static(
+            br#"{"channel":"trades","data":[{"coin":"BTC","side":"B","px":"1","sz":"2"}]}"#,
+        );
+        let rejection =
+            bytes::Bytes::from_static(br#"{"channel":"error","data":"Already subscribed"}"#);
+
+        for data in [trade.clone(), trade.clone(), rejection.clone(), rejection] {
+            handle(
+                &writer_tx,
+                &mut symbols,
+                &rejections,
+                &mut dedup,
+                Timestamp::now(),
+                data,
+            )
+            .await
+            .unwrap();
+        }
+
+        let (_, _, written) = writer_rx.try_recv().unwrap();
+        assert_eq!(written, trade);
+        assert!(writer_rx.try_recv().is_err(), "the copy is dropped");
+        assert_eq!(rejections.total.load(Ordering::Relaxed), 2);
     }
 }

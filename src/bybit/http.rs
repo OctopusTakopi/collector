@@ -41,6 +41,14 @@ pub struct SubscriptionRequest {
     topics: Vec<String>,
 }
 
+/// A frame with the connection it arrived on.
+///
+/// Subscription rejections are answered by resubscribing, and only the
+/// connection that was rejected may be resubscribed — redundant connections
+/// each carry their own subscription state. Everything downstream of the read
+/// loop therefore has to know where a frame came from.
+pub type Frame = (usize, Timestamp, bytes::Bytes);
+
 async fn send_subscription(
     sender: &FrameSender,
     req_id: &str,
@@ -155,7 +163,8 @@ async fn control_loop(
 async fn connect(
     url: &str,
     requests: Vec<SubscriptionRequest>,
-    ws_tx: Sender<(Timestamp, bytes::Bytes)>,
+    connection: usize,
+    ws_tx: Sender<Frame>,
     retry_rx: &mut UnboundedReceiver<String>,
     reconnect_rx: &mut watch::Receiver<u64>,
 ) -> Result<(), anyhow::Error> {
@@ -195,7 +204,7 @@ async fn connect(
             result = timeout(IDLE_TIMEOUT, conn.read()) => match result {
                 Ok(message) => message?,
                 Err(_) => {
-                    warn!(?IDLE_TIMEOUT, "no websocket frame received; reconnecting");
+                    warn!(connection, ?IDLE_TIMEOUT, "no websocket frame received; reconnecting");
                     return Err(Error::from(io::Error::new(ErrorKind::TimedOut, "idle")));
                 }
             },
@@ -207,12 +216,12 @@ async fn connect(
                 let delivery = ws::deliver(
                     &ws_tx,
                     &mut overflow,
-                    (recv_time, message.payload),
+                    (connection, recv_time, message.payload),
                     // Only frames carrying a `topic` are market data. Shedding a
                     // subscription ack or rejection would leave that symbol's
                     // topics unsubscribed with nothing left to trigger a retry,
                     // and no degraded-feed report either.
-                    |(_, payload)| ws::payload_contains(payload, br#""topic""#),
+                    |(_, _, payload)| ws::payload_contains(payload, br#""topic""#),
                 )
                 .await;
                 match delivery {
@@ -230,7 +239,7 @@ async fn connect(
                 sender.pong(message.payload.to_vec()).await?;
             }
             OpCode::Close => {
-                warn!("connection closed by server");
+                warn!(connection, "connection closed by server");
                 return Err(Error::from(io::Error::new(
                     ErrorKind::ConnectionAborted,
                     "closed",
@@ -244,7 +253,8 @@ async fn connect(
 pub async fn keep_connection(
     topics: Vec<String>,
     symbol_list: Vec<String>,
-    ws_tx: Sender<(Timestamp, bytes::Bytes)>,
+    connection: usize,
+    ws_tx: Sender<Frame>,
     mut retry_rx: UnboundedReceiver<String>,
     mut reconnect_rx: watch::Receiver<u64>,
 ) {
@@ -267,15 +277,17 @@ pub async fn keep_connection(
         if let Err(error) = connect(
             "wss://stream.bybit.com/v5/public/linear",
             requests,
+            connection,
             ws_tx.clone(),
             &mut retry_rx,
             &mut reconnect_rx,
         )
         .await
         {
-            error!(?error, "websocket error");
+            let lifetime = connect_time.elapsed();
+            error!(connection, ?error, ?lifetime, "websocket error");
             error_count += 1;
-            if connect_time.elapsed() > Duration::from_secs(30) {
+            if lifetime > Duration::from_secs(30) {
                 error_count = 0;
             }
             if error_count > 20 {

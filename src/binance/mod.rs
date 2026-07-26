@@ -22,6 +22,15 @@ pub async fn run_collection(
     symbols: Vec<String>,
     writer_tx: Sender<WriteRecord>,
     shutdown: watch::Receiver<bool>,
+    connections: usize,
 ) -> Result<(), anyhow::Error> {
-    binance_market::run_collection(&ENDPOINT, streams, symbols, writer_tx, shutdown).await
+    binance_market::run_collection(
+        &ENDPOINT,
+        streams,
+        symbols,
+        writer_tx,
+        shutdown,
+        connections,
+    )
+    .await
 }

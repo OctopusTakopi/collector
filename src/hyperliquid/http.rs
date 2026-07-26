@@ -56,6 +56,7 @@ async fn control_loop(sender: FrameSender, subscriptions: Vec<String>) {
 pub async fn connect(
     url: &str,
     subscriptions: Vec<String>,
+    connection: usize,
     ws_tx: Sender<(Timestamp, bytes::Bytes)>,
 ) -> Result<(), anyhow::Error> {
     let mut conn = ws::connect(url).await?;
@@ -75,7 +76,7 @@ pub async fn connect(
             result = timeout(IDLE_TIMEOUT, conn.read()) => match result {
                 Ok(message) => message?,
                 Err(_) => {
-                    warn!(?IDLE_TIMEOUT, "no websocket frame received; reconnecting");
+                    warn!(connection, ?IDLE_TIMEOUT, "no websocket frame received; reconnecting");
                     return Err(Error::from(io::Error::new(ErrorKind::TimedOut, "idle")));
                 }
             },
@@ -108,7 +109,7 @@ pub async fn connect(
                 sender.pong(message.payload.to_vec()).await?;
             }
             OpCode::Close => {
-                warn!("connection closed by server");
+                warn!(connection, "connection closed by server");
                 return Err(Error::from(io::Error::new(
                     ErrorKind::ConnectionAborted,
                     "connection closed",
@@ -122,6 +123,7 @@ pub async fn connect(
 pub async fn keep_connection(
     subscription_types: Vec<String>,
     symbol_list: Vec<String>,
+    connection: usize,
     ws_tx: Sender<(Timestamp, bytes::Bytes)>,
 ) {
     let subscriptions: Vec<String> = symbol_list
@@ -137,7 +139,7 @@ pub async fn keep_connection(
 
     info!(
         subscriptions = subscriptions.len(),
-        "connecting to the Hyperliquid websocket"
+        connection, "connecting to the Hyperliquid websocket"
     );
 
     let mut error_count = 0;
@@ -146,13 +148,15 @@ pub async fn keep_connection(
         if let Err(error) = connect(
             "wss://api.hyperliquid.xyz/ws",
             subscriptions.clone(),
+            connection,
             ws_tx.clone(),
         )
         .await
         {
-            error!(?error, "websocket error");
+            let lifetime = connect_time.elapsed();
+            error!(connection, ?error, ?lifetime, "websocket error");
             error_count += 1;
-            if connect_time.elapsed() > Duration::from_secs(30) {
+            if lifetime > Duration::from_secs(30) {
                 error_count = 0;
             }
 

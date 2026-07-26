@@ -15,6 +15,7 @@ mod binance_market;
 mod binancefuturescm;
 mod binancefuturesum;
 mod bybit;
+mod dedup;
 mod error;
 mod feed;
 mod file;
@@ -25,7 +26,15 @@ mod throttler;
 mod ws;
 
 const WRITER_QUEUE_CAPACITY: usize = 65_536;
+/// Per connection: the queue is shared by all of them, so redundancy does not
+/// shrink the burst each one can absorb.
 const WS_QUEUE_CAPACITY: usize = 16_384;
+/// Redundant connections are opened this far apart.
+///
+/// Simultaneous handshakes are what a venue's connection rate limit notices,
+/// and connections opened together are the ones most likely to be recycled
+/// together — which is exactly the correlation redundancy is meant to avoid.
+const CONNECT_STAGGER: Duration = Duration::from_secs(5);
 /// How long the collection task is given to hand its already-received messages
 /// to the writer before it is aborted outright.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
@@ -41,6 +50,20 @@ struct Args {
 
     /// Symbols for which data will be collected.
     symbols: Vec<String>,
+
+    /// Number of redundant websocket connections to the exchange.
+    ///
+    /// Every connection subscribes to the same streams and duplicate messages
+    /// are discarded, so a disconnect on one connection no longer leaves a hole
+    /// in the recording — the others keep delivering while it reconnects. Costs
+    /// one extra connection's bandwidth per step. 1 disables redundancy.
+    #[arg(
+        short = 'c',
+        long,
+        default_value_t = 1,
+        value_parser = clap::value_parser!(u8).range(1..=8),
+    )]
+    connections: u8,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -48,6 +71,14 @@ async fn main() -> Result<(), anyhow::Error> {
     let args = Args::parse();
 
     tracing_subscriber::fmt::init();
+
+    let connections = usize::from(args.connections);
+    if connections > 1 {
+        info!(
+            connections,
+            "redundant collection enabled; duplicate messages will be discarded"
+        );
+    }
 
     std::fs::create_dir_all(&args.path)?;
     let (writer_tx, mut writer_rx) = channel::<file::WriteRecord>(WRITER_QUEUE_CAPACITY);
@@ -71,6 +102,7 @@ async fn main() -> Result<(), anyhow::Error> {
                 args.symbols,
                 writer_tx,
                 shutdown_rx,
+                connections,
             ))
         }
         "binancefuturescm" => {
@@ -92,6 +124,7 @@ async fn main() -> Result<(), anyhow::Error> {
                 args.symbols,
                 writer_tx,
                 shutdown_rx,
+                connections,
             ))
         }
         "binance" | "binancespot" => {
@@ -105,6 +138,7 @@ async fn main() -> Result<(), anyhow::Error> {
                 args.symbols,
                 writer_tx,
                 shutdown_rx,
+                connections,
             ))
         }
         "bybit" => {
@@ -124,6 +158,7 @@ async fn main() -> Result<(), anyhow::Error> {
                 args.symbols,
                 writer_tx,
                 shutdown_rx,
+                connections,
             ))
         }
         "hyperliquid" => {
@@ -137,6 +172,7 @@ async fn main() -> Result<(), anyhow::Error> {
                 args.symbols,
                 writer_tx,
                 shutdown_rx,
+                connections,
             ))
         }
         exchange => {
