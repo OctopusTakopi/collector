@@ -37,6 +37,16 @@ use crate::{
     ws::{self, Delivery, Overflow},
 };
 
+/// How far a depth update id may fall below the last one seen before the
+/// stream is treated as restarted rather than merely reordered.
+///
+/// Redundant connections reorder by at most the dedup window's worth of
+/// updates — thousands, on the busiest symbol. A book that re-bases drops by
+/// orders of magnitude more, since Binance's ids run in the billions. Anything
+/// between is read as a reorder, which costs nothing but a stale high-water
+/// mark until the stream catches up.
+const RESYNC_BACKSTEP: i64 = 1_000_000;
+
 /// How a market's depth stream signals that an update was missed.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DepthContinuity {
@@ -197,12 +207,37 @@ async fn handle(
         let u = event.u.ok_or(ConnectorError::FormatError)?;
         match prev_u_map.get_mut(symbol.as_ref()) {
             Some(prev_u) => {
+                // A book that restarts its update ids (relist, maintenance)
+                // lands far below the high-water mark. Without this the mark
+                // would never come down again and every later update would be
+                // read as a hole, for the life of the process.
+                if u < prev_u.saturating_sub(RESYNC_BACKSTEP) {
+                    warn!(
+                        symbol = %symbol,
+                        prev_u = *prev_u,
+                        u,
+                        "depth update ids restarted well below the last seen; resyncing"
+                    );
+                    *prev_u = u;
+                    return writer_tx
+                        .send((recv_time, symbol, data))
+                        .await
+                        .map_err(|_| ConnectorError::WriterClosed);
+                }
+
+                // Only an update that begins *beyond* what we already hold
+                // leaves a hole. One at or below the mark is already covered:
+                // a straggler from a connection that fell behind, or the very
+                // update that fills a hole reported earlier. Alarming on those
+                // would fetch a snapshot for data already in hand, once per
+                // update, for as long as the connections stay skewed.
                 let gap = match endpoint.depth_continuity {
                     DepthContinuity::FirstUpdateId => {
-                        event.first_update_id.ok_or(ConnectorError::FormatError)? != *prev_u + 1
+                        event.first_update_id.ok_or(ConnectorError::FormatError)?
+                            > prev_u.saturating_add(1)
                     }
                     DepthContinuity::PrevUpdateId => {
-                        event.pu.ok_or(ConnectorError::FormatError)? != *prev_u
+                        event.pu.ok_or(ConnectorError::FormatError)? > *prev_u
                     }
                 };
                 if gap {
@@ -493,7 +528,9 @@ mod tests {
                 symbols: SymbolCache::new(&[symbol.to_owned()]),
                 dedup: Dedup::for_connections(connections),
                 client: reqwest::Client::new(),
-                throttler: Throttler::new(1),
+                // No budget: the gap path must never issue a live
+                // request to Binance from a unit test.
+                throttler: Throttler::new(0),
                 tasks: JoinSet::new(),
             }
         }
@@ -655,22 +692,23 @@ mod tests {
     }
 
     /// A frame that arrives after a later one — possible once redundant
-    /// connections can be skewed past the dedup window — costs one gap, not a
-    /// gap on every frame after it. Rewinding `prev_u` would make the next
-    /// in-order update mismatch too, and so on until the streams realign.
+    /// connections can be skewed past the dedup window — costs *one* gap, for
+    /// the moment the hole was real. The straggler that fills it is not a
+    /// second hole, and must not rewind `prev_u` and make the next in-order
+    /// update mismatch as well.
     #[tokio::test]
-    async fn an_out_of_order_frame_does_not_rewind_the_sequence() {
+    async fn a_straggler_fills_a_hole_rather_than_reporting_another() {
         let (writer_tx, _writer_rx) = channel(16);
         let mut harness = Harness::with_connections("BTCUSDT", 2);
 
         harness.feed(&FUTURES, &writer_tx, DEPTH[0]).await.unwrap();
+        // DEPTH[1] has not arrived, so at this instant the hole is real.
         harness.feed(&FUTURES, &writer_tx, DEPTH[2]).await.unwrap();
         assert_eq!(harness.prev_u_map["btcusdt"], 7);
-        let after_skip = harness.tasks.len();
-        assert_eq!(after_skip, 1, "the skipped frame is a genuine gap");
+        assert_eq!(harness.tasks.len(), 1, "the skipped update is a real hole");
 
-        // The straggler arrives late. It is a gap too, but it must not drag
-        // `prev_u` back to 5 and make the *next* frame look like one as well.
+        // The straggler arrives late and covers exactly what was reported
+        // missing. Nothing is outstanding, so nothing more should be fetched.
         harness.feed(&FUTURES, &writer_tx, DEPTH[1]).await.unwrap();
         assert_eq!(
             harness.prev_u_map["btcusdt"], 7,
@@ -680,8 +718,34 @@ mod tests {
         harness.feed(&FUTURES, &writer_tx, DEPTH[3]).await.unwrap();
         assert_eq!(
             harness.tasks.len(),
-            after_skip + 1,
-            "the reorder costs one gap, not one per frame afterwards"
+            1,
+            "already-covered updates must not each fetch a snapshot"
+        );
+    }
+
+    /// A book whose ids restart must not leave the high-water mark stranded
+    /// above the new stream, or every later update reads as a hole forever.
+    #[tokio::test]
+    async fn a_restarted_book_resyncs_instead_of_wedging() {
+        let (writer_tx, _writer_rx) = channel(16);
+        let mut harness = Harness::with_connections("BTCUSDT", 2);
+        // Parked in the billions, as Binance ids really are.
+        harness
+            .prev_u_map
+            .insert(Symbol::from("btcusdt"), 5_000_000_000);
+
+        for frame in DEPTH {
+            harness.feed(&FUTURES, &writer_tx, frame).await.unwrap();
+        }
+
+        assert_eq!(
+            harness.prev_u_map["btcusdt"], 9,
+            "the mark follows the restarted stream"
+        );
+        assert!(
+            harness.tasks.len() <= 1,
+            "one resync, not a snapshot fetch per update: {}",
+            harness.tasks.len()
         );
     }
 

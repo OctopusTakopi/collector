@@ -44,7 +44,11 @@
 //! `first(m) = min over connections of arrival(m)` is earlier than
 //! `first(n) = min ... arrival(n)`: every term of the first minimum precedes
 //! the matching term of the second. The recorded timestamp is therefore also
-//! the lowest latency any connection achieved for that event.
+//! the lowest latency any connection achieved for that event — with the
+//! caveat that the filter sees dequeue order, not arrival order. The
+//! connections share one bounded queue, and once it is full the order in which
+//! senders win a permit is semaphore wake order, so under sustained
+//! backpressure the surviving copy can be the slower connection's.
 //!
 //! The one exception is a connection that comes back from a reconnect *ahead*
 //! of where a lagging peer still is: it can deliver an event whose predecessor
@@ -83,15 +87,23 @@ const REPORT_INTERVAL: Duration = Duration::from_secs(300);
 ///
 /// `Instant::now` per message is affordable but pointless: the window is tens
 /// of seconds and the rotation only has to be approximately on time.
+///
+/// It does mean the window is measured in messages as well as in time. On a
+/// sparse feed a generation can outlive its nominal duration by a wide margin,
+/// which costs memory and widens the window but never lets a duplicate slip —
+/// the guarantee that matters here is the lower bound. It also means the
+/// duplicate-rate report below is driven by traffic, so it falls silent when
+/// the feed does rather than reporting zero.
 const CLOCK_CHECK_INTERVAL: u32 = 1_024;
 
 /// Drops the second and later copies of a message.
 ///
 /// Keys are held in two generations that rotate on a timer. A lookup checks
-/// both, so anything inserted is remembered for at least [`DEDUP_WINDOW`] and
-/// at most twice that, without storing a timestamp per key or ever walking the
-/// set to expire it — unless [`DEDUP_MAX_ENTRIES`] forces an early rotation,
-/// which is logged.
+/// both, so anything inserted is remembered for at least [`DEDUP_WINDOW`],
+/// without storing a timestamp per key or ever walking the set to expire it.
+/// The upper bound is softer: nominally twice the window, but longer on a
+/// sparse feed (see [`CLOCK_CHECK_INTERVAL`]) and shorter when
+/// [`DEDUP_MAX_ENTRIES`] forces an early rotation, which is logged.
 pub struct Dedup {
     /// `false` for a single connection, where no message can be a duplicate.
     /// Checked before hashing, so the whole module costs one branch.
