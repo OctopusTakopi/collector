@@ -420,7 +420,13 @@ pub async fn run_collection(
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(30))
         .build()?;
-    {
+    // Depth snapshots exist to seed/repair the DEPTH stream; a worker
+    // whose stream set carries no depth (e.g. the market-path
+    // forceOrder split) must not duplicate the REST snapshot loop —
+    // the legacy worker already snapshots the same symbols, and a
+    // second loop only burns request budget (review finding).
+    let collects_depth = streams.iter().any(|s| s.contains("@depth"));
+    if collects_depth {
         let writer_tx = writer_tx.clone();
         let client = client.clone();
         let throttler = throttler.clone();
