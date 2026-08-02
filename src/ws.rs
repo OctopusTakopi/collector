@@ -39,6 +39,9 @@ pub const QUEUE_FULL_GRACE: Duration = Duration::from_secs(1);
 /// forever with no data flowing.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// RFC 6455 caps a control frame's payload at 125 bytes.
+const MAX_CONTROL_PAYLOAD: usize = 125;
+
 /// How long [`Connection::flush_close`] waits for a queued close frame.
 ///
 /// Only spent on a connection that is being discarded anyway, so it buys a
@@ -260,9 +263,14 @@ impl FrameSender {
     /// socket instead leaves the venue holding a connection slot that this IP
     /// is limited on. Pair with [`Connection::flush_close`] to wait for it to
     /// reach the wire.
+    /// `reason` is truncated to fit: a control frame may carry at most 125
+    /// bytes, and overrunning it turns a polite close into a protocol error the
+    /// peer must fail the connection on.
     pub async fn close(&self, code: u16, reason: &str) -> Result<()> {
+        let room = MAX_CONTROL_PAYLOAD - size_of::<u16>();
+        let reason = &reason.as_bytes()[..reason.len().min(room)];
         let mut payload = code.to_be_bytes().to_vec();
-        payload.extend_from_slice(reason.as_bytes());
+        payload.extend_from_slice(reason);
         self.send(Outgoing::CloseRaw(payload)).await
     }
 }

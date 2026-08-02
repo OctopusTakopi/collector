@@ -105,8 +105,23 @@ const SHUTDOWN_PROBE_LIMIT: usize = 256;
 /// RFC 6455 "going away": this endpoint is leaving, not faulting.
 const CLOSE_GOING_AWAY: u16 = 1001;
 
-/// How long a retired session may spend draining and closing before it is
-/// simply dropped. Its replacement is already carrying the feed by then.
+/// Room for the events every live session in a slot can report.
+///
+/// Each session sends at most a `Relieve` and a `Live`, and only the relieved
+/// ones outlive their successor being opened, so this is generous even during a
+/// rollout that announces a shutdown on every fresh connection.
+const EVENT_QUEUE_CAPACITY: usize = 16;
+
+/// How long a retired session may spend recovering its backlog.
+///
+/// Separate from [`RETIRE_GRACE`] on purpose: one [`ws::deliver`] can wait a
+/// whole `QUEUE_FULL_GRACE` when the consumer is saturated, so a budget shared
+/// with the close would let a slow drain consume it and leave the connection
+/// slot un-handed-back.
+const DRAIN_GRACE: Duration = Duration::from_secs(2);
+
+/// How long a retired session may spend closing politely before it is simply
+/// dropped. Its replacement is already carrying the feed by then.
 const RETIRE_GRACE: Duration = Duration::from_secs(2);
 
 /// True if `payload` is Binance's shutdown announcement.
@@ -148,15 +163,25 @@ impl Reason {
     }
 }
 
+/// Identifies one session within a connection slot, in the order they were
+/// opened. What makes "older" mean something to [`Handover`].
+type SessionId = u64;
+
 /// What a running session reports to its supervisor.
+///
+/// Every session reports on the *same* channel, including the ones that have
+/// been relieved and are still delivering. A per-session channel would be
+/// dropped the moment its session was relieved, and a session relieved before
+/// it went live — the case [`Handover`] exists for — would then have no way
+/// left to report that it had started carrying the feed.
 #[derive(Debug)]
 enum Event {
-    /// Market data from this session reached the queue, so whatever it was
-    /// opened to replace has been superseded and can be let go.
-    Live,
+    /// Market data from this session reached the queue, so every *older*
+    /// session has been superseded and can be let go.
+    Live(SessionId),
     /// Open the replacement now. The session keeps delivering until that
     /// replacement is live or the venue closes the socket, whichever is first.
-    Relieve(Reason),
+    Relieve(SessionId, Reason),
 }
 
 /// How a session ended.
@@ -187,27 +212,36 @@ enum Step {
 /// unproven socket and put back exactly the hole this removes. A venue rolling
 /// its pool can announce a shutdown on a fresh connection before its first
 /// frame arrives, which is precisely when that matters.
+///
+/// "Older" is what the ids are for. A relieved session that later starts
+/// delivering supersedes the ones before it, but emphatically not itself, so
+/// retirement is scoped to strictly lower ids.
 #[derive(Default)]
 struct Handover {
-    pending: Vec<tokio::sync::oneshot::Sender<()>>,
+    pending: Vec<(SessionId, tokio::sync::oneshot::Sender<()>)>,
 }
 
 impl Handover {
-    /// A session is delivering: every older one is now redundant.
-    fn on_live(&mut self) {
-        for retire in self.pending.drain(..) {
-            let _ = retire.send(());
+    /// Session `live` is delivering: every session opened before it is now
+    /// redundant.
+    fn on_live(&mut self, live: SessionId) {
+        for (id, retire) in std::mem::take(&mut self.pending) {
+            if id < live {
+                let _ = retire.send(());
+            } else {
+                self.pending.push((id, retire));
+            }
         }
     }
 
     /// A session was relieved and goes on delivering. Hold its handle until
     /// something proves it can be let go.
-    fn on_relieved(&mut self, retire: tokio::sync::oneshot::Sender<()>) {
+    fn on_relieved(&mut self, id: SessionId, retire: tokio::sync::oneshot::Sender<()>) {
         // Sessions the venue has already closed cannot be retired, and holding
         // their handles would let this grow for as long as replacements keep
         // being announced away before they deliver.
-        self.pending.retain(|pending| !pending.is_closed());
-        self.pending.push(retire);
+        self.pending.retain(|(_, pending)| !pending.is_closed());
+        self.pending.push((id, retire));
     }
 
     fn waiting(&self) -> usize {
@@ -282,6 +316,33 @@ pub async fn fetch_depth_snapshot(
     Ok(body)
 }
 
+/// What the drain recovered from a socket being retired.
+#[derive(Default, Debug)]
+struct Drained {
+    /// Frames the queue took. These are the ones the recording actually keeps.
+    delivered: usize,
+    /// Frames shed because the consumer was saturated. Counted separately: a
+    /// drain that reported these as recovered would tell an operator a handover
+    /// was lossless when it was not.
+    shed: usize,
+}
+
+/// Hand one market-data frame to the queue.
+///
+/// Shared by the steady-state read loop and the retire drain so the two cannot
+/// drift on how frames are stamped or classified.
+async fn deliver_frame(
+    ws_tx: &Sender<(Timestamp, bytes::Bytes)>,
+    overflow: &mut Overflow,
+    payload: bytes::Bytes,
+) -> Delivery {
+    let recv_time = Timestamp::now();
+    // Combined streams carry no subscription responses — the stream list is in
+    // the URL — so every frame here is market data and may be shed if the
+    // writer falls behind.
+    ws::deliver(ws_tx, overflow, (recv_time, payload), |_| true).await
+}
+
 /// Deliver what has already arrived on a socket that is about to be closed.
 ///
 /// The replacement subscribes when it connects, so it only ever sees events
@@ -295,27 +356,40 @@ pub async fn fetch_depth_snapshot(
 ///
 /// Cancelling `read` mid-frame is sound here and only here — the connection is
 /// closed on the next line, so a half-consumed header has nothing left to
-/// corrupt.
+/// corrupt. It does discard a frame whose payload is still arriving, but by the
+/// time a drain runs the replacement is already delivering, so a frame arriving
+/// *now* is one the replacement has too. What is unique to this socket is what
+/// arrived before the replacement subscribed, and that is already whole in the
+/// buffer.
+///
+/// `deadline` bounds the whole drain, and is checked rather than wrapped around
+/// it so the count is still returned when the budget runs out: a single
+/// [`ws::deliver`] can wait `QUEUE_FULL_GRACE` on a saturated queue, and a
+/// cancelled drain would otherwise report nothing at all.
 async fn drain_buffered<S>(
     conn: &mut ws::Connection<S>,
     ws_tx: &Sender<(Timestamp, bytes::Bytes)>,
     overflow: &mut Overflow,
-) -> usize
+    deadline: Instant,
+) -> Drained
 where
     S: tokio::io::AsyncRead + Unpin,
 {
-    let mut delivered = 0;
-    while let Ok(Ok(message)) = timeout(Duration::ZERO, conn.read()).await {
+    let mut drained = Drained::default();
+    while Instant::now() < deadline {
+        let Ok(Ok(message)) = timeout(Duration::ZERO, conn.read()).await else {
+            break;
+        };
         if message.opcode != OpCode::Text {
             continue;
         }
-        let recv_time = Timestamp::now();
-        match ws::deliver(ws_tx, overflow, (recv_time, message.payload), |_| true).await {
-            Delivery::Sent | Delivery::Dropped => delivered += 1,
+        match deliver_frame(ws_tx, overflow, message.payload).await {
+            Delivery::Sent => drained.delivered += 1,
+            Delivery::Dropped => drained.shed += 1,
             Delivery::Closed | Delivery::Undeliverable => break,
         }
     }
-    delivered
+    drained
 }
 
 /// Read one websocket session to its end, delivering market data into `ws_tx`.
@@ -326,8 +400,10 @@ where
 /// handshake happens while this socket is still delivering. The session stops
 /// when `retire` fires, when the venue closes the socket, or when it falls
 /// silent.
+#[allow(clippy::too_many_arguments)]
 async fn run_session<S>(
     mut conn: ws::Connection<S>,
+    id: SessionId,
     endpoint: &'static Endpoint,
     connection: usize,
     ws_tx: Sender<(Timestamp, bytes::Bytes)>,
@@ -353,12 +429,19 @@ where
                 // All of this is bounded: the replacement is already carrying
                 // the feed, so a socket that will not drain or close must not
                 // hold this task — and its share of the queue — open.
-                let mut drained = 0;
+                // Two separate budgets, because they are not alternatives: a
+                // single `deliver` can wait `QUEUE_FULL_GRACE` on a saturated
+                // queue, and a shared deadline would let the drain eat the
+                // close — dropping the very connection slot this path exists to
+                // hand back, under exactly the conditions where slots are
+                // scarce.
+                let drained =
+                    drain_buffered(&mut conn, &ws_tx, &mut overflow, Instant::now() + DRAIN_GRACE)
+                        .await;
+                // Hand the slot back rather than dropping the socket: this IP
+                // has a limited number of them, and a handover deliberately
+                // holds two at once.
                 let _ = timeout(RETIRE_GRACE, async {
-                    drained = drain_buffered(&mut conn, &ws_tx, &mut overflow).await;
-                    // Hand the slot back rather than dropping the socket: this
-                    // IP has a limited number of them, and a handover
-                    // deliberately holds two at once.
                     if sender.close(CLOSE_GOING_AWAY, "replaced").await.is_ok() {
                         conn.flush_close().await;
                     }
@@ -367,8 +450,10 @@ where
                 tracing::info!(
                     endpoint = endpoint.label,
                     connection,
+                    session = id,
                     lifetime = ?opened.elapsed(),
-                    drained,
+                    recovered = drained.delivered,
+                    shed = drained.shed,
                     "the replacement is carrying the feed; retiring this session"
                 );
                 return SessionEnd::Retired;
@@ -396,7 +481,7 @@ where
         // timeout bounds how late this can run, against a cap measured in hours.
         if !relieved && opened.elapsed() >= max_age {
             relieved = true;
-            request_replacement(&events, Reason::Age, endpoint, connection);
+            request_replacement(&events, id, Reason::Age, endpoint, connection);
         }
 
         match message.opcode {
@@ -415,34 +500,33 @@ where
                     // replacement.
                     if !relieved {
                         relieved = true;
-                        request_replacement(&events, Reason::ServerShutdown, endpoint, connection);
+                        request_replacement(
+                            &events,
+                            id,
+                            Reason::ServerShutdown,
+                            endpoint,
+                            connection,
+                        );
                     }
                     continue;
                 }
 
-                let recv_time = Timestamp::now();
-                // Combined streams carry no subscription responses — the stream
-                // list is in the URL — so every frame here is market data and
-                // may be shed if the writer falls behind.
-                let delivery =
-                    ws::deliver(&ws_tx, &mut overflow, (recv_time, message.payload), |_| {
-                        true
-                    })
-                    .await;
-                match delivery {
-                    Delivery::Sent => {
-                        // Only a frame the queue actually took proves this
-                        // session can carry the feed in place of the one it
-                        // replaced. A shed frame proves the opposite, and
-                        // shedding is when retiring the predecessor costs the
-                        // most: that is the session holding the longest unread
-                        // backlog.
+                match deliver_frame(&ws_tx, &mut overflow, message.payload).await {
+                    Delivery::Sent | Delivery::Dropped => {
+                        // Liveness is a property of the *socket* — this session
+                        // is connected and reading — not of the consumer. A shed
+                        // frame proves the socket just as well, and under
+                        // sustained shedding nothing would ever be `Sent`, so
+                        // requiring it would leave the predecessor running and
+                        // put a second producer on the queue that is already
+                        // saturated. What made shedding dangerous here was
+                        // retiring a session that still held a backlog, and that
+                        // is what `drain_buffered` now answers.
                         if !live {
                             live = true;
-                            let _ = events.try_send(Event::Live);
+                            let _ = events.try_send(Event::Live(id));
                         }
                     }
-                    Delivery::Dropped => {}
                     // Receiver dropped: the collector is shutting down.
                     Delivery::Closed => return SessionEnd::Finished,
                     Delivery::Undeliverable => {
@@ -480,6 +564,7 @@ where
 
 fn request_replacement(
     events: &tokio::sync::mpsc::Sender<Event>,
+    id: SessionId,
     reason: Reason,
     endpoint: &Endpoint,
     connection: usize,
@@ -487,12 +572,13 @@ fn request_replacement(
     warn!(
         endpoint = endpoint.label,
         connection,
+        session = id,
         reason = reason.as_str(),
         "asking for a replacement connection"
     );
-    // The supervisor is the only reader and the channel holds both events a
-    // session can send, so a failure here means it has already moved on.
-    let _ = events.try_send(Event::Relieve(reason));
+    // The supervisor drains this promptly and it is sized for several sessions
+    // at once, so a failure here means it has already moved on.
+    let _ = events.try_send(Event::Relieve(id, reason));
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -811,6 +897,15 @@ pub async fn keep_connection(
     let mut error_count = 0;
     let max_age = max_session_age(connection);
 
+    // One channel for every session this slot will ever open, held here so it
+    // outlives them. A per-session channel would be dropped the moment its
+    // session was relieved, and a session relieved before it went live could
+    // then never report that it had started carrying the feed — leaving the
+    // session it replaced running until some later one happened to prove
+    // itself. Holding the sender here also means `recv` never yields `None`.
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(EVENT_QUEUE_CAPACITY);
+    let mut next_session: SessionId = 0;
+
     loop {
         while lingering.try_join_next().is_some() {}
 
@@ -831,33 +926,45 @@ pub async fn keep_connection(
             }
         };
 
-        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(2);
+        let id = next_session;
+        next_session += 1;
         let (retire_tx, retire_rx) = tokio::sync::oneshot::channel();
         let mut session = Box::pin(run_session(
             conn,
+            id,
             endpoint,
             connection,
             ws_tx.clone(),
-            event_tx,
+            event_tx.clone(),
             retire_rx,
             max_age,
         ));
 
-        // `event_tx` lives inside the session future, so `recv` can only yield
-        // `None` once that future has returned — which the other arm breaks on
-        // first. The guard is not for that ordering but for what happens if it
-        // ever stops holding: a closed channel is ready forever, and under
-        // `biased` that would starve the session arm into a hot loop.
-        let mut reporting = true;
         let step = loop {
             tokio::select! {
                 biased;
-                event = event_rx.recv(), if reporting => match event {
-                    // Proof that this session carries the feed, and the only
-                    // thing that may retire the sessions it replaced.
-                    Some(Event::Live) => handover.on_live(),
-                    Some(Event::Relieve(reason)) => break Step::Relieved(reason),
-                    None => reporting = false,
+                event = event_rx.recv() => match event {
+                    // Proof that a session carries the feed, and the only thing
+                    // that may retire the ones opened before it. It can come
+                    // from a relieved session that is still delivering, which is
+                    // why the channel is shared and the id is carried.
+                    Some(Event::Live(live)) => handover.on_live(live),
+                    Some(Event::Relieve(from, reason)) if from == id => {
+                        break Step::Relieved(reason);
+                    }
+                    // A session asks to be replaced exactly once, so this can
+                    // only be a relieved session repeating itself.
+                    Some(Event::Relieve(from, _)) => {
+                        tracing::debug!(
+                            endpoint = endpoint.label,
+                            connection,
+                            session = from,
+                            "ignoring a stale relieve"
+                        );
+                    }
+                    // `event_tx` is held by this task, so the channel cannot
+                    // close while the loop runs.
+                    None => break Step::Ended(SessionEnd::Finished),
                 },
                 end = &mut session => break Step::Ended(end),
             }
@@ -869,7 +976,7 @@ pub async fn keep_connection(
                 // Deliberately *not* retiring anything here. This session has
                 // asked to be replaced, which says nothing about whether the
                 // replacement will work — only `Event::Live` does.
-                handover.on_relieved(retire_tx);
+                handover.on_relieved(id, retire_tx);
                 warn!(
                     endpoint = endpoint.label,
                     connection,
@@ -901,9 +1008,17 @@ pub async fn keep_connection(
             // stops the relieved sessions too.
             Step::Ended(SessionEnd::Finished) => return,
             Step::Ended(SessionEnd::Retired) => {
-                // Only a relieved session is ever retired, and this one was
-                // active. Reconnecting is still right; backing off keeps an
-                // impossible state from becoming a spin.
+                // `Handover` only ever fires handles it was given, and the
+                // active session's is not among them until it is relieved — so
+                // this should not be reachable. Say so rather than absorbing it:
+                // reconnecting is still the right response, and the backoff
+                // keeps a state that cannot happen from becoming a spin.
+                warn!(
+                    endpoint = endpoint.label,
+                    connection,
+                    session = id,
+                    "the active session was retired; this should not happen"
+                );
                 back_off(&mut error_count, None).await;
             }
             Step::Ended(SessionEnd::Lost(error)) => {
@@ -1245,6 +1360,9 @@ mod tests {
 
     const ANNOUNCEMENT: &str = r#"{"e":"serverShutdown","E":1770123456789}"#;
 
+    /// The id the harness runs its session under.
+    const TEST_SESSION: SessionId = 7;
+
     /// One session, its peer, and the channels the supervisor would watch.
     struct SessionHarness {
         server: fastwebsockets::WebSocket<tokio::io::DuplexStream>,
@@ -1261,7 +1379,14 @@ mod tests {
             let (ws_tx, data) = tokio::sync::mpsc::channel(16);
             let (retire_tx, retire_rx) = tokio::sync::oneshot::channel();
             let session = tokio::spawn(run_session(
-                conn, &SPOT, 0, ws_tx, event_tx, retire_rx, max_age,
+                conn,
+                TEST_SESSION,
+                &SPOT,
+                0,
+                ws_tx,
+                event_tx,
+                retire_rx,
+                max_age,
             ));
             Self {
                 server,
@@ -1300,13 +1425,16 @@ mod tests {
         let mut harness = SessionHarness::start(NEVER);
 
         harness.send_market_data().await;
-        assert!(matches!(harness.events.recv().await, Some(Event::Live)));
+        assert!(matches!(
+            harness.events.recv().await,
+            Some(Event::Live(TEST_SESSION))
+        ));
         assert!(harness.data.recv().await.is_some());
 
         harness.send_text(ANNOUNCEMENT).await;
         assert!(matches!(
             harness.events.recv().await,
-            Some(Event::Relieve(Reason::ServerShutdown))
+            Some(Event::Relieve(TEST_SESSION, Reason::ServerShutdown))
         ));
 
         harness.send_market_data().await;
@@ -1326,7 +1454,7 @@ mod tests {
         harness.send_text(ANNOUNCEMENT).await;
         assert!(matches!(
             harness.events.recv().await,
-            Some(Event::Relieve(Reason::ServerShutdown))
+            Some(Event::Relieve(TEST_SESSION, Reason::ServerShutdown))
         ));
         harness.send_market_data().await;
 
@@ -1347,7 +1475,7 @@ mod tests {
 
         assert!(matches!(
             harness.events.recv().await,
-            Some(Event::Relieve(Reason::Age))
+            Some(Event::Relieve(TEST_SESSION, Reason::Age))
         ));
         assert!(
             !harness.session.is_finished(),
@@ -1392,9 +1520,16 @@ mod tests {
                 .unwrap();
         }
 
-        let drained = drain_buffered(&mut conn, &ws_tx, &mut overflow).await;
+        let drained = drain_buffered(
+            &mut conn,
+            &ws_tx,
+            &mut overflow,
+            Instant::now() + DRAIN_GRACE,
+        )
+        .await;
 
-        assert_eq!(drained, 3, "the backlog must not be discarded");
+        assert_eq!(drained.delivered, 3, "the backlog must not be discarded");
+        assert_eq!(drained.shed, 0);
         assert_eq!(data.len(), 3);
     }
 
@@ -1408,7 +1543,14 @@ mod tests {
         let mut overflow = Overflow::new("test");
 
         let before = tokio::time::Instant::now();
-        assert_eq!(drain_buffered(&mut conn, &ws_tx, &mut overflow).await, 0);
+        let drained = drain_buffered(
+            &mut conn,
+            &ws_tx,
+            &mut overflow,
+            Instant::now() + DRAIN_GRACE,
+        )
+        .await;
+        assert_eq!(drained.delivered, 0);
         assert_eq!(
             tokio::time::Instant::now(),
             before,
@@ -1425,14 +1567,36 @@ mod tests {
         let (live_session, mut live_rx) = tokio::sync::oneshot::channel();
         let (unproven_session, _unproven_rx) = tokio::sync::oneshot::channel();
 
-        handover.on_relieved(live_session);
-        handover.on_relieved(unproven_session);
+        handover.on_relieved(0, live_session);
+        handover.on_relieved(1, unproven_session);
 
         assert_eq!(handover.waiting(), 2);
         assert!(
             live_rx.try_recv().is_err(),
             "the delivering session must still be running"
         );
+    }
+
+    /// The session relieved before it went live is still the one carrying the
+    /// feed once it starts delivering, so it must be able to release the session
+    /// it replaced — and must not release itself doing it.
+    #[test]
+    fn a_relieved_session_that_goes_live_retires_its_elders_but_not_itself() {
+        let mut handover = Handover::default();
+        let (elder, mut elder_rx) = tokio::sync::oneshot::channel();
+        let (relieved_but_delivering, mut own_rx) = tokio::sync::oneshot::channel();
+
+        handover.on_relieved(0, elder);
+        handover.on_relieved(1, relieved_but_delivering);
+
+        handover.on_live(1);
+
+        assert!(elder_rx.try_recv().is_ok(), "the elder is now redundant");
+        assert!(
+            own_rx.try_recv().is_err(),
+            "a session must not retire itself by proving it works"
+        );
+        assert_eq!(handover.waiting(), 1);
     }
 
     /// Once something is proven to carry the feed, everything older is
@@ -1443,9 +1607,9 @@ mod tests {
         let (first, mut first_rx) = tokio::sync::oneshot::channel();
         let (second, mut second_rx) = tokio::sync::oneshot::channel();
 
-        handover.on_relieved(first);
-        handover.on_relieved(second);
-        handover.on_live();
+        handover.on_relieved(0, first);
+        handover.on_relieved(1, second);
+        handover.on_live(2);
 
         assert!(first_rx.try_recv().is_ok());
         assert!(second_rx.try_recv().is_ok());
@@ -1458,11 +1622,11 @@ mod tests {
     fn sessions_that_already_ended_are_forgotten() {
         let mut handover = Handover::default();
         let (ended, ended_rx) = tokio::sync::oneshot::channel();
-        handover.on_relieved(ended);
+        handover.on_relieved(0, ended);
         drop(ended_rx);
 
         let (current, _current_rx) = tokio::sync::oneshot::channel();
-        handover.on_relieved(current);
+        handover.on_relieved(1, current);
 
         assert_eq!(handover.waiting(), 1);
     }
