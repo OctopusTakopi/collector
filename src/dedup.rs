@@ -15,13 +15,16 @@
 //!
 //! That property is a fact about each venue's encoding, not a law, and it must
 //! be measured before trusting it on a new one. It holds for every JSON stream
-//! here: two connections recording the same 60 s window produced 34,008 rows
-//! with zero duplicates, and zero even when event and transact times were
-//! ignored — so those timestamps come from the matching engine, identical for
-//! all subscribers. It does *not* hold for Binance's SBE streams, which stamp
-//! `eventTime` per connection at serialisation and land tens of microseconds
-//! apart; the sister `sbe-collector` has to cut that field out of the key. A
-//! venue that stamps per connection will silently record every copy, so the
+//! here with one exception, measured over two days of redundant collection:
+//! Binance **spot** stamps event time `E` per connection at serialisation, so
+//! a few percent of spot events differ between copies only in `E` and a
+//! whole-payload key would record both. The binance market worker therefore
+//! cuts `E` out of the key before calling [`Dedup::is_duplicate_key`]
+//! (Binance futures JSON is unaffected — its copies are byte-identical). It
+//! does *not* hold for Binance's SBE streams either, which stamp `eventTime`
+//! per connection at serialisation and land tens of microseconds apart; the
+//! sister `sbe-collector` has to cut that field out of the key. A venue that
+//! stamps per connection will silently record every copy, so the
 //! check on a new feed is: run two connections for a minute and confirm the
 //! row count does not double.
 //!
@@ -170,6 +173,13 @@ impl Dedup {
     /// bytes reports the second call as a duplicate. Call it once per message,
     /// on the path that decides whether to keep it.
     pub fn is_duplicate(&mut self, payload: &[u8]) -> bool {
+        self.is_duplicate_key(xxhash_rust::xxh3::xxh3_128(payload))
+    }
+
+    /// Key-level variant of [`Self::is_duplicate`] for venues whose otherwise
+    /// identical copies differ in a per-connection stamp: the caller hashes
+    /// the payload with that field cut out, so all copies share one key.
+    pub fn is_duplicate_key(&mut self, key: u128) -> bool {
         if !self.enabled {
             return false;
         }
@@ -185,7 +195,6 @@ impl Dedup {
         // probability around 2^-85. A 64-bit key would be roughly 2^-21 per
         // window, which over a year of collection is a coin flip — and a
         // collision here silently discards a real message.
-        let key = xxhash_rust::xxh3::xxh3_128(payload);
         if self.previous.contains(&key) || !self.current.insert(key) {
             self.duplicate += 1;
             true
@@ -263,6 +272,16 @@ mod tests {
         assert!(!dedup.is_duplicate(frame));
         assert!(dedup.is_duplicate(frame));
         assert!(dedup.is_duplicate(frame));
+    }
+
+    /// Callers that normalise per-connection stamps before hashing must get
+    /// the same suppression as byte-identical payloads.
+    #[test]
+    fn a_repeated_key_is_reported_once() {
+        let mut dedup = Dedup::new(DEDUP_WINDOW, DEDUP_MAX_ENTRIES);
+
+        assert!(!dedup.is_duplicate_key(42));
+        assert!(dedup.is_duplicate_key(42));
     }
 
     #[test]
