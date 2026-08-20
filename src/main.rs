@@ -9,6 +9,7 @@ use tokio::{
 use tracing::{error, info};
 
 use crate::file::Writer;
+use crate::quality::QualityEvent;
 
 mod binance;
 mod binance_market;
@@ -19,7 +20,10 @@ mod dedup;
 mod error;
 mod feed;
 mod file;
+mod handover;
 mod hyperliquid;
+mod quality;
+mod readiness;
 mod routing;
 mod symbol;
 mod throttler;
@@ -38,6 +42,15 @@ const CONNECT_STAGGER: Duration = Duration::from_secs(5);
 /// How long the collection task is given to hand its already-received messages
 /// to the writer before it is aborted outright.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+const FILE_ROTATION_POLL: Duration = Duration::from_secs(1);
+
+fn recv_with_timeout<T>(
+    runtime: &tokio::runtime::Handle,
+    receiver: &mut tokio::sync::mpsc::Receiver<T>,
+    wait: Duration,
+) -> Result<Option<T>, tokio::time::error::Elapsed> {
+    runtime.block_on(async { tokio::time::timeout(wait, receiver.recv()).await })
+}
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -64,6 +77,11 @@ struct Args {
         value_parser = clap::value_parser!(u8).range(1..=8),
     )]
     connections: u8,
+
+    /// Linux Unix-domain socket used to coordinate zero-gap rolling updates.
+    /// Defaults to `<path>/.collector.sock`.
+    #[arg(long)]
+    handover_socket: Option<std::path::PathBuf>,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -73,6 +91,15 @@ async fn main() -> Result<(), anyhow::Error> {
     tracing_subscriber::fmt::init();
 
     let connections = usize::from(args.connections);
+    let required_sources = if matches!(
+        args.exchange.as_str(),
+        "binancefutures" | "binancefuturesum"
+    ) {
+        connections.saturating_mul(2)
+    } else {
+        connections
+    };
+    let (readiness, ready_rx) = readiness::Readiness::new(required_sources);
     if connections > 1 {
         info!(
             connections,
@@ -81,6 +108,33 @@ async fn main() -> Result<(), anyhow::Error> {
     }
 
     std::fs::create_dir_all(&args.path)?;
+    let run_id = format!(
+        "{}-{}",
+        jiff::Timestamp::now().as_nanosecond(),
+        std::process::id()
+    );
+    let (quality, quality_thread, mut quality_done_rx, quality_path) =
+        quality::start(std::path::Path::new(&args.path), &run_id)?;
+    info!(run_id, path = %quality_path.display(), "quality log started");
+    let handover_path = args
+        .handover_socket
+        .clone()
+        .unwrap_or_else(|| std::path::Path::new(&args.path).join(".collector.sock"));
+    let identity = handover::Identity {
+        exchange: args.exchange.clone(),
+        symbols: args.symbols.clone(),
+        connections,
+        output: std::fs::canonicalize(&args.path)?.display().to_string(),
+    };
+    let (takeover_tx, mut takeover_rx) = tokio::sync::mpsc::channel(1);
+    let mut handover_handle = tokio::spawn(handover::run(
+        handover_path,
+        identity,
+        run_id.clone(),
+        ready_rx,
+        takeover_tx,
+        quality.clone(),
+    ));
     let (writer_tx, mut writer_rx) = channel::<file::WriteRecord>(WRITER_QUEUE_CAPACITY);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -103,6 +157,8 @@ async fn main() -> Result<(), anyhow::Error> {
                 writer_tx,
                 shutdown_rx,
                 connections,
+                quality.clone(),
+                readiness.clone(),
             ))
         }
         "binancefuturescm" => {
@@ -125,6 +181,8 @@ async fn main() -> Result<(), anyhow::Error> {
                 writer_tx,
                 shutdown_rx,
                 connections,
+                quality.clone(),
+                readiness.clone(),
             ))
         }
         "binance" | "binancespot" => {
@@ -139,6 +197,8 @@ async fn main() -> Result<(), anyhow::Error> {
                 writer_tx,
                 shutdown_rx,
                 connections,
+                quality.clone(),
+                readiness.clone(),
             ))
         }
         "bybit" => {
@@ -159,6 +219,8 @@ async fn main() -> Result<(), anyhow::Error> {
                 writer_tx,
                 shutdown_rx,
                 connections,
+                quality.clone(),
+                readiness.clone(),
             ))
         }
         "hyperliquid" => {
@@ -173,6 +235,8 @@ async fn main() -> Result<(), anyhow::Error> {
                 writer_tx,
                 shutdown_rx,
                 connections,
+                quality.clone(),
+                readiness.clone(),
             ))
         }
         exchange => {
@@ -183,16 +247,32 @@ async fn main() -> Result<(), anyhow::Error> {
     let (writer_done_tx, writer_done_rx) = oneshot::channel();
     let writer_thread = {
         let path = args.path.clone();
+        let run_id = run_id.clone();
+        let quality = quality.clone();
+        let readiness = readiness.clone();
+        let runtime = tokio::runtime::Handle::current();
         std::thread::spawn(move || -> Result<(), anyhow::Error> {
-            let mut writer = Writer::new(&path);
+            let mut writer = Writer::new(&path, &run_id, quality);
+            let mut writer_ready = false;
+            let mut next_rotation_check = std::time::Instant::now() + FILE_ROTATION_POLL;
             let result = loop {
-                match writer_rx.blocking_recv() {
-                    Some((recv_time, symbol, data)) => {
+                let wait = next_rotation_check.saturating_duration_since(std::time::Instant::now());
+                match recv_with_timeout(&runtime, &mut writer_rx, wait) {
+                    Ok(Some((recv_time, symbol, data))) => {
                         if let Err(error) = writer.write(recv_time, symbol, data) {
                             break Err(error);
                         }
+                        if !writer_ready {
+                            readiness.mark_writer_ready();
+                            writer_ready = true;
+                        }
                     }
-                    None => break Ok(()),
+                    Ok(None) => break Ok(()),
+                    Err(_) => {}
+                }
+                if std::time::Instant::now() >= next_rotation_check {
+                    writer.finalize_expired(jiff::Timestamp::now());
+                    next_rotation_check = std::time::Instant::now() + FILE_ROTATION_POLL;
                 }
             };
             let result = result.and(writer.close());
@@ -204,6 +284,9 @@ async fn main() -> Result<(), anyhow::Error> {
     enum Shutdown {
         Signal,
         Writer,
+        Quality,
+        Takeover(handover::TakeoverRequest),
+        HandoverFailed(anyhow::Error),
         Collection(Result<(), anyhow::Error>),
     }
 
@@ -217,6 +300,22 @@ async fn main() -> Result<(), anyhow::Error> {
             error!("writer stopped; shutting down collection");
             Shutdown::Writer
         }
+        _ = &mut quality_done_rx => {
+            error!("quality log stopped; shutting down collection");
+            Shutdown::Quality
+        }
+        Some(request) = takeover_rx.recv() => {
+            info!(peer_run_id = %request.peer_run_id, "ready replacement requested takeover");
+            Shutdown::Takeover(request)
+        }
+        result = &mut handover_handle => {
+            let error = match result {
+                Ok(Ok(())) => anyhow!("UDS handover supervisor exited unexpectedly"),
+                Ok(Err(error)) => error,
+                Err(error) => anyhow!("UDS handover task failed: {error}"),
+            };
+            Shutdown::HandoverFailed(error)
+        }
         result = &mut handle => {
             Shutdown::Collection(match result {
                 Ok(result) => result,
@@ -225,12 +324,12 @@ async fn main() -> Result<(), anyhow::Error> {
         }
     };
 
-    let collection_result = match shutdown {
-        Shutdown::Signal | Shutdown::Writer => {
+    let (mut collection_result, takeover_request, handover_error) = match shutdown {
+        Shutdown::Signal | Shutdown::Writer | Shutdown::Quality => {
             // Ask the collection task to stop reading and flush what it already
             // has, rather than aborting it with a full queue.
             shutdown_tx.send_replace(true);
-            match tokio::time::timeout(DRAIN_TIMEOUT, &mut handle).await {
+            let result = match tokio::time::timeout(DRAIN_TIMEOUT, &mut handle).await {
                 Ok(Ok(result)) => result,
                 Ok(Err(error)) => Err(anyhow!("collection task failed: {error}")),
                 Err(_) => {
@@ -243,22 +342,117 @@ async fn main() -> Result<(), anyhow::Error> {
                          queued records were discarded"
                     ))
                 }
-            }
+            };
+            (result, None, None)
         }
-        Shutdown::Collection(result) => result,
+        Shutdown::Takeover(request) => {
+            shutdown_tx.send_replace(true);
+            let result = match tokio::time::timeout(DRAIN_TIMEOUT, &mut handle).await {
+                Ok(Ok(result)) => result,
+                Ok(Err(error)) => Err(anyhow!("collection task failed: {error}")),
+                Err(_) => {
+                    handle.abort();
+                    let _ = handle.await;
+                    Err(anyhow!(
+                        "collection task did not finish draining within {DRAIN_TIMEOUT:?}; \
+                         queued records were discarded"
+                    ))
+                }
+            };
+            (result, Some(request), None)
+        }
+        Shutdown::HandoverFailed(error) => {
+            shutdown_tx.send_replace(true);
+            let result = match tokio::time::timeout(DRAIN_TIMEOUT, &mut handle).await {
+                Ok(Ok(result)) => result,
+                Ok(Err(error)) => Err(anyhow!("collection task failed: {error}")),
+                Err(_) => {
+                    handle.abort();
+                    let _ = handle.await;
+                    Err(anyhow!("collection drain timed out after handover failure"))
+                }
+            };
+            (result, None, Some(error))
+        }
+        Shutdown::Collection(result) => (result, None, None),
     };
+
+    if collection_result.is_ok()
+        && let Some(error) = handover_error
+    {
+        collection_result = Err(error);
+    }
 
     let writer_result = match writer_thread.join() {
         Ok(result) => result,
         Err(_) => Err(anyhow!("writer thread panicked")),
     };
 
+    if let Err(error) = &collection_result {
+        quality.report(QualityEvent::CriticalTaskFailed {
+            at_ns: QualityEvent::now_ns(),
+            task: "collection".to_owned(),
+            error: error.to_string(),
+        });
+    }
+    if let Err(error) = &writer_result {
+        quality.report(QualityEvent::StorageDegraded {
+            at_ns: QualityEvent::now_ns(),
+            target: args.path.clone(),
+            error: error.to_string(),
+        });
+    }
+    if let Some(request) = takeover_request {
+        let error = collection_result
+            .as_ref()
+            .err()
+            .or_else(|| writer_result.as_ref().err())
+            .map(ToString::to_string);
+        quality.report(QualityEvent::Handover {
+            at_ns: QualityEvent::now_ns(),
+            state: if error.is_none() {
+                "incumbent_drained"
+            } else {
+                "incumbent_drained_degraded"
+            }
+            .to_owned(),
+            peer_run_id: Some(request.peer_run_id.clone()),
+        });
+        request.complete(handover::DrainReport {
+            clean: error.is_none(),
+            error,
+        });
+        if tokio::time::timeout(std::time::Duration::from_secs(5), &mut handover_handle)
+            .await
+            .is_err()
+        {
+            handover_handle.abort();
+            let _ = handover_handle.await;
+        }
+    } else if !handover_handle.is_finished() {
+        handover_handle.abort();
+        let _ = handover_handle.await;
+    }
+    drop(quality);
+    let quality_result = match quality_thread.join() {
+        Ok(result) => result.map_err(anyhow::Error::from),
+        Err(_) => Err(anyhow!("quality writer thread panicked")),
+    };
+
     // The collection error is the root cause; a writer close failure is usually
     // a symptom of the same underlying problem, so it must not mask it.
-    match (collection_result, writer_result) {
+    let result = match (collection_result, writer_result) {
         (Err(collection), Err(writer)) => {
             error!(%writer, "the writer also failed while shutting down");
             Err(collection)
+        }
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
+    };
+    match (result, quality_result) {
+        (Err(error), Err(quality_error)) => {
+            error!(%quality_error, "the quality log also failed while shutting down");
+            Err(error)
         }
         (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
         (Ok(()), Ok(())) => Ok(()),
@@ -282,5 +476,22 @@ async fn shutdown_signal() -> std::io::Result<&'static str> {
     {
         signal::ctrl_c().await?;
         Ok("SIGINT")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn writer_timeout_runs_from_a_plain_thread() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let handle = runtime.handle().clone();
+        let (_sender, mut receiver) = tokio::sync::mpsc::channel::<()>(1);
+        let worker = std::thread::spawn(move || {
+            recv_with_timeout(&handle, &mut receiver, Duration::from_millis(1))
+        });
+
+        assert!(worker.join().unwrap().is_err());
     }
 }

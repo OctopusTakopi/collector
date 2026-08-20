@@ -5,6 +5,8 @@ use tokio::sync::{mpsc::Sender, watch};
 use crate::{
     binance_market::{self, DepthContinuity, Endpoint},
     file::WriteRecord,
+    quality::QualityReporter,
+    readiness::Readiness,
 };
 
 static ENDPOINT: Endpoint = Endpoint {
@@ -22,6 +24,8 @@ pub async fn run_collection(
     writer_tx: Sender<WriteRecord>,
     shutdown: watch::Receiver<bool>,
     connections: usize,
+    quality: QualityReporter,
+    readiness: Readiness,
 ) -> Result<(), anyhow::Error> {
     binance_market::run_collection(
         &ENDPOINT,
@@ -30,6 +34,8 @@ pub async fn run_collection(
         writer_tx,
         shutdown,
         connections,
+        quality,
+        readiness,
     )
     .await
 }

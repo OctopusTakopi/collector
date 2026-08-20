@@ -21,8 +21,14 @@ use tokio::{
 use tracing::error;
 
 use crate::{
-    dedup::Dedup, error::ConnectorError, feed::Feed, file::WriteRecord,
-    routing::HyperliquidMessage, symbol::SymbolCache,
+    dedup::Dedup,
+    error::ConnectorError,
+    feed::{BackgroundResult, Feed},
+    file::WriteRecord,
+    quality::QualityReporter,
+    readiness::Readiness,
+    routing::HyperliquidMessage,
+    symbol::SymbolCache,
 };
 
 /// How often to restate that requests were rejected, so an incomplete feed
@@ -106,6 +112,8 @@ pub async fn run_collection(
     writer_tx: Sender<WriteRecord>,
     shutdown: watch::Receiver<bool>,
     connections: usize,
+    quality: QualityReporter,
+    readiness: Readiness,
 ) -> Result<(), anyhow::Error> {
     let connections = connections.max(1);
     // Hyperliquid's caps are per IP "across all websocket connections", not per
@@ -127,24 +135,41 @@ pub async fn run_collection(
     let (ws_tx, ws_rx) =
         channel::<(Timestamp, bytes::Bytes)>(crate::WS_QUEUE_CAPACITY.saturating_mul(connections));
     let mut feed = Feed::new(ws_rx, shutdown);
-    let mut tasks = JoinSet::new();
+    let mut tasks: JoinSet<BackgroundResult> = JoinSet::new();
     let mut symbol_cache = SymbolCache::new(&symbols);
     let rejections = Arc::new(Rejections::default());
     for connection in 0..connections {
         let subscriptions = subscriptions.clone();
         let symbols = symbols.clone();
         let ws_tx = ws_tx.clone();
+        let quality = quality.clone();
+        let readiness = readiness.clone();
         tasks.spawn(async move {
             tokio::time::sleep(crate::CONNECT_STAGGER * connection as u32).await;
-            keep_connection(subscriptions, symbols, connection, connections, ws_tx).await;
-            error!(connection, "the websocket connection task exited");
+            keep_connection(
+                subscriptions,
+                symbols,
+                connection,
+                connections,
+                ws_tx,
+                quality,
+                readiness,
+            )
+            .await;
+            Err(anyhow::anyhow!(
+                "Hyperliquid websocket connection supervisor {connection} exited"
+            ))
         });
     }
     // The clones above are the only senders that should keep the feed open.
     drop(ws_tx);
-    tasks.spawn(report_rejections(Arc::clone(&rejections)));
+    let rejection_report_state = Arc::clone(&rejections);
+    tasks.spawn(async move {
+        report_rejections(rejection_report_state).await;
+        Err(anyhow::anyhow!("Hyperliquid rejection reporter exited"))
+    });
 
-    while let Some((recv_time, data)) = feed.recv(&mut tasks).await {
+    while let Some((recv_time, data)) = feed.recv(&mut tasks).await? {
         if let Err(error) = handle(
             &writer_tx,
             &mut symbol_cache,

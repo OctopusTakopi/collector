@@ -1,15 +1,19 @@
-use std::{borrow::Cow, collections::HashMap, fs::File, io, io::Write, time::Duration};
+use std::{
+    borrow::Cow, collections::HashMap, fs::File, io, io::Write, path::PathBuf, time::Duration,
+};
 
 use bytes::BufMut;
 use jiff::Timestamp;
 use tracing::{error, info, warn};
 use zstd::stream::write::Encoder as ZstdEncoder;
 
+use crate::quality::{QualityEvent, QualityReporter};
 use crate::symbol::Symbol;
 
 pub type WriteRecord = (Timestamp, Symbol, bytes::Bytes);
 
 const SYNC_ATTEMPTS: u32 = 3;
+const SEGMENT_NANOS: i64 = 60_000_000_000;
 
 /// Characters left as-is in a filename.
 ///
@@ -55,47 +59,64 @@ fn encode_symbol(symbol: &str) -> Cow<'_, str> {
 pub struct RotatingFile {
     next_rotation: i64,
     path: String,
+    run_id: String,
+    late_sequence: u64,
     file: Option<ZstdEncoder<'static, File>>,
+    active_path: Option<PathBuf>,
+    final_path: Option<PathBuf>,
     buf: bytes::BytesMut,
     /// Set when a rotation could not be finalized, so the already-rotated file
     /// may be missing its zstd footer. Collection continues, but the process
     /// must not report a clean exit.
     degraded: bool,
+    quality: QualityReporter,
 }
 
 impl RotatingFile {
     fn create(
         timestamp: Timestamp,
         path: &str,
-    ) -> Result<(ZstdEncoder<'static, File>, i64), io::Error> {
+        run_id: &str,
+    ) -> Result<(ZstdEncoder<'static, File>, PathBuf, PathBuf, i64), io::Error> {
+        let timestamp_ns = timestamp.as_nanosecond() as i64;
+        let segment_start = timestamp_ns.div_euclid(SEGMENT_NANOS) * SEGMENT_NANOS;
+        let next_rotation = segment_start.saturating_add(SEGMENT_NANOS);
         let zoned = timestamp.to_zoned(jiff::tz::TimeZone::UTC);
         let date_str = zoned.date().strftime("%Y%m%d");
+        let final_path = PathBuf::from(format!("{path}_{date_str}_{segment_start}_{run_id}.zst"));
+        let active_path = PathBuf::from(format!("{}.part", final_path.display()));
         let file = File::options()
-            .create(true)
-            .append(true)
-            .open(format!("{path}_{date_str}.zst"))?;
+            .create_new(true)
+            .write(true)
+            .open(&active_path)?;
 
-        let next_rotation = zoned
-            .date()
-            .tomorrow()
-            .map_err(io::Error::other)?
-            .at(0, 0, 0, 0)
-            .to_zoned(jiff::tz::TimeZone::UTC)
-            .map_err(io::Error::other)?
-            .timestamp()
-            .as_nanosecond();
-
-        Ok((ZstdEncoder::new(file, 1)?, next_rotation as i64))
+        Ok((
+            ZstdEncoder::new(file, 1)?,
+            active_path,
+            final_path,
+            next_rotation,
+        ))
     }
 
-    pub fn new(timestamp: Timestamp, path: String) -> Result<Self, io::Error> {
-        let (file, next_rotation) = Self::create(timestamp, &path)?;
+    pub fn new(
+        timestamp: Timestamp,
+        path: String,
+        run_id: String,
+        quality: QualityReporter,
+    ) -> Result<Self, io::Error> {
+        let (file, active_path, final_path, next_rotation) =
+            Self::create(timestamp, &path, &run_id)?;
         Ok(Self {
             next_rotation,
             file: Some(file),
             path,
+            run_id,
+            late_sequence: 0,
+            active_path: Some(active_path),
+            final_path: Some(final_path),
             buf: bytes::BytesMut::with_capacity(8 * 1024),
             degraded: false,
+            quality,
         })
     }
 
@@ -113,44 +134,107 @@ impl RotatingFile {
 
         // Retry a transient fsync failure, then let the last attempt speak for
         // itself — no unreachable arm to fall out of sync with the bound.
+        let mut synced = false;
         for attempt in 1..SYNC_ATTEMPTS {
             match file.sync_all() {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    synced = true;
+                    break;
+                }
                 Err(error) => {
                     warn!(path = %self.path, attempt, %error, "sync_all failed; retrying");
                     std::thread::sleep(Duration::from_millis(25 * u64::from(attempt)));
                 }
             }
         }
-        file.sync_all().map_err(|error| {
-            io::Error::new(
+        if !synced && let Err(error) = file.sync_all() {
+            return Err(io::Error::new(
                 error.kind(),
                 format!(
                     "failed to sync {} after {SYNC_ATTEMPTS} attempts: {error}",
                     self.path
                 ),
-            )
-        })
+            ));
+        }
+        drop(file);
+
+        let active_path = self
+            .active_path
+            .take()
+            .ok_or_else(|| io::Error::other("active segment path is missing"))?;
+        let final_path = self
+            .final_path
+            .take()
+            .ok_or_else(|| io::Error::other("final segment path is missing"))?;
+        std::fs::rename(&active_path, &final_path)?;
+        if let Some(parent) = final_path.parent() {
+            File::open(parent)?.sync_all()?;
+        }
+        Ok(())
+    }
+
+    fn finalize_or_degrade(&mut self, trigger: &'static str) -> bool {
+        if let Err(error) = self.finalize() {
+            error!(
+                path = %self.path,
+                %error,
+                trigger,
+                "failed to finalize recording segment; collection is degraded"
+            );
+            self.degraded = true;
+            self.quality.report(QualityEvent::StorageDegraded {
+                at_ns: QualityEvent::now_ns(),
+                target: self.path.clone(),
+                error: error.to_string(),
+            });
+            false
+        } else {
+            true
+        }
+    }
+
+    fn finalize_if_expired(&mut self, now: Timestamp) {
+        if self.file.is_some()
+            && now.as_nanosecond() >= i128::from(self.next_rotation)
+            && self.finalize_or_degrade("wall_clock")
+        {
+            info!(path = %self.path, "idle recording segment finalized");
+        }
+    }
+
+    fn open_late_segment(&mut self, timestamp: Timestamp) -> io::Result<()> {
+        self.late_sequence = self.late_sequence.saturating_add(1);
+        let run_token = format!("{}.late{}", self.run_id, self.late_sequence);
+        let (file, active_path, final_path, next_rotation) =
+            Self::create(timestamp, &self.path, &run_token)?;
+        self.file = Some(file);
+        self.active_path = Some(active_path);
+        self.final_path = Some(final_path);
+        self.next_rotation = next_rotation;
+        info!(path = %self.path, "opened a late-record segment after wall-clock finalization");
+        Ok(())
     }
 
     pub fn write(&mut self, timestamp: Timestamp, data: bytes::Bytes) -> Result<(), io::Error> {
         let ts_nanos = timestamp.as_nanosecond();
+        // A wall-clock tick may have finalized this minute before a record
+        // timestamped in it traversed both bounded queues. Keep the completed
+        // file immutable and put such records in another independently durable
+        // segment instead of terminating the collector.
+        if self.file.is_none() && ts_nanos < i128::from(self.next_rotation) {
+            self.open_late_segment(timestamp)?;
+        }
         if ts_nanos >= self.next_rotation as i128 {
-            if let Err(error) = self.finalize() {
-                // Failing to close yesterday's file must not stop today's data
-                // for this symbol, let alone for every other symbol sharing the
-                // writer thread. `degraded` carries the failure to the exit code.
-                error!(
-                    path = %self.path,
-                    %error,
-                    "failed to finalize file on rotation; continuing with the new file"
-                );
-                self.degraded = true;
-            }
-            let (new_file, next_rotation) = Self::create(timestamp, &self.path)?;
+            // Failing to close one segment must not stop data for every other
+            // symbol. `degraded` carries the failure to the process exit code.
+            let _ = self.finalize_or_degrade("record");
+            let (new_file, active_path, final_path, next_rotation) =
+                Self::create(timestamp, &self.path, &self.run_id)?;
             self.file = Some(new_file);
+            self.active_path = Some(active_path);
+            self.final_path = Some(final_path);
             self.next_rotation = next_rotation;
-            info!(%self.path, "date is changed, file rotated");
+            info!(%self.path, "recording segment rotated");
         }
 
         self.buf.clear();
@@ -182,14 +266,18 @@ impl Drop for RotatingFile {
 
 pub struct Writer {
     path: String,
+    run_id: String,
     files: HashMap<Symbol, RotatingFile>,
+    quality: QualityReporter,
 }
 
 impl Writer {
-    pub fn new(path: &str) -> Self {
+    pub fn new(path: &str, run_id: &str, quality: QualityReporter) -> Self {
         Self {
             path: path.to_string(),
+            run_id: run_id.to_owned(),
             files: Default::default(),
+            quality,
         }
     }
 
@@ -206,12 +294,20 @@ impl Writer {
             rotating_file.write(recv_time, data)?;
         } else {
             let path = format!("{}/{}", self.path, name);
-            let mut rotating_file = RotatingFile::new(recv_time, path)?;
+            let mut rotating_file =
+                RotatingFile::new(recv_time, path, self.run_id.clone(), self.quality.clone())?;
             rotating_file.write(recv_time, data)?;
             self.files
                 .insert(Symbol::from(name.as_ref()), rotating_file);
         }
         Ok(())
+    }
+
+    /// Finalize completed minute segments even when no later record arrives.
+    pub fn finalize_expired(&mut self, now: Timestamp) {
+        for file in self.files.values_mut() {
+            file.finalize_if_expired(now);
+        }
     }
 
     pub fn close(&mut self) -> Result<(), anyhow::Error> {
@@ -307,7 +403,11 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
 
-        let mut writer = Writer::new(dir.to_str().unwrap());
+        let mut writer = Writer::new(
+            dir.to_str().unwrap(),
+            "test-run",
+            QualityReporter::disabled(),
+        );
         for symbol in ["purr/usdc", "purr_usdc"] {
             writer
                 .write(
@@ -346,7 +446,11 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
 
-        let mut writer = Writer::new(dir.to_str().unwrap());
+        let mut writer = Writer::new(
+            dir.to_str().unwrap(),
+            "test-run",
+            QualityReporter::disabled(),
+        );
         writer
             .write(
                 Timestamp::now(),
@@ -364,5 +468,161 @@ mod tests {
         assert!(written[0].starts_with("purr%2Fusdc_"), "{written:?}");
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn completed_minutes_are_independent_durable_segments() {
+        let dir = std::env::temp_dir().join(format!(
+            "collector-segment-test-{}-{}",
+            std::process::id(),
+            Timestamp::now().as_nanosecond()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut writer = Writer::new(
+            dir.to_str().unwrap(),
+            "segment-run",
+            QualityReporter::disabled(),
+        );
+        let first = Timestamp::from_nanosecond(1_800_000_000_000_000_000).unwrap();
+        let second = first
+            .checked_add(jiff::Span::new().try_minutes(1).unwrap())
+            .unwrap();
+        for recv_time in [first, second] {
+            writer
+                .write(
+                    recv_time,
+                    Symbol::from("btcusdt"),
+                    bytes::Bytes::from_static(b"{}"),
+                )
+                .unwrap();
+        }
+        writer.close().unwrap();
+
+        let paths: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(paths.len(), 2, "{paths:?}");
+        assert!(paths.iter().all(|path| path.extension().unwrap() == "zst"));
+        for path in paths {
+            let bytes = std::fs::read(path).unwrap();
+            assert!(zstd::decode_all(bytes.as_slice()).is_ok());
+        }
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn idle_completed_minute_is_finalized_by_wall_clock() {
+        let dir = std::env::temp_dir().join(format!(
+            "collector-idle-segment-test-{}-{}",
+            std::process::id(),
+            Timestamp::now().as_nanosecond()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut writer = Writer::new(
+            dir.to_str().unwrap(),
+            "idle-run",
+            QualityReporter::disabled(),
+        );
+        let first = Timestamp::from_nanosecond(1_800_000_000_000_000_000).unwrap();
+        writer
+            .write(
+                first,
+                Symbol::from("btcusdt"),
+                bytes::Bytes::from_static(b"{}"),
+            )
+            .unwrap();
+        let after_boundary = first
+            .checked_add(jiff::Span::new().try_minutes(1).unwrap())
+            .unwrap();
+        // Another symbol remains active; expiration must not depend on the
+        // whole writer queue becoming idle.
+        writer
+            .write(
+                after_boundary,
+                Symbol::from("ethusdt"),
+                bytes::Bytes::from_static(b"{}"),
+            )
+            .unwrap();
+        writer.finalize_expired(after_boundary);
+
+        let paths: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(paths.len(), 2, "{paths:?}");
+        let btc = paths
+            .iter()
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("btcusdt_")
+            })
+            .unwrap();
+        let eth = paths
+            .iter()
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("ethusdt_")
+            })
+            .unwrap();
+        assert_eq!(btc.extension().unwrap(), "zst");
+        assert_eq!(eth.extension().unwrap(), "part");
+        assert!(zstd::decode_all(std::fs::read(btc).unwrap().as_slice()).is_ok());
+        writer.close().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn delayed_record_reopens_a_finalized_minute() {
+        let dir = std::env::temp_dir().join(format!(
+            "collector-late-segment-test-{}-{}",
+            std::process::id(),
+            Timestamp::now().as_nanosecond()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut writer = Writer::new(
+            dir.to_str().unwrap(),
+            "late-run",
+            QualityReporter::disabled(),
+        );
+        let before_boundary = Timestamp::from_nanosecond(1_800_000_059_000_000_000).unwrap();
+        let after_boundary = Timestamp::from_nanosecond(1_800_000_060_000_000_000).unwrap();
+        writer
+            .write(
+                before_boundary,
+                Symbol::from("btcusdt"),
+                bytes::Bytes::from_static(b"{\"n\":1}"),
+            )
+            .unwrap();
+        writer.finalize_expired(after_boundary);
+        writer
+            .write(
+                before_boundary,
+                Symbol::from("btcusdt"),
+                bytes::Bytes::from_static(b"{\"n\":2}"),
+            )
+            .unwrap();
+        writer.close().unwrap();
+
+        let paths: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(paths.len(), 2, "{paths:?}");
+        assert!(paths.iter().all(|path| path.extension().unwrap() == "zst"));
+        assert!(
+            paths
+                .iter()
+                .any(|path| path.to_string_lossy().contains(".late1.zst"))
+        );
+        for path in paths {
+            assert!(zstd::decode_all(std::fs::read(path).unwrap().as_slice()).is_ok());
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

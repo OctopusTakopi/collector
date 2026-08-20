@@ -20,6 +20,8 @@ use tokio_rustls::TlsConnector;
 use tracing::{error, info, warn};
 use url::Url;
 
+use crate::quality::{QualityEvent, QualityReporter};
+
 type Io = TokioIo<Upgraded>;
 
 /// How long a frame may wait for room in the websocket queue before it is
@@ -73,7 +75,8 @@ where
 /// the resulting sequence gap and refetch a snapshot. What must never happen is
 /// dropping *silently*.
 pub struct Overflow {
-    label: &'static str,
+    label: String,
+    quality: Option<QualityReporter>,
     dropped: u64,
     reported: u64,
     last_report: Instant,
@@ -83,13 +86,21 @@ pub struct Overflow {
 }
 
 impl Overflow {
-    pub fn new(label: &'static str) -> Self {
+    pub fn new(label: impl Into<String>) -> Self {
         Self {
-            label,
+            label: label.into(),
+            quality: None,
             dropped: 0,
             reported: 0,
             last_report: Instant::now(),
             shedding: false,
+        }
+    }
+
+    pub fn with_reporter(label: impl Into<String>, quality: QualityReporter) -> Self {
+        Self {
+            quality: Some(quality),
+            ..Self::new(label)
         }
     }
 
@@ -98,11 +109,19 @@ impl Overflow {
         self.dropped += 1;
         if self.dropped == 1 || self.last_report.elapsed() >= OVERFLOW_REPORT_INTERVAL {
             error!(
-                endpoint = self.label,
+                endpoint = %self.label,
                 dropped_total = self.dropped,
                 dropped_since_last_report = self.dropped - self.reported,
                 "writer cannot keep up; dropping frames"
             );
+            if let Some(quality) = &self.quality {
+                quality.report(QualityEvent::MarketDataDropped {
+                    at_ns: QualityEvent::now_ns(),
+                    source: self.label.clone(),
+                    dropped_total: self.dropped,
+                    dropped_since_last_report: self.dropped - self.reported,
+                });
+            }
             self.reported = self.dropped;
             self.last_report = Instant::now();
         }
@@ -112,10 +131,17 @@ impl Overflow {
     pub fn record_sent(&mut self) {
         if self.dropped > 0 {
             info!(
-                endpoint = self.label,
+                endpoint = %self.label,
                 dropped_total = self.dropped,
                 "writer caught up; no longer dropping frames"
             );
+            if let Some(quality) = &self.quality {
+                quality.report(QualityEvent::MarketDataRecovered {
+                    at_ns: QualityEvent::now_ns(),
+                    source: self.label.clone(),
+                    dropped_total: self.dropped,
+                });
+            }
             self.dropped = 0;
             self.reported = 0;
         }
@@ -548,12 +574,28 @@ mod tests {
 
     #[test]
     fn overflow_reports_the_first_drop_and_resets_after_recovery() {
-        let mut overflow = Overflow::new("test");
+        let (quality, rx) = QualityReporter::test_channel();
+        let mut overflow = Overflow::with_reporter("test", quality);
         overflow.record_drop();
         overflow.record_drop();
         assert_eq!(overflow.dropped(), 2);
         overflow.record_sent();
         assert_eq!(overflow.dropped(), 0);
+        assert!(matches!(
+            rx.recv().unwrap(),
+            QualityEvent::MarketDataDropped {
+                dropped_total: 1,
+                dropped_since_last_report: 1,
+                ..
+            }
+        ));
+        assert!(matches!(
+            rx.recv().unwrap(),
+            QualityEvent::MarketDataRecovered {
+                dropped_total: 2,
+                ..
+            }
+        ));
     }
 
     /// A sustained stall must not cost one grace period per frame: that would

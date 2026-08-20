@@ -18,7 +18,12 @@ use tokio::{
 };
 use tracing::{error, warn};
 
-use crate::ws::{self, Delivery, FrameSender, Overflow};
+use crate::{
+    quality::QualityReporter,
+    readiness::Readiness,
+    routing::BybitMessage,
+    ws::{self, Delivery, FrameSender, Overflow},
+};
 
 const PING_INTERVAL: Duration = Duration::from_secs(20);
 /// Bybit closes the socket after 20 s without a client ping, and market data on
@@ -48,6 +53,51 @@ pub struct SubscriptionRequest {
 /// each carry their own subscription state. Everything downstream of the read
 /// loop therefore has to know where a frame came from.
 pub type Frame = (usize, Timestamp, bytes::Bytes);
+
+struct SubscriptionReadiness {
+    expected: BTreeSet<String>,
+    successful: BTreeSet<String>,
+    market_delivered: bool,
+}
+
+impl SubscriptionReadiness {
+    fn new(requests: &HashMap<String, Vec<String>>) -> Self {
+        Self {
+            expected: requests.keys().cloned().collect(),
+            successful: BTreeSet::new(),
+            market_delivered: false,
+        }
+    }
+
+    /// Returns whether this is market data. Subscription acknowledgements are
+    /// tracked here before the frame is forwarded to the shared parser.
+    fn observe(&mut self, payload: &[u8]) -> bool {
+        let Ok(message) = serde_json::from_slice::<BybitMessage<'_>>(payload) else {
+            return false;
+        };
+        if message.op == Some("subscribe") {
+            if let Some(req_id) = message.req_id
+                && self.expected.contains(req_id)
+            {
+                if message.success == Some(true) {
+                    self.successful.insert(req_id.to_owned());
+                } else {
+                    self.successful.remove(req_id);
+                }
+            }
+            return false;
+        }
+        message.topic.is_some()
+    }
+
+    fn market_sent(&mut self, sent: bool) {
+        self.market_delivered = sent;
+    }
+
+    fn ready(&self) -> bool {
+        self.market_delivered && self.successful == self.expected
+    }
+}
 
 async fn send_subscription(
     sender: &FrameSender,
@@ -160,6 +210,7 @@ async fn control_loop(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn connect(
     url: &str,
     requests: Vec<SubscriptionRequest>,
@@ -167,10 +218,12 @@ async fn connect(
     ws_tx: Sender<Frame>,
     retry_rx: &mut UnboundedReceiver<String>,
     reconnect_rx: &mut watch::Receiver<u64>,
+    quality: QualityReporter,
+    readiness: Readiness,
 ) -> Result<(), anyhow::Error> {
     let mut conn = ws::connect(url).await?;
     let sender = conn.sender();
-    let mut overflow = Overflow::new("bybit");
+    let mut overflow = Overflow::with_reporter(format!("bybit/connection-{connection}"), quality);
 
     let order: Vec<String> = requests
         .iter()
@@ -189,6 +242,8 @@ async fn connect(
 
     let control = control_loop(sender.clone(), retry_rx, &request_map, order);
     tokio::pin!(control);
+    let mut subscription_readiness = SubscriptionReadiness::new(&request_map);
+    let mut liveness = None;
 
     loop {
         // `read` is not cancel-safe, so every arm racing it must be terminal.
@@ -213,6 +268,7 @@ async fn connect(
         match message.opcode {
             OpCode::Text => {
                 let recv_time = Timestamp::now();
+                let is_market = subscription_readiness.observe(&message.payload);
                 let delivery = ws::deliver(
                     &ws_tx,
                     &mut overflow,
@@ -225,7 +281,12 @@ async fn connect(
                 )
                 .await;
                 match delivery {
-                    Delivery::Sent | Delivery::Dropped => {}
+                    Delivery::Sent => {
+                        if is_market {
+                            subscription_readiness.market_sent(true);
+                        }
+                    }
+                    Delivery::Dropped => subscription_readiness.market_sent(false),
                     // Receiver dropped: the collector is shutting down.
                     Delivery::Closed => return Ok(()),
                     Delivery::Undeliverable => {
@@ -233,6 +294,14 @@ async fn connect(
                             "a subscription response could not be delivered; reconnecting"
                         ));
                     }
+                }
+                if subscription_readiness.ready() {
+                    if liveness.is_none() {
+                        liveness =
+                            Some(readiness.source_live(format!("bybit/connection-{connection}")));
+                    }
+                } else {
+                    liveness = None;
                 }
             }
             OpCode::Ping => {
@@ -250,6 +319,7 @@ async fn connect(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn keep_connection(
     topics: Vec<String>,
     symbol_list: Vec<String>,
@@ -257,6 +327,8 @@ pub async fn keep_connection(
     ws_tx: Sender<Frame>,
     mut retry_rx: UnboundedReceiver<String>,
     mut reconnect_rx: watch::Receiver<u64>,
+    quality: QualityReporter,
+    readiness: Readiness,
 ) {
     let mut error_count = 0;
     loop {
@@ -281,6 +353,8 @@ pub async fn keep_connection(
             ws_tx.clone(),
             &mut retry_rx,
             &mut reconnect_rx,
+            quality.clone(),
+            readiness.clone(),
         )
         .await
         {
@@ -300,5 +374,44 @@ pub async fn keep_connection(
         } else {
             break;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn requests() -> HashMap<String, Vec<String>> {
+        HashMap::from([
+            ("BTCUSDT".to_owned(), vec!["publicTrade.BTCUSDT".to_owned()]),
+            ("ETHUSDT".to_owned(), vec!["publicTrade.ETHUSDT".to_owned()]),
+        ])
+    }
+
+    #[test]
+    fn readiness_requires_every_successful_ack_and_market_delivery() {
+        let mut state = SubscriptionReadiness::new(&requests());
+        assert!(!state.observe(br#"{"success":true,"req_id":"BTCUSDT","op":"subscribe"}"#));
+        assert!(state.observe(br#"{"topic":"publicTrade.BTCUSDT","data":[]}"#));
+        state.market_sent(true);
+        assert!(!state.ready());
+        assert!(!state.observe(br#"{"success":false,"req_id":"ETHUSDT","op":"subscribe"}"#));
+        assert!(!state.ready());
+        assert!(!state.observe(br#"{"success":true,"req_id":"ETHUSDT","op":"subscribe"}"#));
+        assert!(state.ready());
+    }
+
+    #[test]
+    fn a_later_rejection_or_dropped_market_revokes_readiness() {
+        let one = HashMap::from([("BTCUSDT".to_owned(), vec!["topic".to_owned()])]);
+        let mut state = SubscriptionReadiness::new(&one);
+        state.observe(br#"{"success":true,"req_id":"BTCUSDT","op":"subscribe"}"#);
+        state.market_sent(true);
+        assert!(state.ready());
+        state.observe(br#"{"success":false,"req_id":"BTCUSDT","op":"subscribe"}"#);
+        assert!(!state.ready());
+        state.observe(br#"{"success":true,"req_id":"BTCUSDT","op":"subscribe"}"#);
+        state.market_sent(false);
+        assert!(!state.ready());
     }
 }

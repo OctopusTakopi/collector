@@ -29,8 +29,10 @@ use tracing::{error, warn};
 use crate::{
     dedup::Dedup,
     error::ConnectorError,
-    feed::Feed,
+    feed::{BackgroundResult, Feed},
     file::WriteRecord,
+    quality::QualityReporter,
+    readiness::Readiness,
     routing::BinanceMessage,
     symbol::{Symbol, SymbolCache},
     throttler::Throttler,
@@ -410,14 +412,20 @@ async fn run_session<S>(
     events: tokio::sync::mpsc::Sender<Event>,
     mut retire: tokio::sync::oneshot::Receiver<()>,
     max_age: Duration,
+    quality: QualityReporter,
+    readiness: Readiness,
 ) -> SessionEnd
 where
     S: tokio::io::AsyncRead + Unpin,
 {
     let sender = conn.sender();
-    let mut overflow = Overflow::new(endpoint.label);
+    let mut overflow = Overflow::with_reporter(
+        format!("{}/connection-{connection}", endpoint.label),
+        quality,
+    );
     let opened = Instant::now();
-    let mut live = false;
+    let mut liveness = None;
+    let mut announced_live = false;
     let mut relieved = false;
 
     loop {
@@ -512,18 +520,22 @@ where
                 }
 
                 match deliver_frame(&ws_tx, &mut overflow, message.payload).await {
-                    Delivery::Sent | Delivery::Dropped => {
-                        // Liveness is a property of the *socket* — this session
-                        // is connected and reading — not of the consumer. A shed
-                        // frame proves the socket just as well, and under
-                        // sustained shedding nothing would ever be `Sent`, so
-                        // requiring it would leave the predecessor running and
-                        // put a second producer on the queue that is already
-                        // saturated. What made shedding dangerous here was
-                        // retiring a session that still held a backlog, and that
-                        // is what `drain_buffered` now answers.
-                        if !live {
-                            live = true;
+                    Delivery::Sent => {
+                        if liveness.is_none() {
+                            liveness = Some(readiness.source_live(format!(
+                                "{}/connection-{connection}",
+                                endpoint.label
+                            )));
+                        }
+                        if !announced_live {
+                            announced_live = true;
+                            let _ = events.try_send(Event::Live(id));
+                        }
+                    }
+                    Delivery::Dropped => {
+                        liveness = None;
+                        if !announced_live {
+                            announced_live = true;
                             let _ = events.try_send(Event::Live(id));
                         }
                     }
@@ -637,7 +649,8 @@ async fn handle(
     data: bytes::Bytes,
     client: &reqwest::Client,
     throttler: &Throttler,
-    tasks: &mut JoinSet<()>,
+    quality: &QualityReporter,
+    tasks: &mut JoinSet<BackgroundResult>,
 ) -> Result<(), ConnectorError> {
     // Before anything reads sequence numbers. A second copy of a depth update
     // carries the `pu` of the update *before* it, which no longer matches the
@@ -700,6 +713,11 @@ async fn handle(
                 };
                 if gap {
                     warn!(symbol = %symbol, "missing depth feed has been detected.");
+                    quality.report(crate::quality::QualityEvent::FeedDegraded {
+                        at_ns: crate::quality::QualityEvent::now_ns(),
+                        source: format!("{}/{symbol}", endpoint.label),
+                        detail: format!("depth continuity break after update {}", *prev_u),
+                    });
                     let symbol_ = Symbol::clone(&symbol);
                     let writer_tx_ = writer_tx.clone();
                     let client_ = client.clone();
@@ -731,6 +749,7 @@ async fn handle(
                                 )
                             }
                         }
+                        Ok(())
                     });
                 }
                 // Only ever forwards. Redundant connections can deliver an
@@ -801,6 +820,7 @@ async fn snapshot_loop(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_collection(
     endpoint: &'static Endpoint,
     streams: Vec<String>,
@@ -808,6 +828,8 @@ pub async fn run_collection(
     writer_tx: Sender<WriteRecord>,
     shutdown: watch::Receiver<bool>,
     connections: usize,
+    quality: QualityReporter,
+    readiness: Readiness,
 ) -> Result<(), anyhow::Error> {
     let connections = connections.max(1);
     let mut prev_u_map = HashMap::new();
@@ -817,7 +839,7 @@ pub async fn run_collection(
     let (ws_tx, ws_rx) =
         channel::<(Timestamp, bytes::Bytes)>(crate::WS_QUEUE_CAPACITY.saturating_mul(connections));
     let mut feed = Feed::new(ws_rx, shutdown);
-    let mut tasks = JoinSet::new();
+    let mut tasks: JoinSet<BackgroundResult> = JoinSet::new();
     let mut symbol_cache = SymbolCache::new(&symbols);
     let snapshot_symbols: Vec<Symbol> = symbols
         .iter()
@@ -827,13 +849,18 @@ pub async fn run_collection(
         let streams = streams.clone();
         let symbols = symbols.clone();
         let ws_tx = ws_tx.clone();
+        let quality = quality.clone();
+        let readiness = readiness.clone();
         tasks.spawn(async move {
             tokio::time::sleep(crate::CONNECT_STAGGER * connection as u32).await;
-            keep_connection(endpoint, streams, symbols, connection, ws_tx).await;
-            error!(
-                endpoint = endpoint.label,
-                connection, "the websocket connection task exited"
-            );
+            keep_connection(
+                endpoint, streams, symbols, connection, ws_tx, quality, readiness,
+            )
+            .await;
+            Err(anyhow::anyhow!(
+                "{} websocket connection supervisor {connection} exited",
+                endpoint.label
+            ))
         });
     }
     // The clones above are the only senders that should keep the feed open;
@@ -868,27 +895,13 @@ pub async fn run_collection(
                 3600,
             )
             .await;
-            error!(
-                endpoint = endpoint.label,
-                "the periodic depth-snapshot task exited"
-            );
+            Err(anyhow::anyhow!(
+                "{} periodic depth-snapshot task exited",
+                endpoint.label
+            ))
         });
     }
-    let mut messages_before_reap = 1_024;
-    while let Some((recv_time, data)) = feed.recv(&mut tasks).await {
-        messages_before_reap -= 1;
-        if messages_before_reap == 0 {
-            while let Some(result) = tasks.try_join_next() {
-                // Cancellation is how shutdown stops these tasks; only a panic
-                // is worth reporting.
-                if let Err(error) = result
-                    && !error.is_cancelled()
-                {
-                    error!(?error, "background task failed");
-                }
-            }
-            messages_before_reap = 1_024;
-        }
+    while let Some((recv_time, data)) = feed.recv(&mut tasks).await? {
         if let Err(error) = handle(
             endpoint,
             &mut prev_u_map,
@@ -899,6 +912,7 @@ pub async fn run_collection(
             data,
             &client,
             &throttler,
+            &quality,
             &mut tasks,
         )
         .await
@@ -918,6 +932,8 @@ pub async fn keep_connection(
     symbol_list: Vec<String>,
     connection: usize,
     ws_tx: Sender<(Timestamp, bytes::Bytes)>,
+    quality: QualityReporter,
+    readiness: Readiness,
 ) {
     let streams_str = symbol_list
         .iter()
@@ -982,6 +998,8 @@ pub async fn keep_connection(
             event_tx.clone(),
             retire_rx,
             max_age,
+            quality.clone(),
+            readiness.clone(),
         ));
 
         let step = loop {
@@ -1131,7 +1149,8 @@ mod tests {
         dedup: Dedup,
         client: reqwest::Client,
         throttler: Throttler,
-        tasks: JoinSet<()>,
+        quality: QualityReporter,
+        tasks: JoinSet<BackgroundResult>,
     }
 
     impl Harness {
@@ -1148,6 +1167,7 @@ mod tests {
                 // No budget: the gap path must never issue a live
                 // request to Binance from a unit test.
                 throttler: Throttler::new(0),
+                quality: QualityReporter::disabled(),
                 tasks: JoinSet::new(),
             }
         }
@@ -1168,6 +1188,7 @@ mod tests {
                 bytes::Bytes::from_static(raw),
                 &self.client,
                 &self.throttler,
+                &self.quality,
                 &mut self.tasks,
             )
             .await
@@ -1480,6 +1501,8 @@ mod tests {
                 event_tx,
                 retire_rx,
                 max_age,
+                QualityReporter::disabled(),
+                Readiness::new(1).0,
             ));
             Self {
                 server,

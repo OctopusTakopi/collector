@@ -14,7 +14,13 @@ use tokio::{
 use tracing::{error, info};
 
 use crate::{
-    dedup::Dedup, error::ConnectorError, feed::Feed, file::WriteRecord, routing::BybitMessage,
+    dedup::Dedup,
+    error::ConnectorError,
+    feed::{BackgroundResult, Feed},
+    file::WriteRecord,
+    quality::QualityReporter,
+    readiness::Readiness,
+    routing::BybitMessage,
     symbol::SymbolCache,
 };
 
@@ -98,6 +104,8 @@ pub async fn run_collection(
     writer_tx: Sender<WriteRecord>,
     shutdown: watch::Receiver<bool>,
     connections: usize,
+    quality: QualityReporter,
+    readiness: Readiness,
 ) -> Result<(), anyhow::Error> {
     let connections = connections.max(1);
     let mut dedup = Dedup::for_connections(connections);
@@ -105,7 +113,7 @@ pub async fn run_collection(
     // absorb stays the same however many there are.
     let (ws_tx, ws_rx) = channel::<Frame>(crate::WS_QUEUE_CAPACITY.saturating_mul(connections));
     let mut feed = Feed::new(ws_rx, shutdown);
-    let mut tasks = JoinSet::new();
+    let mut tasks: JoinSet<BackgroundResult> = JoinSet::new();
     let mut symbol_cache = SymbolCache::new(&symbols);
     // Each connection subscribes independently, so each one needs its own retry
     // and reconnect signal — a rejection has to be answered on the connection
@@ -121,6 +129,8 @@ pub async fn run_collection(
         let subscriptions = subscriptions.clone();
         let symbols = symbols.clone();
         let ws_tx = ws_tx.clone();
+        let quality = quality.clone();
+        let readiness = readiness.clone();
         tasks.spawn(async move {
             tokio::time::sleep(crate::CONNECT_STAGGER * connection as u32).await;
             keep_connection(
@@ -130,15 +140,19 @@ pub async fn run_collection(
                 ws_tx,
                 retry_rx,
                 reconnect_rx,
+                quality,
+                readiness,
             )
             .await;
-            error!(connection, "the websocket connection task exited");
+            Err(anyhow::anyhow!(
+                "Bybit websocket connection supervisor {connection} exited"
+            ))
         });
     }
     // The clones above are the only senders that should keep the feed open.
     drop(ws_tx);
 
-    while let Some((connection, recv_time, data)) = feed.recv(&mut tasks).await {
+    while let Some((connection, recv_time, data)) = feed.recv(&mut tasks).await? {
         // A frame can only carry the index of a connection this loop started.
         let (Some(retry_tx), Some(reconnect_tx)) =
             (retry_txs.get(connection), reconnect_txs.get(connection))

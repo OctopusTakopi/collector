@@ -1,6 +1,8 @@
 use tokio::{select, sync::mpsc::Receiver, sync::watch, task::JoinSet};
 use tracing::info;
 
+pub type BackgroundResult = Result<(), anyhow::Error>;
+
 /// The websocket queue, wrapped so shutdown drains it instead of discarding it.
 ///
 /// Aborting the collection task outright would throw away everything already
@@ -27,10 +29,13 @@ impl<T> Feed<T> {
     ///
     /// Cancel-safe: both arms are (`mpsc::Receiver::recv` and
     /// `watch::Receiver::changed`).
-    pub async fn recv(&mut self, tasks: &mut JoinSet<()>) -> Option<T> {
+    pub async fn recv(
+        &mut self,
+        tasks: &mut JoinSet<BackgroundResult>,
+    ) -> anyhow::Result<Option<T>> {
         loop {
             if self.draining {
-                return self.rx.recv().await;
+                return Ok(self.rx.recv().await);
             }
             select! {
                 biased;
@@ -39,7 +44,13 @@ impl<T> Feed<T> {
                     tasks.abort_all();
                     self.draining = true;
                 }
-                message = self.rx.recv() => return message,
+                Some(result) = tasks.join_next() => match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => return Err(error),
+                    Err(error) if error.is_cancelled() => {}
+                    Err(error) => return Err(anyhow::anyhow!("background task panicked: {error}")),
+                },
+                message = self.rx.recv() => return Ok(message),
             }
         }
     }
@@ -56,7 +67,10 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let mut tasks = JoinSet::new();
         // A connection task that would otherwise keep the feed open forever.
-        tasks.spawn(async { std::future::pending::<()>().await });
+        tasks.spawn(async {
+            std::future::pending::<()>().await;
+            Ok(())
+        });
 
         for value in 0..3 {
             tx.send(value).await.unwrap();
@@ -66,10 +80,22 @@ mod tests {
 
         let mut feed = Feed::new(rx, shutdown_rx);
         let mut drained = Vec::new();
-        while let Some(value) = feed.recv(&mut tasks).await {
+        while let Some(value) = feed.recv(&mut tasks).await.unwrap() {
             drained.push(value);
         }
 
         assert_eq!(drained, vec![0, 1, 2]);
+    }
+
+    #[tokio::test]
+    async fn a_critical_background_failure_is_propagated_immediately() {
+        let (_tx, rx) = channel::<u8>(1);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let mut tasks = JoinSet::new();
+        tasks.spawn(async { Err(anyhow::anyhow!("connection supervisor exited")) });
+
+        let mut feed = Feed::new(rx, shutdown_rx);
+        let error = feed.recv(&mut tasks).await.unwrap_err();
+        assert!(error.to_string().contains("connection supervisor exited"));
     }
 }

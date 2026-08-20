@@ -29,7 +29,7 @@
 //! straddling the rotation boundary are attributed correctly.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     fmt,
     fs::{self, File},
     io::{BufRead, BufReader},
@@ -55,6 +55,8 @@ const LIVE_FILE_WINDOW: Duration = Duration::from_secs(15 * 60);
 
 /// Keep at most this many break timestamps per stream.
 const MAX_BREAK_TIMES: usize = 16;
+
+const OVERLAP_DEDUP_WINDOW_NS: i64 = 5_000_000_000;
 
 #[derive(Parser)]
 #[command(version, about = "Detect gaps in the collector's raw recording files")]
@@ -161,6 +163,8 @@ impl Family {
 struct DatedFile {
     path: PathBuf,
     date: civil::Date,
+    segment_start_ns: i64,
+    run_id: Option<String>,
 }
 
 struct Series {
@@ -169,8 +173,8 @@ struct Series {
     files: Vec<DatedFile>,
 }
 
-/// Discover `<symbol>_<YYYYMMDD>.zst` files under the roots and group them
-/// into per-(directory, symbol) series sorted by date.
+/// Discover legacy daily and current segmented zstd files under the roots and
+/// group them into per-(directory, symbol) series in recording order.
 fn discover(roots: &[PathBuf]) -> Result<Vec<Series>> {
     let mut map: BTreeMap<(PathBuf, String), Vec<DatedFile>> = BTreeMap::new();
     let mut stack: Vec<PathBuf> = Vec::new();
@@ -185,17 +189,18 @@ fn discover(roots: &[PathBuf]) -> Result<Vec<Series>> {
     while let Some(dir) = stack.pop() {
         let meta = fs::metadata(&dir)?;
         if meta.is_file() {
-            if let Some(df) = dated_file(&dir) {
+            if dir.extension().is_none_or(|ext| ext != "zst") {
+                continue;
+            }
+            if let Some((symbol, df)) = dated_file(&dir) {
                 let parent = dir.parent().unwrap_or(Path::new(".")).to_path_buf();
-                let stem = df.path.file_stem().unwrap().to_string_lossy().into_owned();
-                let symbol = stem
-                    .rsplit_once('_')
-                    .map(|(sym, _)| sym.to_string())
-                    .unwrap_or(stem);
                 map.entry((parent, symbol)).or_default().push(df);
             } else {
                 skipped += 1;
             }
+            continue;
+        }
+        if !meta.is_dir() {
             continue;
         }
         for entry in fs::read_dir(&dir)
@@ -212,7 +217,14 @@ fn discover(roots: &[PathBuf]) -> Result<Vec<Series>> {
     let mut series: Vec<Series> = map
         .into_iter()
         .map(|((dir, symbol), mut files)| {
-            files.sort_by_key(|f| f.date);
+            files.sort_by(|a, b| {
+                (a.date, a.segment_start_ns, &a.run_id, &a.path).cmp(&(
+                    b.date,
+                    b.segment_start_ns,
+                    &b.run_id,
+                    &b.path,
+                ))
+            });
             Series {
                 key: format!("{}/{symbol}", dir.display()),
                 family: Family::guess(&dir),
@@ -224,17 +236,55 @@ fn discover(roots: &[PathBuf]) -> Result<Vec<Series>> {
     Ok(series)
 }
 
-fn dated_file(path: &Path) -> Option<DatedFile> {
+fn dated_file(path: &Path) -> Option<(String, DatedFile)> {
     if path.extension().is_none_or(|ext| ext != "zst") {
         return None;
     }
     let stem = path.file_stem()?.to_str()?;
-    let (_, date_str) = stem.rsplit_once('_')?;
+    let mut parts = stem.rsplitn(4, '_');
+    let run_id = parts.next()?.to_owned();
+    let segment_start = parts.next();
+    let date_str = parts.next();
+    let symbol = parts.next();
+    if let (Some(segment_start), Some(date_str), Some(symbol)) = (segment_start, date_str, symbol)
+        && let (Ok(segment_start_ns), Ok(date)) = (
+            segment_start.parse::<i64>(),
+            civil::Date::strptime("%Y%m%d", date_str),
+        )
+    {
+        return Some((
+            symbol.to_owned(),
+            DatedFile {
+                path: path.to_path_buf(),
+                date,
+                segment_start_ns,
+                run_id: Some(run_id),
+            },
+        ));
+    }
+
+    let (symbol, date_str) = stem.rsplit_once('_')?;
     let date = civil::Date::strptime("%Y%m%d", date_str).ok()?;
-    Some(DatedFile {
-        path: path.to_path_buf(),
-        date,
-    })
+    Some((
+        symbol.to_owned(),
+        DatedFile {
+            path: path.to_path_buf(),
+            date,
+            segment_start_ns: i64::MIN,
+            run_id: None,
+        },
+    ))
+}
+
+fn logical_run_id(run_id: &str) -> &str {
+    match run_id.rsplit_once(".late") {
+        Some((base, suffix))
+            if !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit()) =>
+        {
+            base
+        }
+        _ => run_id,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -416,6 +466,7 @@ struct Gap {
     end: i64,
 }
 
+#[cfg(test)]
 enum LineOutcome {
     Ok,
     Bad,
@@ -475,17 +526,16 @@ impl SeriesScan {
         self.last_recv = Some(recv);
     }
 
+    #[cfg(test)]
     fn process_line(&mut self, family: Family, line: &[u8], min_gap_ns: i64) -> LineOutcome {
-        let Some(space) = line.iter().position(|&b| b == b' ') else {
+        let Some((recv, payload)) = parse_record_line(line) else {
             return LineOutcome::Bad;
         };
-        let Some(recv) = parse_int(&line[..space]) else {
-            return LineOutcome::Bad;
-        };
-        let payload = &line[space + 1..];
-        if payload.first() != Some(&b'{') {
-            return LineOutcome::Bad;
-        }
+        self.process_payload(family, recv, payload, min_gap_ns);
+        LineOutcome::Ok
+    }
+
+    fn process_payload(&mut self, family: Family, recv: i64, payload: &[u8], min_gap_ns: i64) {
         self.observe_recv(recv, min_gap_ns);
         self.rows += 1;
         match family {
@@ -496,7 +546,6 @@ impl SeriesScan {
             Family::Hyperliquid => self.hyperliquid_payload(payload),
             Family::Generic => {}
         }
-        LineOutcome::Ok
     }
 
     fn binance_payload(&mut self, family: Family, payload: &[u8], recv: i64) {
@@ -748,16 +797,34 @@ fn parse_int(bytes: &[u8]) -> Option<i64> {
     Some(value)
 }
 
+fn parse_record_line(line: &[u8]) -> Option<(i64, &[u8])> {
+    let space = line.iter().position(|&byte| byte == b' ')?;
+    let recv = parse_int(&line[..space])?;
+    let payload = &line[space + 1..];
+    (payload.first() == Some(&b'{')).then_some((recv, payload))
+}
+
 // ---------------------------------------------------------------------------
 // Reports
 // ---------------------------------------------------------------------------
 
 struct FileReport {
-    date: civil::Date,
+    path: PathBuf,
     rows: u64,
     foreign: bool,
     decode_error: Option<String>,
     live: bool,
+}
+
+struct RawLine {
+    recv: i64,
+    payload: Vec<u8>,
+    source: usize,
+}
+
+struct FileRead {
+    report: FileReport,
+    bad_lines: u64,
 }
 
 struct SeriesReport {
@@ -789,9 +856,12 @@ impl SeriesReport {
     }
 }
 
-fn scan_file(scan: &mut SeriesScan, family: Family, df: &DatedFile, min_gap_ns: i64) -> FileReport {
+fn read_file<F>(df: &DatedFile, mut process: F) -> FileRead
+where
+    F: FnMut(i64, &[u8]),
+{
     let mut report = FileReport {
-        date: df.date,
+        path: df.path.clone(),
         rows: 0,
         foreign: false,
         decode_error: None,
@@ -801,16 +871,23 @@ fn scan_file(scan: &mut SeriesScan, family: Family, df: &DatedFile, min_gap_ns: 
         Ok(file) => file,
         Err(error) => {
             report.decode_error = Some(format!("open failed: {error}"));
-            return report;
+            return FileRead {
+                report,
+                bad_lines: 0,
+            };
         }
     };
     let modified = fs::metadata(&df.path).and_then(|m| m.modified()).ok();
     let Ok(decoder) = zstd::stream::read::Decoder::new(file) else {
         report.decode_error = Some("not a zstd stream".into());
-        return report;
+        return FileRead {
+            report,
+            bad_lines: 0,
+        };
     };
     let mut reader = BufReader::with_capacity(1 << 20, decoder);
     let mut line: Vec<u8> = Vec::with_capacity(1 << 16);
+    let mut bad_lines = 0;
     loop {
         line.clear();
         match reader.read_until(b'\n', &mut line) {
@@ -822,13 +899,16 @@ fn scan_file(scan: &mut SeriesScan, family: Family, df: &DatedFile, min_gap_ns: 
                 if line.is_empty() {
                     continue;
                 }
-                match scan.process_line(family, &line, min_gap_ns) {
-                    LineOutcome::Ok => report.rows += 1,
-                    LineOutcome::Bad if report.rows == 0 && is_foreign(&line) => {
+                match parse_record_line(&line) {
+                    Some((recv, payload)) => {
+                        process(recv, payload);
+                        report.rows += 1;
+                    }
+                    None if report.rows == 0 && is_foreign(&line) => {
                         report.foreign = true;
                         break;
                     }
-                    LineOutcome::Bad => scan.bad_lines += 1,
+                    None => bad_lines += 1,
                 }
             }
             Err(error) => {
@@ -838,15 +918,98 @@ fn scan_file(scan: &mut SeriesScan, family: Family, df: &DatedFile, min_gap_ns: 
                         .is_ok_and(|age| age < LIVE_FILE_WINDOW)
                 });
                 report.decode_error = Some(format!("{error}"));
-                // The unreadable tail hides whenever the next row arrived, so a
-                // receive-time gap measured across it would be fiction; the
-                // sequence checks keep their state and will count the hole.
-                scan.prev_recv = None;
                 break;
             }
         }
     }
-    report
+    FileRead { report, bad_lines }
+}
+
+fn process_lines(
+    scan: &mut SeriesScan,
+    family: Family,
+    mut records: Vec<RawLine>,
+    min_gap_ns: i64,
+    overlapping_runs: bool,
+) {
+    if !overlapping_runs {
+        for record in records {
+            scan.process_payload(family, record.recv, &record.payload, min_gap_ns);
+        }
+        return;
+    }
+
+    let mut source_ranges: HashMap<usize, (i64, i64)> = HashMap::new();
+    for record in &records {
+        source_ranges
+            .entry(record.source)
+            .and_modify(|range| {
+                range.0 = range.0.min(record.recv);
+                range.1 = range.1.max(record.recv);
+            })
+            .or_insert((record.recv, record.recv));
+    }
+    records.sort_by_key(|record| (record.recv, record.source));
+    let mut unmatched: HashMap<u128, VecDeque<(usize, i64)>> = HashMap::new();
+    for record in records {
+        let key = overlap_key(family, &record.payload);
+        let queue = unmatched.entry(key).or_default();
+        while queue
+            .front()
+            .is_some_and(|(_, recv)| *recv < record.recv.saturating_sub(OVERLAP_DEDUP_WINDOW_NS))
+        {
+            queue.pop_front();
+        }
+
+        let duplicate = queue.iter().position(|&(source, recv)| {
+            source != record.source
+                && source_ranges
+                    .get(&source)
+                    .zip(source_ranges.get(&record.source))
+                    .is_some_and(|(&(source_min, source_max), &(record_min, record_max))| {
+                        let overlap_start = source_min.max(record_min);
+                        let overlap_end = source_max.min(record_max);
+                        (overlap_start..=overlap_end).contains(&record.recv)
+                            && record.recv.saturating_sub(recv) <= OVERLAP_DEDUP_WINDOW_NS
+                    })
+        });
+        if let Some(index) = duplicate {
+            queue.remove(index);
+            continue;
+        }
+
+        scan.process_payload(family, record.recv, &record.payload, min_gap_ns);
+        queue.push_back((record.source, record.recv));
+    }
+}
+
+fn overlap_key(family: Family, payload: &[u8]) -> u128 {
+    if family != Family::BinanceSpot {
+        return xxhash_rust::xxh3::xxh3_128(payload);
+    }
+    let Some((before, after)) = cut_binance_event_time(payload) else {
+        return xxhash_rust::xxh3::xxh3_128(payload);
+    };
+    let mut hasher = xxhash_rust::xxh3::Xxh3Default::new();
+    hasher.update(before);
+    hasher.update(after);
+    hasher.digest128()
+}
+
+fn cut_binance_event_time(payload: &[u8]) -> Option<(&[u8], &[u8])> {
+    const NEEDLE: &[u8] = b"\"E\":";
+    let position = payload
+        .windows(NEEDLE.len())
+        .position(|bytes| bytes == NEEDLE)?;
+    let mut end = position + NEEDLE.len();
+    if end < payload.len() && payload[end] == b'-' {
+        end += 1;
+    }
+    let digits = end;
+    while end < payload.len() && payload[end].is_ascii_digit() {
+        end += 1;
+    }
+    (end != digits).then_some((&payload[..position], &payload[end..]))
 }
 
 /// A first line that neither parses nor looks like text marks the whole file
@@ -866,8 +1029,66 @@ fn scan_series(series: &Series, min_gap_ns: i64, exact: bool) -> SeriesReport {
         ..Default::default()
     };
     let mut files = Vec::with_capacity(series.files.len());
-    for df in &series.files {
-        files.push(scan_file(&mut scan, series.family, df, min_gap_ns));
+    let mut first = 0;
+    while first < series.files.len() {
+        let key = (
+            series.files[first].date,
+            series.files[first].segment_start_ns,
+        );
+        let mut end = first + 1;
+        while end < series.files.len()
+            && (series.files[end].date, series.files[end].segment_start_ns) == key
+        {
+            end += 1;
+        }
+
+        let mut run_indices: HashMap<&str, usize> = HashMap::new();
+        for df in &series.files[first..end] {
+            if let Some(run_id) = df.run_id.as_deref() {
+                let run_id = logical_run_id(run_id);
+                let next = run_indices.len();
+                run_indices.entry(run_id).or_insert(next);
+            }
+        }
+        let overlapping_runs = key.1 != i64::MIN && run_indices.len() > 1;
+        if overlapping_runs {
+            let mut records = Vec::new();
+            let mut decode_error = false;
+            for df in &series.files[first..end] {
+                let source = *run_indices
+                    .get(logical_run_id(df.run_id.as_deref().expect("segmented run")))
+                    .expect("run indexed");
+                let read = read_file(df, |recv, payload| {
+                    records.push(RawLine {
+                        recv,
+                        payload: payload.to_vec(),
+                        source,
+                    });
+                });
+                decode_error |= read.report.decode_error.is_some();
+                scan.bad_lines += read.bad_lines;
+                files.push(read.report);
+            }
+            process_lines(&mut scan, series.family, records, min_gap_ns, true);
+            if decode_error {
+                scan.prev_recv = None;
+            }
+        } else {
+            // Legacy daily files and ordinary single-run segments remain
+            // streaming and retain their on-disk receive ordering.
+            for df in &series.files[first..end] {
+                let read = read_file(df, |recv, payload| {
+                    scan.process_payload(series.family, recv, payload, min_gap_ns);
+                });
+                let decode_error = read.report.decode_error.is_some();
+                scan.bad_lines += read.bad_lines;
+                files.push(read.report);
+                if decode_error {
+                    scan.prev_recv = None;
+                }
+            }
+        }
+        first = end;
     }
 
     let mut missing_dates = Vec::new();
@@ -1027,26 +1248,30 @@ fn stream_notable(s: &StreamStats) -> bool {
 
 fn print_report(report: &SeriesReport, min_gap_ns: i64, max_reported: usize, exact: bool) {
     println!("{} ({})", report.key, report.family.label());
-    let dates: Vec<String> = report.files.iter().map(|f| f.date.to_string()).collect();
-    println!("  files: {}", dates.join(", "));
+    let files: Vec<String> = report
+        .files
+        .iter()
+        .map(|file| file.path.display().to_string())
+        .collect();
+    println!("  files: {}", files.join(", "));
     for file in &report.files {
         if file.foreign {
             println!(
                 "    {}: foreign format (not `<recv_ns> <json>` lines), skipped",
-                file.date
+                file.path.display()
             );
         }
         if let Some(error) = &file.decode_error {
             if file.live {
                 println!(
                     "    {}: unterminated zstd stream after {} rows (file modified recently — still being written?): {error}",
-                    file.date,
+                    file.path.display(),
                     grouped(file.rows)
                 );
             } else {
                 println!(
                     "    {}: decode error after {} rows: {error}",
-                    file.date,
+                    file.path.display(),
                     grouped(file.rows)
                 );
             }
@@ -1444,6 +1669,156 @@ mod tests {
         ));
         assert!(is_foreign(&binary));
         assert!(!is_foreign(b"123 {\"a\":1}"));
+    }
+
+    #[test]
+    fn segmented_filename_preserves_symbols_with_underscores() {
+        let (symbol, file) = dated_file(Path::new(
+            "btc_usdt_20260820_1787200000000000000_1787200000000000001-42.zst",
+        ))
+        .unwrap();
+        assert_eq!(symbol, "btc_usdt");
+        assert_eq!(file.date, civil::Date::new(2026, 8, 20).unwrap());
+        assert_eq!(file.segment_start_ns, 1_787_200_000_000_000_000);
+        assert_eq!(file.run_id.as_deref(), Some("1787200000000000001-42"));
+    }
+
+    #[test]
+    fn late_segment_uses_the_original_run_identity() {
+        assert_eq!(
+            logical_run_id("1787200000000000001-42.late3"),
+            "1787200000000000001-42"
+        );
+        assert_eq!(logical_run_id("run.later"), "run.later");
+    }
+
+    #[test]
+    fn non_overlapping_records_preserve_recorded_order() {
+        let records = vec![
+            RawLine {
+                recv: 200,
+                payload: b"{}".to_vec(),
+                source: 0,
+            },
+            RawLine {
+                recv: 100,
+                payload: b"{}".to_vec(),
+                source: 0,
+            },
+        ];
+        let mut scan = SeriesScan::default();
+        process_lines(&mut scan, Family::Generic, records, 1_000, false);
+        assert_eq!(scan.recv_regressions, 1);
+    }
+
+    #[test]
+    fn overlapping_runs_are_time_merged_and_cross_run_duplicates_are_removed() {
+        let ten_old = br#"{"stream":"btcusdt@trade","data":{"e":"trade","E":10,"t":10}}"#.to_vec();
+        let ten_new = br#"{"stream":"btcusdt@trade","data":{"e":"trade","E":11,"t":10}}"#.to_vec();
+        let twelve_old =
+            br#"{"stream":"btcusdt@trade","data":{"e":"trade","E":12,"t":12}}"#.to_vec();
+        let twelve_new =
+            br#"{"stream":"btcusdt@trade","data":{"e":"trade","E":13,"t":12}}"#.to_vec();
+        let records = vec![
+            RawLine {
+                recv: 0,
+                payload: b"{\"old\":\"start\"}".to_vec(),
+                source: 0,
+            },
+            RawLine {
+                recv: 4,
+                payload: twelve_old,
+                source: 0,
+            },
+            RawLine {
+                recv: 1,
+                payload: ten_old,
+                source: 0,
+            },
+            RawLine {
+                recv: 2,
+                payload: ten_new,
+                source: 1,
+            },
+            RawLine {
+                recv: 3,
+                payload: twelve_new,
+                source: 1,
+            },
+            RawLine {
+                recv: 5,
+                payload: b"{\"new\":\"end\"}".to_vec(),
+                source: 1,
+            },
+        ];
+        let mut scan = SeriesScan::default();
+        process_lines(&mut scan, Family::BinanceSpot, records, 5_000_000_000, true);
+        let stats = &scan.streams[0].1.stats;
+        assert_eq!(scan.rows, 4);
+        assert_eq!(scan.recv_regressions, 0);
+        assert!(scan.gaps.is_empty());
+        assert_eq!(stats.id_count, 2);
+        assert_eq!(stats.net_deficit(), 1);
+    }
+
+    #[test]
+    fn overlap_dedup_is_one_to_one_and_stops_at_the_observed_overlap() {
+        let raw = |recv, payload: &'static [u8], source| RawLine {
+            recv,
+            payload: payload.to_vec(),
+            source,
+        };
+        let records = vec![
+            raw(0, br#"{"run":"old-start"}"#, 0),
+            raw(1, br#"{"run":"new-start"}"#, 1),
+            raw(2, br#"{"same":true}"#, 0),
+            raw(3, br#"{"same":true}"#, 1),
+            raw(10, br#"{"run":"old-end"}"#, 0),
+            raw(11, br#"{"same":true}"#, 1),
+            raw(20, br#"{"run":"new-end"}"#, 1),
+        ];
+        let mut scan = SeriesScan::default();
+        process_lines(&mut scan, Family::Generic, records, 100, true);
+        assert_eq!(scan.rows, 6);
+    }
+
+    #[test]
+    fn legacy_file_streams_in_recorded_order_and_retains_its_path() {
+        use std::io::Write;
+
+        let dir = std::env::temp_dir().join(format!(
+            "collector-gap-detector-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("btcusdt_20260820.zst");
+        {
+            let file = File::create(&path).unwrap();
+            let mut encoder = zstd::stream::write::Encoder::new(file, 1).unwrap();
+            encoder.write_all(b"200 {}\n100 {}\n").unwrap();
+            encoder.finish().unwrap();
+        }
+        let series = Series {
+            key: "test/btcusdt".to_owned(),
+            family: Family::Generic,
+            files: vec![DatedFile {
+                path: path.clone(),
+                date: civil::Date::new(2026, 8, 20).unwrap(),
+                segment_start_ns: i64::MIN,
+                run_id: None,
+            }],
+        };
+
+        let report = scan_series(&series, 1_000, false);
+        assert_eq!(report.rows, 2);
+        assert_eq!(report.recv_regressions, 1);
+        assert_eq!(report.files[0].path, path);
+
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
