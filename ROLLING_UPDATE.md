@@ -11,19 +11,22 @@ new/collector -c 2 /data/binance/spot binancespot btcusdt ethusdt
 ```
 
 The replacement must match the incumbent's exchange, ordered symbol list,
-connection count, and canonical output path. It writes process-unique zstd
-segments while warming up. Only after every required endpoint/connection is
-currently delivering frames, the writer has accepted its first record, and
-that state has remained continuously healthy for two seconds does it request
-takeover. A disconnect or dropped delivery restarts the overlap grace; the
-incumbent then drains, fsyncs, and exits only after a healthy request.
+connection count, and canonical output path. While warming up it may write a
+run-local sidecar (`<symbol>_<UTC-date>_<run-id>.zst`) if today's canonical
+daily file is already locked by the incumbent. Only after every required
+endpoint/connection is currently delivering frames, the writer has accepted its
+first record, and that state has remained continuously healthy for two seconds
+does it request takeover. A disconnect or dropped delivery restarts the overlap
+grace; the incumbent then drains, fsyncs, and exits only after a healthy
+request.
 
-Completed files use
-`<symbol>_<UTC-date>_<segment-start-ns>_<run-id>.zst`; the current minute uses
-the `.zst.part` suffix until it is finalized. Overlap intentionally favors no
-gaps over no duplicates. The bundled `gap_detector` chronologically merges
-same-minute run segments and removes only cross-run duplicate payloads; other
-downstream readers must apply equivalent venue-event deduplication.
+Steady-state recordings use one file per symbol per UTC day:
+`<symbol>_<UTC-date>.zst`. During handover overlap the challenger writes a
+run-local sidecar. After the incumbent releases the daily file lock (the
+switch), that sidecar's finished zstd frame is appended into
+`<symbol>_<UTC-date>.zst` and the sidecar is deleted. If the challenger exits
+before the switch, the sidecar stays on disk. Overlap intentionally favors no
+gaps over no duplicates.
 
 The first upgrade from a binary without UDS support is necessarily a normal
 stop/start. Existing deployment scripts that stop the old tmux session must be

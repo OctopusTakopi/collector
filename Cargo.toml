@@ -32,6 +32,7 @@ zstd = "0.13"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 tracing-subscriber = { version = "0.3.23", features = [] }
 fastwebsockets = { version = "0.10.0", features = ["upgrade", "unstable-split"] }
+libc = "0.2.189"
 
 [profile.release]
 opt-level = 3

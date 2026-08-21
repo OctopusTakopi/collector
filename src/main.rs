@@ -42,15 +42,6 @@ const CONNECT_STAGGER: Duration = Duration::from_secs(5);
 /// How long the collection task is given to hand its already-received messages
 /// to the writer before it is aborted outright.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
-const FILE_ROTATION_POLL: Duration = Duration::from_secs(1);
-
-fn recv_with_timeout<T>(
-    runtime: &tokio::runtime::Handle,
-    receiver: &mut tokio::sync::mpsc::Receiver<T>,
-    wait: Duration,
-) -> Result<Option<T>, tokio::time::error::Elapsed> {
-    runtime.block_on(async { tokio::time::timeout(wait, receiver.recv()).await })
-}
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -250,15 +241,12 @@ async fn main() -> Result<(), anyhow::Error> {
         let run_id = run_id.clone();
         let quality = quality.clone();
         let readiness = readiness.clone();
-        let runtime = tokio::runtime::Handle::current();
         std::thread::spawn(move || -> Result<(), anyhow::Error> {
             let mut writer = Writer::new(&path, &run_id, quality);
             let mut writer_ready = false;
-            let mut next_rotation_check = std::time::Instant::now() + FILE_ROTATION_POLL;
             let result = loop {
-                let wait = next_rotation_check.saturating_duration_since(std::time::Instant::now());
-                match recv_with_timeout(&runtime, &mut writer_rx, wait) {
-                    Ok(Some((recv_time, symbol, data))) => {
+                match writer_rx.blocking_recv() {
+                    Some((recv_time, symbol, data)) => {
                         if let Err(error) = writer.write(recv_time, symbol, data) {
                             break Err(error);
                         }
@@ -267,12 +255,7 @@ async fn main() -> Result<(), anyhow::Error> {
                             writer_ready = true;
                         }
                     }
-                    Ok(None) => break Ok(()),
-                    Err(_) => {}
-                }
-                if std::time::Instant::now() >= next_rotation_check {
-                    writer.finalize_expired(jiff::Timestamp::now());
-                    next_rotation_check = std::time::Instant::now() + FILE_ROTATION_POLL;
+                    None => break Ok(()),
                 }
             };
             let result = result.and(writer.close());
@@ -476,22 +459,5 @@ async fn shutdown_signal() -> std::io::Result<&'static str> {
     {
         signal::ctrl_c().await?;
         Ok("SIGINT")
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn writer_timeout_runs_from_a_plain_thread() {
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        let handle = runtime.handle().clone();
-        let (_sender, mut receiver) = tokio::sync::mpsc::channel::<()>(1);
-        let worker = std::thread::spawn(move || {
-            recv_with_timeout(&handle, &mut receiver, Duration::from_millis(1))
-        });
-
-        assert!(worker.join().unwrap().is_err());
     }
 }

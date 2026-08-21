@@ -29,6 +29,108 @@ impl BinanceMessage<'_> {
     }
 }
 
+/// Fields the collector needs from a combined-stream frame. The rest of the
+/// payload — including depth `b`/`a` arrays — is left unparsed and written as-is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BinanceRoute<'a> {
+    pub symbol: &'a str,
+    pub event: Option<&'a str>,
+    pub u: Option<i64>,
+    pub first_update_id: Option<i64>,
+    pub pu: Option<i64>,
+}
+
+/// Combined-stream envelope scan. Returns `None` when the cheap layout does
+/// not match (control frames, unusual whitespace, `data` before `stream` with
+/// a large body) so the caller can fall back to serde.
+///
+/// Depth ids are read only from the header before `"b":[` / `"a":[`, so a
+/// book-sized payload does not get its price strings walked.
+pub fn parse_binance_route(payload: &[u8]) -> Option<BinanceRoute<'_>> {
+    const STREAM_PREFIX: usize = 256;
+    let stream = json_unescaped_string(
+        payload.get(..STREAM_PREFIX.min(payload.len()))?,
+        b"\"stream\":\"",
+    )?;
+    let symbol = stream.split_once('@')?.0;
+    if symbol.is_empty() {
+        return None;
+    }
+
+    if !stream
+        .as_bytes()
+        .windows(6)
+        .any(|window| window == b"@depth")
+    {
+        return Some(BinanceRoute {
+            symbol,
+            event: None,
+            u: None,
+            first_update_id: None,
+            pu: None,
+        });
+    }
+
+    let header = depth_header_prefix(payload);
+    Some(BinanceRoute {
+        symbol,
+        event: json_unescaped_string(header, b"\"e\":\""),
+        u: json_i64(header, b"\"u\":"),
+        first_update_id: json_i64(header, b"\"U\":"),
+        pu: json_i64(header, b"\"pu\":"),
+    })
+}
+
+fn depth_header_prefix(payload: &[u8]) -> &[u8] {
+    const MAX: usize = 1024;
+    let head = payload.get(..MAX.min(payload.len())).unwrap_or(payload);
+    for needle in [b"\"b\":[".as_slice(), b"\"a\":[".as_slice()] {
+        if let Some(index) = find_subslice(head, needle) {
+            return &head[..index];
+        }
+    }
+    head
+}
+
+fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    hay.windows(needle.len())
+        .position(|window| window == needle)
+}
+
+fn json_unescaped_string<'a>(hay: &'a [u8], key: &[u8]) -> Option<&'a str> {
+    let start = find_subslice(hay, key)? + key.len();
+    let end = start + hay[start..].iter().position(|&byte| byte == b'"')?;
+    std::str::from_utf8(&hay[start..end]).ok()
+}
+
+fn json_i64(hay: &[u8], key: &[u8]) -> Option<i64> {
+    let mut index = find_subslice(hay, key)? + key.len();
+    while index < hay.len() && hay[index] == b' ' {
+        index += 1;
+    }
+    let bytes = hay.get(index..)?;
+    let mut value: i64 = 0;
+    let mut seen = false;
+    let mut negative = false;
+    let rest = if bytes.first() == Some(&b'-') {
+        negative = true;
+        &bytes[1..]
+    } else {
+        bytes
+    };
+    for &byte in rest {
+        if !byte.is_ascii_digit() {
+            break;
+        }
+        seen = true;
+        value = value.checked_mul(10)?.checked_add(i64::from(byte - b'0'))?;
+    }
+    if !seen {
+        return None;
+    }
+    Some(if negative { -value } else { value })
+}
+
 #[derive(Deserialize)]
 pub struct BybitMessage<'a> {
     #[serde(borrow)]
@@ -193,6 +295,54 @@ mod tests {
         assert_eq!(event.event, Some("depthUpdate"));
         assert_eq!(event.first_update_id, Some(2));
         assert_eq!(event.u, Some(3));
+
+        assert_eq!(
+            parse_binance_route(raw),
+            Some(BinanceRoute {
+                symbol: "btcusdt",
+                event: Some("depthUpdate"),
+                u: Some(3),
+                first_update_id: Some(2),
+                pu: None,
+            })
+        );
+    }
+
+    #[test]
+    fn binance_route_scan_stops_before_book_arrays() {
+        let mut raw = br#"{"stream":"btcusdt@depth","data":{"e":"depthUpdate","E":1,"s":"BTCUSDT","U":2,"u":3,"pu":1,"b":["#
+            .to_vec();
+        for _ in 0..8_000 {
+            raw.extend_from_slice(br#"["12345.67","890.12"],"#);
+        }
+        raw.extend_from_slice(br#"[]]}}"#);
+
+        assert_eq!(
+            parse_binance_route(&raw),
+            Some(BinanceRoute {
+                symbol: "btcusdt",
+                event: Some("depthUpdate"),
+                u: Some(3),
+                first_update_id: Some(2),
+                pu: Some(1),
+            })
+        );
+    }
+
+    #[test]
+    fn binance_route_scan_skips_non_depth_bodies() {
+        let raw = br#"{"stream":"btcusdt@bookTicker","data":{"u":400900217,"s":"BTCUSDT","b":"25.35190000","B":"31.21000000","a":"25.36520000","A":"40.66000000"}}"#;
+        assert_eq!(
+            parse_binance_route(raw),
+            Some(BinanceRoute {
+                symbol: "btcusdt",
+                event: None,
+                u: None,
+                first_update_id: None,
+                pu: None,
+            })
+        );
+        assert!(parse_binance_route(br#"{"result":null,"id":1}"#).is_none());
     }
 
     #[test]

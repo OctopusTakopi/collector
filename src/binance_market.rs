@@ -33,7 +33,7 @@ use crate::{
     file::WriteRecord,
     quality::QualityReporter,
     readiness::Readiness,
-    routing::BinanceMessage,
+    routing::{self, BinanceMessage},
     symbol::{Symbol, SymbolCache},
     throttler::Throttler,
     ws::{self, Delivery, Overflow},
@@ -660,22 +660,41 @@ async fn handle(
         return Ok(());
     }
 
-    let message: BinanceMessage<'_> = serde_json::from_slice(&data)?;
-    // Control frames from the combined endpoint (`{"result":null,"id":1}`) have
-    // no `data` and are not an error.
-    let Some(ref event) = message.data else {
-        return Ok(());
-    };
-    let Some(symbol_raw) = message.symbol() else {
-        return Ok(());
-    };
-
-    let symbol = symbols.resolve(symbol_raw);
+    // Combined-stream frames put `stream` first and depth ids before the book
+    // arrays. Scan that header instead of serde-walking every price string.
+    // Control frames and odd layouts fall back to the typed parser.
+    let (symbol, is_depth_update, u, first_update_id, pu) =
+        if let Some(route) = routing::parse_binance_route(&data) {
+            (
+                symbols.resolve(route.symbol),
+                route.event == Some("depthUpdate"),
+                route.u,
+                route.first_update_id,
+                route.pu,
+            )
+        } else {
+            let message: BinanceMessage<'_> = serde_json::from_slice(&data)?;
+            // Control frames from the combined endpoint (`{"result":null,"id":1}`)
+            // have no `data` and are not an error.
+            let Some(ref event) = message.data else {
+                return Ok(());
+            };
+            let Some(symbol_raw) = message.symbol() else {
+                return Ok(());
+            };
+            (
+                symbols.resolve(symbol_raw),
+                event.event == Some("depthUpdate"),
+                event.u,
+                event.first_update_id,
+                event.pu,
+            )
+        };
 
     // Spot's bookTicker frames carry no `e`, so absence just means "not a depth
     // update" rather than a malformed frame.
-    if event.event == Some("depthUpdate") {
-        let u = event.u.ok_or(ConnectorError::FormatError)?;
+    if is_depth_update {
+        let u = u.ok_or(ConnectorError::FormatError)?;
         match prev_u_map.get_mut(symbol.as_ref()) {
             Some(prev_u) => {
                 // A book that restarts its update ids (relist, maintenance)
@@ -704,11 +723,11 @@ async fn handle(
                 // update, for as long as the connections stay skewed.
                 let gap = match endpoint.depth_continuity {
                     DepthContinuity::FirstUpdateId => {
-                        event.first_update_id.ok_or(ConnectorError::FormatError)?
+                        first_update_id.ok_or(ConnectorError::FormatError)?
                             > prev_u.saturating_add(1)
                     }
                     DepthContinuity::PrevUpdateId => {
-                        event.pu.ok_or(ConnectorError::FormatError)? > *prev_u
+                        pu.ok_or(ConnectorError::FormatError)? > *prev_u
                     }
                 };
                 if gap {
