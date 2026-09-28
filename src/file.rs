@@ -250,6 +250,8 @@ fn open_locked(path: &Path) -> io::Result<Option<File>> {
 
 /// Lock the day's file for appending; `None` while another writer holds it.
 fn try_lock_daily(prefix: &Path, date: Date) -> io::Result<Option<File>> {
+    #[cfg(test)]
+    fault::check(fault::Step::Lock)?;
     let daily = day_file(prefix, date, format_args!(""));
     let Some(file) = open_locked(&daily)? else {
         return Ok(None);
@@ -306,9 +308,13 @@ fn merge_sidecar(daily: &mut File, sidecar: &Path) -> io::Result<Merge> {
         return Ok(Merge::Unterminated);
     }
     let start = daily.metadata()?.len();
-    let appended = io::copy(&mut source, daily)
-        .and_then(|copied| daily.write_all(&trailer(start + copied)))
-        .and_then(|()| daily.sync_all());
+    let appended = (|| {
+        #[cfg(test)]
+        fault::check(fault::Step::Append)?;
+        let copied = io::copy(&mut source, daily)?;
+        daily.write_all(&trailer(start + copied))?;
+        daily.sync_all()
+    })();
     if let Err(error) = appended {
         return Err(match rollback_append(daily, start) {
             Ok(()) => error,
@@ -360,6 +366,8 @@ fn open_sink(prefix: &Path, date: Date, run_id: &str) -> io::Result<Sink> {
 }
 
 fn reopen_sidecar(path: &Path) -> io::Result<ZstdEncoder> {
+    #[cfg(test)]
+    fault::check(fault::Step::Resume)?;
     let file = File::options().append(true).open(path)?;
     lock_exclusively(&file, path)?;
     ZstdEncoder::new(file, ZSTD_LEVEL)
@@ -569,9 +577,7 @@ impl RotatingFile {
                 );
                 self.mark_degraded(sidecar.display().to_string(), &error);
                 self.merge_retry_at = Some(Instant::now() + MERGE_RETRY_BACKOFF);
-                // Unlock: the fallback probes the lock again through another fd.
-                drop(daily);
-                return self.resume_or_queue_sidecar(sidecar, after);
+                return self.resume_or_queue_sidecar(sidecar, daily, after);
             }
         }
         self.continue_in(daily, after)
@@ -579,10 +585,16 @@ impl RotatingFile {
 
     /// After a failed append of a finished sidecar: reopen it, so the day's
     /// records keep going there and a later switch retries the append.
-    /// Failing that, append it now if the daily file is free, or queue it
-    /// when releasing.
-    fn resume_or_queue_sidecar(&mut self, sidecar: PathBuf, after: AfterSwitch) -> io::Result<()> {
-        let resume_error = match reopen_sidecar(&sidecar) {
+    /// Failing that, retry the append through the daily file still locked
+    /// here — not through a fresh lock, which would verify it again — or
+    /// queue the sidecar when releasing.
+    fn resume_or_queue_sidecar(
+        &mut self,
+        sidecar: PathBuf,
+        mut daily: File,
+        after: AfterSwitch,
+    ) -> io::Result<()> {
+        match reopen_sidecar(&sidecar) {
             Ok(encoder) => {
                 self.sink = Sink::Sidecar {
                     encoder,
@@ -590,27 +602,23 @@ impl RotatingFile {
                 };
                 return Ok(());
             }
-            Err(error) => error,
-        };
-        error!(
-            path = %sidecar.display(),
-            %resume_error,
-            "failed to resume overlap sidecar after a failed merge"
-        );
-        let merged = match try_lock_daily(&self.prefix, self.day.date)? {
-            None => Err(resume_error),
-            Some(mut daily) => match merge_sidecar(&mut daily, &sidecar) {
-                Ok(merge) => {
-                    if let Merge::Unterminated = merge {
-                        self.sidecar_unterminated(&sidecar);
-                    }
-                    Ok(daily)
+            Err(error) => error!(
+                path = %sidecar.display(),
+                %error,
+                "failed to resume overlap sidecar after a failed merge"
+            ),
+        }
+        let merged = match merge_sidecar(&mut daily, &sidecar) {
+            Ok(merge) => {
+                if let Merge::Unterminated = merge {
+                    self.sidecar_unterminated(&sidecar);
                 }
-                Err(error) => {
-                    self.mark_degraded(sidecar.display().to_string(), &error);
-                    Err(error)
-                }
-            },
+                Ok(daily)
+            }
+            Err(error) => {
+                self.mark_degraded(sidecar.display().to_string(), &error);
+                Err(error)
+            }
         };
         match (merged, after) {
             (Ok(daily), after) => self.continue_in(daily, after),
@@ -794,6 +802,57 @@ impl Writer {
         }
         self.files.clear();
         first_error.map_or(Ok(()), Err)
+    }
+}
+
+/// Failures of steps a real filesystem cannot be made to fail on demand.
+#[cfg(test)]
+mod fault {
+    use std::{cell::Cell, io};
+
+    #[derive(Clone, Copy, Debug)]
+    pub enum Step {
+        Lock,
+        Append,
+        Resume,
+    }
+    const STEPS: usize = 3;
+
+    thread_local! {
+        static ARMED: Cell<[u32; STEPS]> = const { Cell::new([0; STEPS]) };
+        static CALLS: Cell<[u32; STEPS]> = const { Cell::new([0; STEPS]) };
+    }
+
+    /// Fail the next `times` times `step` is reached on this thread.
+    pub fn arm(step: Step, times: u32) {
+        ARMED.with(|armed| {
+            let mut counts = armed.get();
+            counts[step as usize] = times;
+            armed.set(counts);
+        });
+    }
+
+    /// How often `step` was reached on this thread.
+    pub fn calls(step: Step) -> u32 {
+        CALLS.with(|calls| calls.get()[step as usize])
+    }
+
+    pub fn check(step: Step) -> io::Result<()> {
+        CALLS.with(|calls| {
+            let mut counts = calls.get();
+            counts[step as usize] += 1;
+            calls.set(counts);
+        });
+        ARMED.with(|armed| {
+            let mut counts = armed.get();
+            let left = &mut counts[step as usize];
+            if *left == 0 {
+                return Ok(());
+            }
+            *left -= 1;
+            armed.set(counts);
+            Err(io::Error::other(format!("injected {step:?} failure")))
+        })
     }
 }
 
@@ -1289,6 +1348,34 @@ mod tests {
             challenger.close().is_err(),
             "close must not report a clean exit"
         );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_failed_append_is_retried_through_the_lock_already_held() {
+        let dir = test_dir("merge-relock");
+        let mut incumbent = writer(&dir, "incumbent");
+        put(&mut incumbent, day_one(), br#"{"n":1}"#);
+        let mut challenger = writer(&dir, "challenger");
+        put(&mut challenger, day_one(), br#"{"n":2}"#);
+        incumbent.close().unwrap();
+        fault::arm(fault::Step::Append, 1);
+        fault::arm(fault::Step::Resume, 1);
+        let locks = fault::calls(fault::Step::Lock);
+
+        put(&mut challenger, day_one(), br#"{"n":3}"#);
+        assert_eq!(
+            fault::calls(fault::Step::Lock) - locks,
+            1,
+            "the daily file must not be locked and verified again"
+        );
+        assert!(matches!(challenger.files["btcusdt"].sink, Sink::Daily(_)));
+        challenger.close().unwrap_err();
+        assert_eq!(names(&dir), [DAY_ONE]);
+        let text = decoded(dir.join(DAY_ONE));
+        for record in [r#"{"n":1}"#, r#"{"n":2}"#, r#"{"n":3}"#] {
+            assert!(text.contains(record), "{record} missing: {text}");
+        }
         fs::remove_dir_all(&dir).unwrap();
     }
 
