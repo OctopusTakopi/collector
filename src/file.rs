@@ -37,6 +37,14 @@ const MERGE_RETRY_BACKOFF: Duration = Duration::from_secs(5);
 const ZSTD_MAGIC: u32 = 0xFD2F_B528;
 const SKIPPABLE_MAGIC: u32 = 0x184D_2A50;
 const SKIPPABLE_MAGIC_MASK: u32 = 0xFFFF_FFF0;
+/// Every cleanly closed file ends with a trailer: a zstd skippable frame of
+/// `TRAILER_MAGIC`, its 16-byte size, `TRAILER_TAG` and the file length at
+/// which the trailer starts, all little-endian. The next writer checks the
+/// file's end with one `pread` instead of walking every block; decoders skip
+/// it.
+const TRAILER_MAGIC: u32 = 0x184D_2A5C;
+const TRAILER_TAG: [u8; 8] = *b"COLLECTR";
+const TRAILER_LEN: usize = 24;
 
 /// Bytes kept as-is in a filename: only path-hostile bytes are escaped, so
 /// the exchange's identifier stays readable on disk. Hyperliquid names 315 of
@@ -130,11 +138,39 @@ fn names_file(path: &Path, file: &File) -> io::Result<bool> {
     }
 }
 
+/// The trailer of a file whose last frame ends at `offset`.
+fn trailer(offset: u64) -> [u8; TRAILER_LEN] {
+    let mut trailer = [0; TRAILER_LEN];
+    trailer[..4].copy_from_slice(&TRAILER_MAGIC.to_le_bytes());
+    trailer[4..8].copy_from_slice(&(TRAILER_LEN as u32 - 8).to_le_bytes());
+    trailer[8..16].copy_from_slice(&TRAILER_TAG);
+    trailer[16..].copy_from_slice(&offset.to_le_bytes());
+    trailer
+}
+
 /// Whether `file` ends exactly where a complete zstd frame does.
 ///
 /// A writer killed mid-frame leaves a tail no decoder can step past, so every
-/// frame appended after it would be lost to readers. Only frame and block
-/// headers are read — one small `pread` per block, no decompression.
+/// frame appended after it would be lost to readers. A file that ends with its
+/// trailer takes one `pread`; one written without (by an older binary) is
+/// walked.
+fn ends_cleanly(file: &File) -> io::Result<bool> {
+    let len = file.metadata()?.len();
+    if len == 0 {
+        return Ok(true);
+    }
+    if let Some(start) = len.checked_sub(TRAILER_LEN as u64) {
+        let mut tail = [0; TRAILER_LEN];
+        file.read_exact_at(&mut tail, start)?;
+        if tail == trailer(start) {
+            return Ok(true);
+        }
+    }
+    ends_on_frame_boundary(file)
+}
+
+/// The walk behind [`ends_cleanly`]: only frame and block headers are read —
+/// one small `pread` per block, no decompression.
 fn ends_on_frame_boundary(file: &File) -> io::Result<bool> {
     let len = file.metadata()?.len();
     let read_le = |pos: u64, width: usize| -> io::Result<Option<u32>> {
@@ -218,7 +254,7 @@ fn try_lock_daily(prefix: &Path, date: Date) -> io::Result<Option<File>> {
     let Some(file) = open_locked(&daily)? else {
         return Ok(None);
     };
-    if ends_on_frame_boundary(&file)? {
+    if ends_cleanly(&file)? {
         return Ok(Some(file));
     }
     // The last writer died mid-frame: set the file aside, readable up to
@@ -240,14 +276,39 @@ fn try_lock_daily(prefix: &Path, date: Date) -> io::Result<Option<File>> {
     fresh
 }
 
-/// Append a finished sidecar to the locked daily file, fsync, and delete the
-/// sidecar. A failed append is rolled back, so the daily file never ends
-/// mid-frame.
-fn merge_sidecar(daily: &mut File, sidecar: &Path) -> io::Result<()> {
+/// End a file whose last frame is finished with its trailer and fsync it. A
+/// torn trailer is cut off again, so the file still ends on its frame.
+fn seal(file: &mut File) -> io::Result<()> {
+    let start = file.metadata()?.len();
+    if let Err(error) = file.write_all(&trailer(start)) {
+        file.set_len(start)?;
+        return Err(error);
+    }
+    // A failed fsync may already have dropped the dirty pages and marked them
+    // clean, so a retry could succeed with the data lost.
+    file.sync_all()
+}
+
+/// What became of a finished sidecar.
+enum Merge {
+    Appended,
+    /// It does not end on a frame boundary, so it stays on disk: appended, it
+    /// would cut off everything written after it.
+    Unterminated,
+}
+
+/// Append a finished sidecar and a fresh trailer to the locked daily file,
+/// fsync, and delete the sidecar. A failed append is rolled back, so the daily
+/// file never ends mid-frame.
+fn merge_sidecar(daily: &mut File, sidecar: &Path) -> io::Result<Merge> {
+    let mut source = File::open(sidecar)?;
+    if !ends_cleanly(&source)? {
+        return Ok(Merge::Unterminated);
+    }
     let start = daily.metadata()?.len();
-    let appended = File::open(sidecar)
-        .and_then(|mut src| io::copy(&mut src, daily))
-        .and_then(|_| daily.sync_all());
+    let appended = io::copy(&mut source, daily)
+        .and_then(|copied| daily.write_all(&trailer(start + copied)))
+        .and_then(|()| daily.sync_all());
     if let Err(error) = appended {
         return Err(match rollback_append(daily, start) {
             Ok(()) => error,
@@ -268,17 +329,16 @@ fn merge_sidecar(daily: &mut File, sidecar: &Path) -> io::Result<()> {
             "switch complete; merged overlap sidecar but failed to remove it"
         ),
     }
-    Ok(())
+    Ok(Merge::Appended)
 }
 
-/// Merge a finished sidecar into its day's file; `false` while another writer
+/// Merge a finished sidecar into its day's file; `None` while another writer
 /// still holds that file.
-fn merge_into_daily(prefix: &Path, date: Date, sidecar: &Path) -> io::Result<bool> {
+fn merge_into_daily(prefix: &Path, date: Date, sidecar: &Path) -> io::Result<Option<Merge>> {
     let Some(mut daily) = try_lock_daily(prefix, date)? else {
-        return Ok(false);
+        return Ok(None);
     };
-    merge_sidecar(&mut daily, sidecar)?;
-    Ok(true)
+    merge_sidecar(&mut daily, sidecar).map(Some)
 }
 
 /// The day's file, or this run's sidecar while another writer holds it.
@@ -498,17 +558,21 @@ impl RotatingFile {
             };
             return self.continue_in(daily, after);
         }
-        if let Err(error) = merge_sidecar(&mut daily, &sidecar) {
-            error!(
-                path = %sidecar.display(),
-                %error,
-                "failed to append overlap sidecar after switch"
-            );
-            self.mark_degraded(sidecar.display().to_string(), &error);
-            self.merge_retry_at = Some(Instant::now() + MERGE_RETRY_BACKOFF);
-            // Unlock: the fallback probes the lock again through another fd.
-            drop(daily);
-            return self.resume_or_queue_sidecar(sidecar, after);
+        match merge_sidecar(&mut daily, &sidecar) {
+            Ok(Merge::Appended) => {}
+            Ok(Merge::Unterminated) => self.sidecar_unterminated(&sidecar),
+            Err(error) => {
+                error!(
+                    path = %sidecar.display(),
+                    %error,
+                    "failed to append overlap sidecar after switch"
+                );
+                self.mark_degraded(sidecar.display().to_string(), &error);
+                self.merge_retry_at = Some(Instant::now() + MERGE_RETRY_BACKOFF);
+                // Unlock: the fallback probes the lock again through another fd.
+                drop(daily);
+                return self.resume_or_queue_sidecar(sidecar, after);
+            }
         }
         self.continue_in(daily, after)
     }
@@ -536,7 +600,12 @@ impl RotatingFile {
         let merged = match try_lock_daily(&self.prefix, self.day.date)? {
             None => Err(resume_error),
             Some(mut daily) => match merge_sidecar(&mut daily, &sidecar) {
-                Ok(()) => Ok(daily),
+                Ok(merge) => {
+                    if let Merge::Unterminated = merge {
+                        self.sidecar_unterminated(&sidecar);
+                    }
+                    Ok(daily)
+                }
                 Err(error) => {
                     self.mark_degraded(sidecar.display().to_string(), &error);
                     Err(error)
@@ -569,8 +638,9 @@ impl RotatingFile {
     fn merge_pending_sidecars(&mut self) {
         for sidecar in mem::take(&mut self.pending_sidecars) {
             match merge_into_daily(&self.prefix, sidecar.date, &sidecar.path) {
-                Ok(true) => {}
-                Ok(false) => self.pending_sidecars.push(sidecar),
+                Ok(Some(Merge::Appended)) => {}
+                Ok(Some(Merge::Unterminated)) => self.sidecar_unterminated(&sidecar.path),
+                Ok(None) => self.pending_sidecars.push(sidecar),
                 Err(error) => {
                     error!(
                         path = %sidecar.path.display(),
@@ -583,6 +653,12 @@ impl RotatingFile {
                 }
             }
         }
+    }
+
+    fn sidecar_unterminated(&mut self, sidecar: &Path) {
+        let error = "overlap sidecar does not end on a frame boundary; left on disk unmerged";
+        error!(path = %sidecar.display(), "{error}");
+        self.mark_degraded(sidecar.display().to_string(), error);
     }
 
     fn holds_sidecars(&self) -> bool {
@@ -601,8 +677,9 @@ impl RotatingFile {
         Ok(())
     }
 
-    /// Flush the batch, finish the open zstd frame and fsync it. A finished
-    /// sidecar stays the sink until it is appended.
+    /// Flush the batch, finish the open zstd frame, end the file with its
+    /// trailer and fsync it. A finished sidecar stays the sink until it is
+    /// appended.
     fn finalize(&mut self) -> io::Result<()> {
         self.flush_batch()?;
         let encoder = match mem::replace(&mut self.sink, Sink::Closed) {
@@ -616,7 +693,7 @@ impl RotatingFile {
                 return Ok(());
             }
         };
-        let file = encoder.finish().map_err(|error| {
+        let mut file = encoder.finish().map_err(|error| {
             io::Error::new(
                 error.kind(),
                 format!(
@@ -625,9 +702,7 @@ impl RotatingFile {
                 ),
             )
         })?;
-        // A failed fsync may already have dropped the dirty pages and marked
-        // them clean, so a retry could succeed with the data lost.
-        file.sync_all().map_err(|error| {
+        seal(&mut file).map_err(|error| {
             io::Error::new(
                 error.kind(),
                 format!("failed to sync {}: {error}", self.prefix.display()),
@@ -635,7 +710,7 @@ impl RotatingFile {
         })
     }
 
-    fn mark_degraded(&mut self, target: String, error: &io::Error) {
+    fn mark_degraded(&mut self, target: String, error: impl fmt::Display) {
         self.degraded = true;
         self.quality.report(QualityEvent::StorageDegraded {
             at_ns: QualityEvent::now_ns(),
@@ -1104,6 +1179,116 @@ mod tests {
         let mut garbage = whole.clone();
         garbage.extend_from_slice(b"not zstd");
         assert!(!check(&garbage));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Both collectors write this trailer; files from either must verify in
+    /// the other.
+    #[test]
+    fn the_trailer_bytes_are_pinned() {
+        assert_eq!(
+            trailer(0x0102_0304_0506_0708),
+            [
+                0x5C, 0x2A, 0x4D, 0x18, // skippable-frame magic
+                0x10, 0x00, 0x00, 0x00, // frame size: 16
+                b'C', b'O', b'L', b'L', b'E', b'C', b'T', b'R', //
+                0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, // offset
+            ]
+        );
+    }
+
+    #[test]
+    fn a_trailer_spares_the_walk_and_a_misplaced_one_does_not() {
+        let dir = test_dir("trailer");
+        let path = dir.join("check.zst");
+        let check = |bytes: &[u8]| {
+            fs::write(&path, bytes).unwrap();
+            ends_cleanly(&File::open(&path).unwrap()).unwrap()
+        };
+        let with_trailer = |body: &[u8], offset: u64| [body, &trailer(offset)].concat();
+        let frames = zstd::encode_all(&b"records"[..], 1).unwrap();
+        let garbage = b"no frame or block header here".as_slice();
+        let len = |body: &[u8]| body.len() as u64;
+
+        // The walk would reject this body: only the trailer was read.
+        assert!(check(&with_trailer(garbage, len(garbage))));
+        // A trailer that does not end the file it describes is not trusted.
+        assert!(!check(&with_trailer(garbage, len(garbage) - 1)));
+        assert!(check(&with_trailer(&frames, len(&frames) + 1)));
+        assert!(check(&frames));
+        assert!(!check(&frames[..frames.len() - 1]));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn ends_with_its_trailer(bytes: &[u8]) -> bool {
+        let start = bytes.len() - TRAILER_LEN;
+        bytes[start..] == trailer(start as u64)
+    }
+
+    #[test]
+    fn closed_and_merged_files_end_with_their_trailer() {
+        let dir = test_dir("trailer-close");
+        let mut incumbent = writer(&dir, "incumbent");
+        put(&mut incumbent, day_one(), br#"{"n":1}"#);
+        let mut challenger = writer(&dir, "challenger");
+        put(&mut challenger, day_one(), br#"{"n":2}"#);
+        challenger.close().unwrap();
+        let sidecar = fs::read(dir.join("btcusdt_20270115_challenger.zst")).unwrap();
+        assert!(ends_with_its_trailer(&sidecar));
+        incumbent.close().unwrap();
+        assert!(ends_with_its_trailer(&fs::read(dir.join(DAY_ONE)).unwrap()));
+        fs::remove_dir_all(&dir).unwrap();
+
+        let dir = test_dir("trailer-merge");
+        let mut incumbent = writer(&dir, "incumbent");
+        put(&mut incumbent, day_one(), br#"{"n":1}"#);
+        let mut challenger = writer(&dir, "challenger");
+        put(&mut challenger, day_one(), br#"{"n":2}"#);
+        incumbent.close().unwrap();
+        put(&mut challenger, day_one(), br#"{"n":3}"#);
+        assert_eq!(names(&dir), [DAY_ONE], "the sidecar must be merged");
+        assert!(ends_with_its_trailer(&fs::read(dir.join(DAY_ONE)).unwrap()));
+        challenger.close().unwrap();
+        assert!(ends_with_its_trailer(&fs::read(dir.join(DAY_ONE)).unwrap()));
+        assert_eq!(
+            decoded(dir.join(DAY_ONE)),
+            format!(
+                "{DAY_ONE_NS} {{\"n\":1}}\n{DAY_ONE_NS} {{\"n\":2}}\n{DAY_ONE_NS} {{\"n\":3}}\n"
+            ),
+            "decoders must skip every trailer and yield exactly the records"
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_unterminated_sidecar_is_reported_and_left_unmerged() {
+        let dir = test_dir("sidecar-unterminated");
+        let mut incumbent = writer(&dir, "incumbent");
+        put(&mut incumbent, day_one(), br#"{"n":1}"#);
+        let (quality, events) = QualityReporter::test_channel();
+        let mut challenger = Writer::new(&dir, "challenger", quality);
+        put(&mut challenger, day_one(), br#"{"n":2}"#);
+        put(&mut challenger, day_two(), br#"{"n":3}"#);
+        let sidecar = dir.join("btcusdt_20270115_challenger.zst");
+        let bytes = fs::read(&sidecar).unwrap();
+        fs::write(&sidecar, &bytes[..bytes.len() - TRAILER_LEN - 1]).unwrap();
+        incumbent.close().unwrap();
+
+        put(&mut challenger, day_two(), br#"{"n":4}"#);
+        assert!(challenger.files["btcusdt"].pending_sidecars.is_empty());
+        assert!(matches!(
+            events.try_recv(),
+            Ok(QualityEvent::StorageDegraded { target, .. }) if target == sidecar.display().to_string()
+        ));
+        assert!(
+            sidecar.exists(),
+            "an unterminated sidecar must stay on disk"
+        );
+        assert!(!decoded(dir.join(DAY_ONE)).contains(r#"{"n":2}"#));
+        assert!(
+            challenger.close().is_err(),
+            "close must not report a clean exit"
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 

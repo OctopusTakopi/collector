@@ -1816,6 +1816,46 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
+    /// The collector ends every closed file, and every merged sidecar, with
+    /// a skippable trailer frame; the decoder must step over each.
+    #[test]
+    fn files_with_collector_trailers_are_read_whole() {
+        use collector::{file::Writer, quality::QualityReporter};
+
+        const DAY: i128 = 1_787_184_000_000_000_000; // 2026-08-20 00:00 UTC
+        let dir = test_dir("trailer");
+        let put = |writer: &mut Writer, second: i128| {
+            let recv = Timestamp::from_nanosecond(DAY + second * 1_000_000_000).unwrap();
+            writer
+                .write(recv, "btcusdt".into(), bytes::Bytes::from_static(b"{}"))
+                .unwrap();
+        };
+        let mut incumbent = Writer::new(&dir, "incumbent", QualityReporter::disabled());
+        put(&mut incumbent, 1);
+        let mut challenger = Writer::new(&dir, "challenger", QualityReporter::disabled());
+        put(&mut challenger, 2);
+        incumbent.close().unwrap();
+        put(&mut challenger, 3);
+        challenger.close().unwrap();
+
+        let series = Series {
+            key: "test/btcusdt".to_owned(),
+            family: Family::Generic,
+            files: vec![DatedFile {
+                path: dir.join("btcusdt_20260820.zst"),
+                date: civil::Date::new(2026, 8, 20).unwrap(),
+                segment_start_ns: i64::MIN,
+                run_id: None,
+            }],
+        };
+        let report = scan_series(&series, 1_000_000_000_000, false);
+        assert_eq!(report.rows, 3);
+        assert_eq!(report.bad_lines, 0);
+        assert!(report.files.iter().all(|file| file.decode_error.is_none()));
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     fn test_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "collector-gap-{tag}-test-{}-{}",
