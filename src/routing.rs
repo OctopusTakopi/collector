@@ -1,52 +1,74 @@
+//! Cheap routing of raw frames: which symbol a frame belongs to, and the few
+//! fields the consumers act on, without materialising market data.
+
+use std::fmt;
+
 use serde::{
     Deserialize, Deserializer,
     de::{Error as _, IgnoredAny, MapAccess, SeqAccess, Visitor},
 };
 use serde_json::value::RawValue;
-use std::fmt;
 
-#[derive(Deserialize)]
-pub struct BinanceMessage<'a> {
-    #[serde(borrow)]
-    pub stream: Option<&'a str>,
-    #[serde(borrow)]
-    pub data: Option<BinanceEvent<'a>>,
-}
-
-#[derive(Deserialize)]
+/// The Binance event fields the consumer acts on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 pub struct BinanceEvent<'a> {
+    /// `e`; absent on spot's bookTicker.
     #[serde(rename = "e", borrow)]
-    pub event: Option<&'a str>,
+    pub kind: Option<&'a str>,
     pub u: Option<i64>,
     #[serde(rename = "U")]
     pub first_update_id: Option<i64>,
     pub pu: Option<i64>,
 }
 
-impl BinanceMessage<'_> {
-    pub fn symbol(&self) -> Option<&str> {
-        self.stream?.split_once('@').map(|(symbol, _)| symbol)
+impl BinanceEvent<'_> {
+    pub fn is_depth_update(&self) -> bool {
+        self.kind == Some("depthUpdate")
     }
 }
 
-/// Fields the collector needs from a combined-stream frame. The rest of the
-/// payload — including depth `b`/`a` arrays — is left unparsed and written as-is.
+/// A combined-stream frame's symbol and event fields. The rest of the payload,
+/// depth `b`/`a` arrays included, is left unparsed and written as-is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BinanceRoute<'a> {
     pub symbol: &'a str,
-    pub event: Option<&'a str>,
-    pub u: Option<i64>,
-    pub first_update_id: Option<i64>,
-    pub pu: Option<i64>,
+    pub event: BinanceEvent<'a>,
 }
 
-/// Combined-stream envelope scan. Returns `None` when the cheap layout does
-/// not match (control frames, unusual whitespace, `data` before `stream` with
-/// a large body) so the caller can fall back to serde.
-///
-/// Depth ids are read only from the header before `"b":[` / `"a":[`, so a
-/// book-sized payload does not get its price strings walked.
-pub fn parse_binance_route(payload: &[u8]) -> Option<BinanceRoute<'_>> {
+/// Routes a combined-stream frame, or `None` for a control frame without one.
+/// Scans the envelope and falls back to serde when the layout is unusual.
+pub fn binance_route(payload: &[u8]) -> Result<Option<BinanceRoute<'_>>, serde_json::Error> {
+    if let Some(route) = scan_binance_route(payload) {
+        return Ok(Some(route));
+    }
+    let message: BinanceMessage<'_> = serde_json::from_slice(payload)?;
+    Ok(message.route())
+}
+
+#[derive(Deserialize)]
+struct BinanceMessage<'a> {
+    #[serde(borrow)]
+    stream: Option<&'a str>,
+    #[serde(borrow)]
+    data: Option<BinanceEvent<'a>>,
+}
+
+impl<'a> BinanceMessage<'a> {
+    fn route(&self) -> Option<BinanceRoute<'a>> {
+        let (symbol, _) = self.stream?.split_once('@')?;
+        Some(BinanceRoute {
+            symbol,
+            event: self.data?,
+        })
+    }
+}
+
+/// Scans the envelope for `stream` within its first bytes, and for a depth
+/// stream reads the ids from the header before `"b":[` / `"a":[`, so a
+/// book-sized payload never has its price strings walked. `None` when the
+/// layout does not match (control frames, unusual whitespace, a large `data`
+/// before `stream`).
+fn scan_binance_route(payload: &[u8]) -> Option<BinanceRoute<'_>> {
     const STREAM_PREFIX: usize = 256;
     let stream = json_unescaped_string(
         payload.get(..STREAM_PREFIX.min(payload.len()))?,
@@ -60,20 +82,19 @@ pub fn parse_binance_route(payload: &[u8]) -> Option<BinanceRoute<'_>> {
     if !stream.contains("@depth") {
         return Some(BinanceRoute {
             symbol,
-            event: None,
-            u: None,
-            first_update_id: None,
-            pu: None,
+            event: BinanceEvent::default(),
         });
     }
 
     let header = depth_header_prefix(payload);
     Some(BinanceRoute {
         symbol,
-        event: json_unescaped_string(header, b"\"e\":\""),
-        u: json_i64(header, b"\"u\":"),
-        first_update_id: json_i64(header, b"\"U\":"),
-        pu: json_i64(header, b"\"pu\":"),
+        event: BinanceEvent {
+            kind: json_unescaped_string(header, b"\"e\":\""),
+            u: json_i64(header, b"\"u\":"),
+            first_update_id: json_i64(header, b"\"U\":"),
+            pu: json_i64(header, b"\"pu\":"),
+        },
     })
 }
 
@@ -175,6 +196,12 @@ fn cut_event_time(payload: &[u8]) -> Option<(&[u8], &[u8])> {
         return None;
     }
     Some((&payload[..pos], &payload[end..]))
+}
+
+/// The `channel` of a Hyperliquid frame, found by scanning rather than
+/// parsing; the venue puts it first.
+pub(crate) fn hyperliquid_channel(payload: &[u8]) -> Option<&str> {
+    json_unescaped_string(payload, b"\"channel\":\"")
 }
 
 #[derive(Deserialize)]
@@ -331,25 +358,43 @@ impl<'a> HyperliquidMessage<'a> {
 mod tests {
     use super::*;
 
+    fn depth(u: i64, first_update_id: i64, pu: Option<i64>) -> BinanceEvent<'static> {
+        BinanceEvent {
+            kind: Some("depthUpdate"),
+            u: Some(u),
+            first_update_id: Some(first_update_id),
+            pu,
+        }
+    }
+
+    /// The scan and the serde fallback must agree on every field.
     #[test]
-    fn binance_partial_parse_ignores_payload_arrays() {
+    fn binance_scan_and_serde_agree_and_skip_payload_arrays() {
         let raw = br#"{"stream":"btcusdt@depth@0ms","data":{"e":"depthUpdate","E":1,"s":"BTCUSDT","U":2,"u":3,"b":[["1","2"],["3","4"]],"a":[["5","6"]]}}"#;
+        let expected = BinanceRoute {
+            symbol: "btcusdt",
+            event: depth(3, 2, None),
+        };
+
+        assert_eq!(scan_binance_route(raw), Some(expected));
         let message: BinanceMessage<'_> = serde_json::from_slice(raw).unwrap();
-        let event = message.data.as_ref().unwrap();
+        assert_eq!(message.route(), Some(expected));
+    }
 
-        assert_eq!(message.symbol(), Some("btcusdt"));
-        assert_eq!(event.event, Some("depthUpdate"));
-        assert_eq!(event.first_update_id, Some(2));
-        assert_eq!(event.u, Some(3));
-
+    /// `data` before a large `stream`-less prefix defeats the scan; serde
+    /// still routes it.
+    #[test]
+    fn binance_falls_back_to_serde_when_the_scan_misses() {
+        let raw = format!(
+            r#"{{"data":{{"e":"depthUpdate","E":1,"pad":"{}","U":2,"u":3,"pu":1}},"stream":"btcusdt@depth"}}"#,
+            "x".repeat(300)
+        );
+        assert_eq!(scan_binance_route(raw.as_bytes()), None);
         assert_eq!(
-            parse_binance_route(raw),
+            binance_route(raw.as_bytes()).unwrap(),
             Some(BinanceRoute {
                 symbol: "btcusdt",
-                event: Some("depthUpdate"),
-                u: Some(3),
-                first_update_id: Some(2),
-                pu: None,
+                event: depth(3, 2, Some(1)),
             })
         );
     }
@@ -361,13 +406,10 @@ mod tests {
         let raw = br#"{"stream":"btcusd_perp@depth@0ms","data":{"e":"depthUpdate","E":1791026681837,"T":1791026681811,"s":"BTCUSD_PERP","ps":"BTCUSD","U":11726048432971,"u":11726048432978,"pu":11726048432171,"b":[["76119.9","1521"]],"a":[],"st":2}}"#;
 
         assert_eq!(
-            parse_binance_route(raw),
+            scan_binance_route(raw),
             Some(BinanceRoute {
                 symbol: "btcusd_perp",
-                event: Some("depthUpdate"),
-                u: Some(11726048432978),
-                first_update_id: Some(11726048432971),
-                pu: Some(11726048432171),
+                event: depth(11726048432978, 11726048432971, Some(11726048432171)),
             })
         );
     }
@@ -382,13 +424,10 @@ mod tests {
         raw.extend_from_slice(br#"[]]}}"#);
 
         assert_eq!(
-            parse_binance_route(&raw),
+            scan_binance_route(&raw),
             Some(BinanceRoute {
                 symbol: "btcusdt",
-                event: Some("depthUpdate"),
-                u: Some(3),
-                first_update_id: Some(2),
-                pu: Some(1),
+                event: depth(3, 2, Some(1)),
             })
         );
     }
@@ -397,33 +436,38 @@ mod tests {
     fn binance_route_scan_skips_non_depth_bodies() {
         let raw = br#"{"stream":"btcusdt@bookTicker","data":{"u":400900217,"s":"BTCUSDT","b":"25.35190000","B":"31.21000000","a":"25.36520000","A":"40.66000000"}}"#;
         assert_eq!(
-            parse_binance_route(raw),
+            scan_binance_route(raw),
             Some(BinanceRoute {
                 symbol: "btcusdt",
-                event: None,
-                u: None,
-                first_update_id: None,
-                pu: None,
+                event: BinanceEvent::default(),
             })
         );
-        assert!(parse_binance_route(br#"{"result":null,"id":1}"#).is_none());
+        assert!(scan_binance_route(br#"{"result":null,"id":1}"#).is_none());
     }
 
     #[test]
     fn binance_book_ticker_does_not_require_event_type() {
         let raw = br#"{"stream":"btcusdt@bookTicker","data":{"u":400900217,"s":"BTCUSDT","b":"25.35190000","B":"31.21000000","a":"25.36520000","A":"40.66000000"}}"#;
         let message: BinanceMessage<'_> = serde_json::from_slice(raw).unwrap();
+        let route = message.route().unwrap();
 
-        assert_eq!(message.symbol(), Some("btcusdt"));
-        assert_eq!(message.data.unwrap().event, None);
+        assert_eq!(route.symbol, "btcusdt");
+        assert_eq!(route.event.kind, None);
+        assert!(!route.event.is_depth_update());
     }
 
     #[test]
     fn binance_control_message_without_stream_is_ignored() {
-        let raw = br#"{"result":null,"id":1}"#;
-        let message: BinanceMessage<'_> = serde_json::from_slice(raw).unwrap();
+        assert_eq!(binance_route(br#"{"result":null,"id":1}"#).unwrap(), None);
+    }
 
-        assert_eq!(message.symbol(), None);
+    #[test]
+    fn hyperliquid_channel_is_found_without_parsing() {
+        assert_eq!(
+            hyperliquid_channel(br#"{"channel":"l2Book","data":{"coin":"BTC"}}"#),
+            Some("l2Book")
+        );
+        assert_eq!(hyperliquid_channel(br#"{"method":"pong"}"#), None);
     }
 
     #[test]

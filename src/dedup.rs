@@ -129,14 +129,6 @@ impl Dedup {
         Self::build(false, DEDUP_WINDOW, DEDUP_MAX_ENTRIES)
     }
 
-    /// Whether this filter can ever report a duplicate.
-    ///
-    /// Lets a caller skip classifying a message it would not have filtered
-    /// anyway, so a single connection pays nothing for the check.
-    pub fn is_enabled(&self) -> bool {
-        self.enabled
-    }
-
     pub fn new(window: Duration, max_entries: usize) -> Self {
         Self::build(true, window, max_entries)
     }
@@ -363,13 +355,6 @@ mod tests {
         dedup.maintain();
 
         assert!(dedup.last_ceiling_warning.is_none());
-    }
-
-    /// A single connection must let a caller skip classification entirely.
-    #[test]
-    fn is_enabled_matches_the_connection_count() {
-        assert!(!Dedup::for_connections(1).is_enabled());
-        assert!(Dedup::for_connections(2).is_enabled());
     }
 
     /// Both counters have to move, or the health signal in the log is a lie.

@@ -1,249 +1,109 @@
-pub use http::{MAINNET_WS_URL, Subscription, keep_connection, run_connection};
-mod http;
+//! Hyperliquid perpetuals over the public websocket.
 
-use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
-    time::Duration,
-};
+mod connection;
 
+use std::{future::Future, sync::Arc, time::Duration};
+
+use bytes::Bytes;
 use jiff::Timestamp;
-use tokio::{
-    sync::{
-        mpsc::{Sender, channel},
-        watch,
-    },
-    task::JoinSet,
-};
-
-use tracing::error;
+use rustls::ClientConfig;
+use tokio::task::JoinSet;
 
 use crate::{
-    dedup::Dedup,
+    collection::{self, Context, Recorder, Venue},
     error::ConnectorError,
-    feed::{BackgroundResult, Feed},
-    file::WriteRecord,
-    quality::QualityReporter,
-    readiness::Readiness,
     routing::HyperliquidMessage,
-    symbol::SymbolCache,
+    session::Slot,
 };
 
-/// How often to restate that requests were rejected, so an incomplete feed
-/// stays visible instead of scrolling away after the initial error.
-const REJECTION_REPORT_INTERVAL: Duration = Duration::from_secs(60);
+/// Websocket subscriptions Hyperliquid allows per IP, across all connections.
+const MAX_SUBSCRIPTIONS: usize = 1_000;
 
-/// Hyperliquid reports per-request failures on the `error` channel and then
-/// never mentions them again. The connection stays healthy afterwards, so a
-/// rejected subscription would otherwise leave a permanently incomplete feed
-/// that nothing surfaces.
-///
-/// Shared with [`report_rejections`] so the restatement is driven by a timer.
-/// Reporting from `record` alone would only ever rate-limit *new* rejections —
-/// a single rejection followed by a healthy socket would be logged once and
-/// never mentioned again, which is exactly the case that needs surfacing.
-#[derive(Default)]
-struct Rejections {
-    total: AtomicU64,
-}
-
-async fn report_rejections(rejections: Arc<Rejections>) {
-    let mut ticker = tokio::time::interval(REJECTION_REPORT_INTERVAL);
-    // `interval` yields immediately on the first tick; skip it.
-    ticker.tick().await;
-    loop {
-        ticker.tick().await;
-        let total = rejections.total.load(Ordering::Relaxed);
-        if total > 0 {
-            error!(
-                rejected_total = total,
-                "feed may be incomplete: Hyperliquid rejected one or more requests"
-            );
-        }
-    }
-}
-
-async fn handle(
-    writer_tx: &Sender<WriteRecord>,
-    symbols: &mut SymbolCache,
-    rejections: &Rejections,
-    dedup: &mut Dedup,
-    recv_time: Timestamp,
-    data: bytes::Bytes,
-) -> Result<(), ConnectorError> {
-    let message: HyperliquidMessage<'_> = serde_json::from_slice(&data)?;
-    if message.channel == "error" {
-        // Per-request problems (bad coin, rate limit, "Already subscribed") are
-        // not connection-level faults: tearing the socket down and replaying
-        // every subscribe would reproduce the same error and, past a few dozen
-        // symbols, generate more rate-limit errors than it clears.
-        rejections.total.fetch_add(1, Ordering::Relaxed);
-        error!(
-            payload = %String::from_utf8_lossy(&data),
-            "Hyperliquid rejected a request; the other subscriptions keep streaming"
-        );
-        return Ok(());
-    }
-    let Some(symbol_raw) = message.symbol() else {
-        return Ok(());
-    };
-
-    // Only market data is deduplicated. Rejections above are per-connection —
-    // each connection subscribes for itself, so two identical rejections mean
-    // two connections are degraded, and collapsing them would hide one.
-    if dedup.is_duplicate(&data) {
-        return Ok(());
-    }
-
-    let symbol = symbols.resolve(symbol_raw);
-
-    writer_tx
-        .send(WriteRecord {
-            recv_time,
-            symbol,
-            data,
-        })
-        .await
-        .map_err(|_| ConnectorError::WriterClosed)?;
-    Ok(())
-}
-
-pub async fn run_collection(
-    subscriptions: Vec<String>,
-    symbols: Vec<String>,
-    writer_tx: Sender<WriteRecord>,
-    shutdown: watch::Receiver<bool>,
-    connections: usize,
-    quality: QualityReporter,
-    readiness: Readiness,
-) -> Result<(), anyhow::Error> {
-    let connections = connections.max(1);
-    // Hyperliquid's caps are per IP "across all websocket connections", not per
-    // socket, so redundancy spends the same budget N times over: each
-    // connection subscribes to the full set for itself.
-    let per_connection = subscriptions.len().saturating_mul(symbols.len());
-    let subscription_count = per_connection.saturating_mul(connections);
-    if subscription_count > 1_000 {
+pub(crate) async fn collect(
+    kinds: &'static [&'static str],
+    coins: &[String],
+    cx: Context,
+    tls: Arc<ClientConfig>,
+) -> anyhow::Result<()> {
+    // Every redundant connection subscribes to the full set for itself.
+    let per_connection = kinds.len() * coins.len();
+    let total = per_connection * cx.connections.get();
+    if total > MAX_SUBSCRIPTIONS {
         anyhow::bail!(
-            "Hyperliquid allows at most 1000 websocket subscriptions per IP across all \
-             connections; {connections} connection(s) x {per_connection} subscriptions = \
-             {subscription_count}"
+            "Hyperliquid allows at most {MAX_SUBSCRIPTIONS} websocket subscriptions per IP \
+             across all connections; {} connection(s) x {per_connection} subscriptions = {total}",
+            cx.connections
         );
     }
+    let hyperliquid = Hyperliquid {
+        subscriptions: connection::subscriptions(kinds, coins),
+        pace: connection::subscribe_pace(cx.connections),
+        recorder: Recorder::new(cx.writer_tx.clone(), coins, cx.connections),
+    };
+    collection::run(hyperliquid, cx, tls, JoinSet::new()).await
+}
 
-    let mut dedup = Dedup::for_connections(connections);
-    // Sized per connection: they share the queue, so the burst each one can
-    // absorb stays the same however many there are.
-    let (ws_tx, ws_rx) =
-        channel::<(Timestamp, bytes::Bytes)>(crate::WS_QUEUE_CAPACITY.saturating_mul(connections));
-    let mut feed = Feed::new(ws_rx, shutdown);
-    let mut tasks: JoinSet<BackgroundResult> = JoinSet::new();
-    let mut symbol_cache = SymbolCache::new(&symbols);
-    let rejections = Arc::new(Rejections::default());
-    for connection in 0..connections {
-        let subscriptions = subscriptions.clone();
-        let symbols = symbols.clone();
-        let ws_tx = ws_tx.clone();
-        let quality = quality.clone();
-        let readiness = readiness.clone();
-        tasks.spawn(async move {
-            tokio::time::sleep(crate::CONNECT_STAGGER * connection as u32).await;
-            keep_connection(
-                subscriptions,
-                symbols,
-                connection,
-                connections,
-                ws_tx,
-                quality,
-                readiness,
-            )
-            .await;
-            Err(anyhow::anyhow!(
-                "Hyperliquid websocket connection supervisor {connection} exited"
-            ))
-        });
+/// The consumer of Hyperliquid's queue, which carries market data only.
+struct Hyperliquid {
+    subscriptions: Arc<[connection::Subscription]>,
+    pace: Duration,
+    recorder: Recorder,
+}
+
+impl Venue for Hyperliquid {
+    fn label(&self) -> &'static str {
+        "hyperliquid"
     }
-    // The clones above are the only senders that should keep the feed open.
-    drop(ws_tx);
-    let rejection_report_state = Arc::clone(&rejections);
-    tasks.spawn(async move {
-        report_rejections(rejection_report_state).await;
-        Err(anyhow::anyhow!("Hyperliquid rejection reporter exited"))
-    });
 
-    while let Some((recv_time, data)) = feed.recv(&mut tasks).await? {
-        if let Err(error) = handle(
-            &writer_tx,
-            &mut symbol_cache,
-            &rejections,
-            &mut dedup,
-            recv_time,
-            data,
-        )
-        .await
-        {
-            if matches!(&error, ConnectorError::WriterClosed) {
-                return Err(error.into());
-            }
-            error!(?error, "couldn't handle the received data.");
+    fn keep_connection(&self, slot: Slot) -> impl Future<Output = ()> + Send + 'static {
+        connection::keep_connection(Arc::clone(&self.subscriptions), self.pace, slot)
+    }
+
+    async fn handle(&mut self, recv_time: Timestamp, data: Bytes) -> Result<(), ConnectorError> {
+        if self.recorder.dedup.is_duplicate(&data) {
+            return Ok(());
         }
+        let message: HyperliquidMessage<'_> = serde_json::from_slice(&data)?;
+        let Some(coin) = message.symbol() else {
+            return Ok(());
+        };
+        let symbol = self.recorder.symbols.resolve(coin);
+        self.recorder.write(recv_time, symbol, data).await
     }
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroUsize;
+
+    use tokio::sync::mpsc::{Receiver, channel};
+
     use super::*;
+    use crate::file::WriteRecord;
 
-    #[tokio::test]
-    async fn error_frame_is_reported_without_dropping_the_connection() {
-        let (writer_tx, mut writer_rx) = channel(1);
-        let mut symbols = SymbolCache::new(&[]);
-        let rejections = Rejections::default();
-        let mut dedup = Dedup::disabled();
-        let data = bytes::Bytes::from_static(
-            br#"{"channel":"error","data":"Too many websocket messages"}"#,
-        );
-
-        handle(
-            &writer_tx,
-            &mut symbols,
-            &rejections,
-            &mut dedup,
-            Timestamp::now(),
-            data,
-        )
-        .await
-        .unwrap();
-
-        // Nothing is written, and nothing is treated as fatal, but the
-        // rejection is retained so it can be restated.
-        assert!(writer_rx.try_recv().is_err());
-        assert_eq!(rejections.total.load(Ordering::Relaxed), 1);
+    fn hyperliquid(connections: usize) -> (Hyperliquid, Receiver<WriteRecord>) {
+        let (writer_tx, writer_rx) = channel(8);
+        let coins = ["BTC".to_owned()];
+        let connections = NonZeroUsize::new(connections).unwrap();
+        let hyperliquid = Hyperliquid {
+            subscriptions: connection::subscriptions(&["trades"], &coins),
+            pace: connection::subscribe_pace(connections),
+            recorder: Recorder::new(writer_tx, &coins, connections),
+        };
+        (hyperliquid, writer_rx)
     }
 
     #[tokio::test]
     async fn routes_trade_by_coin() {
-        let (writer_tx, mut writer_rx) = channel(1);
-        let mut symbols = SymbolCache::new(&["BTC".to_owned()]);
-        let rejections = Rejections::default();
-        let mut dedup = Dedup::disabled();
-        let data = bytes::Bytes::from_static(
+        let (mut hyperliquid, mut writer_rx) = hyperliquid(1);
+        let data = Bytes::from_static(
             br#"{"channel":"trades","data":[{"coin":"BTC","side":"B","px":"1","sz":"2"}]}"#,
         );
 
-        handle(
-            &writer_tx,
-            &mut symbols,
-            &rejections,
-            &mut dedup,
-            Timestamp::now(),
-            data.clone(),
-        )
-        .await
-        .unwrap();
+        hyperliquid
+            .handle(Timestamp::now(), data.clone())
+            .await
+            .unwrap();
 
         let WriteRecord {
             symbol,
@@ -254,37 +114,48 @@ mod tests {
         assert_eq!(written, data);
     }
 
-    /// Market data is collapsed across connections; a rejection is not, because
-    /// each connection subscribes for itself and two rejections mean two
-    /// degraded connections.
     #[tokio::test]
-    async fn redundant_copies_are_collapsed_but_rejections_are_not() {
-        let (writer_tx, mut writer_rx) = channel(8);
-        let mut symbols = SymbolCache::new(&["BTC".to_owned()]);
-        let rejections = Rejections::default();
-        let mut dedup = Dedup::for_connections(2);
-        let trade = bytes::Bytes::from_static(
+    async fn redundant_copies_are_recorded_once() {
+        let (mut hyperliquid, mut writer_rx) = hyperliquid(2);
+        let trade = Bytes::from_static(
             br#"{"channel":"trades","data":[{"coin":"BTC","side":"B","px":"1","sz":"2"}]}"#,
         );
-        let rejection =
-            bytes::Bytes::from_static(br#"{"channel":"error","data":"Already subscribed"}"#);
 
-        for data in [trade.clone(), trade.clone(), rejection.clone(), rejection] {
-            handle(
-                &writer_tx,
-                &mut symbols,
-                &rejections,
-                &mut dedup,
-                Timestamp::now(),
-                data,
-            )
+        hyperliquid
+            .handle(Timestamp::now(), trade.clone())
             .await
             .unwrap();
-        }
+        hyperliquid
+            .handle(Timestamp::now(), trade.clone())
+            .await
+            .unwrap();
 
-        let WriteRecord { data: written, .. } = writer_rx.try_recv().unwrap();
-        assert_eq!(written, trade);
+        assert_eq!(writer_rx.try_recv().unwrap().data, trade);
         assert!(writer_rx.try_recv().is_err(), "the copy is dropped");
-        assert_eq!(rejections.total.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn too_many_subscriptions_for_one_ip_are_refused_up_front() {
+        let (writer_tx, _writer_rx) = channel(1);
+        let (_shutdown_tx, shutdown) = tokio::sync::watch::channel(false);
+        let coins: Vec<String> = (0..200).map(|index| format!("C{index}")).collect();
+        let cx = Context {
+            writer_tx,
+            shutdown,
+            connections: NonZeroUsize::new(2).unwrap(),
+            quality: crate::quality::QualityReporter::disabled(),
+            readiness: crate::readiness::Readiness::new(1).0,
+        };
+
+        let error = collect(
+            &["trades", "l2Book", "bbo"],
+            &coins,
+            cx,
+            crate::ws::tls_config(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("= 1200"), "{error}");
     }
 }
