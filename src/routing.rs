@@ -57,11 +57,7 @@ pub fn parse_binance_route(payload: &[u8]) -> Option<BinanceRoute<'_>> {
         return None;
     }
 
-    if !stream
-        .as_bytes()
-        .windows(6)
-        .any(|window| window == b"@depth")
-    {
+    if !stream.contains("@depth") {
         return Some(BinanceRoute {
             symbol,
             event: None,
@@ -85,26 +81,32 @@ fn depth_header_prefix(payload: &[u8]) -> &[u8] {
     const MAX: usize = 1024;
     let head = payload.get(..MAX.min(payload.len())).unwrap_or(payload);
     for needle in [b"\"b\":[".as_slice(), b"\"a\":[".as_slice()] {
-        if let Some(index) = find_subslice(head, needle) {
+        if let Some(index) = find(head, needle) {
             return &head[..index];
         }
     }
     head
 }
 
-fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    hay.windows(needle.len())
+/// Where `needle` first occurs in `haystack`.
+pub(crate) fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
         .position(|window| window == needle)
 }
 
+pub(crate) fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    find(haystack, needle).is_some()
+}
+
 fn json_unescaped_string<'a>(hay: &'a [u8], key: &[u8]) -> Option<&'a str> {
-    let start = find_subslice(hay, key)? + key.len();
+    let start = find(hay, key)? + key.len();
     let end = start + hay[start..].iter().position(|&byte| byte == b'"')?;
     std::str::from_utf8(&hay[start..end]).ok()
 }
 
 fn json_i64(hay: &[u8], key: &[u8]) -> Option<i64> {
-    let mut index = find_subslice(hay, key)? + key.len();
+    let mut index = find(hay, key)? + key.len();
     while index < hay.len() && hay[index] == b' ' {
         index += 1;
     }
@@ -160,7 +162,7 @@ pub fn binance_dedup_key(payload: &[u8]) -> u128 {
 /// scan finds exactly the key.
 fn cut_event_time(payload: &[u8]) -> Option<(&[u8], &[u8])> {
     const NEEDLE: &[u8] = b"\"E\":";
-    let pos = payload.windows(NEEDLE.len()).position(|w| w == NEEDLE)?;
+    let pos = find(payload, NEEDLE)?;
     let mut end = pos + NEEDLE.len();
     if end < payload.len() && payload[end] == b'-' {
         end += 1;
@@ -469,6 +471,18 @@ mod tests {
                 String::from_utf8_lossy(raw)
             );
         }
+    }
+
+    #[test]
+    fn a_quoted_topic_key_separates_bybit_market_data_from_control() {
+        let market = br#"{"topic":"orderbook.1.BTCUSDT","type":"delta","data":{}}"#;
+        let ack = br#"{"success":true,"ret_msg":"subscribe","op":"subscribe","req_id":"BTCUSDT"}"#;
+        let rejection = br#"{"success":false,"ret_msg":"error:handler not found,topic:orderbook.1.FOO","op":"subscribe","req_id":"FOO"}"#;
+
+        assert!(contains(market, br#""topic""#));
+        assert!(!contains(ack, br#""topic""#));
+        // The rejection mentions `topic:` in prose but has no `"topic"` field.
+        assert!(!contains(rejection, br#""topic""#));
     }
 
     /// The two connections' copies of a spot event differ only in the

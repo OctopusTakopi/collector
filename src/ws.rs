@@ -20,7 +20,10 @@ use tokio_rustls::TlsConnector;
 use tracing::{error, info, warn};
 use url::Url;
 
-use crate::quality::{QualityEvent, QualityReporter};
+use crate::{
+    quality::{QualityEvent, QualityReporter},
+    readiness::Source,
+};
 
 type Io = TokioIo<Upgraded>;
 
@@ -69,27 +72,25 @@ where
 
 /// Rate-limited accounting for frames dropped because the writer cannot keep up.
 ///
-/// Dropping is preferable to stalling: a stalled read loop stops answering
-/// pings, so the exchange closes the connection and the resulting gap is far
-/// larger than the overflow itself. Binance depth streams additionally detect
-/// the resulting sequence gap and refetch a snapshot. What must never happen is
-/// dropping *silently*.
+/// Dropping beats stalling: a stalled read loop stops answering pings, the
+/// venue closes the connection, and that gap is far larger than the overflow.
+/// What must never happen is dropping silently.
 pub struct Overflow {
-    label: String,
-    quality: Option<QualityReporter>,
+    source: Source,
+    quality: QualityReporter,
     dropped: u64,
     reported: u64,
     last_report: Instant,
-    /// Once the consumer is established as too slow, frames are shed without
-    /// waiting at all. See [`deliver`].
+    /// Set once the consumer has proved too slow; frames are then shed without
+    /// waiting until one gets through. See [`deliver`].
     shedding: bool,
 }
 
 impl Overflow {
-    pub fn new(label: impl Into<String>) -> Self {
+    pub fn new(source: Source, quality: QualityReporter) -> Self {
         Self {
-            label: label.into(),
-            quality: None,
+            source,
+            quality,
             dropped: 0,
             reported: 0,
             last_report: Instant::now(),
@@ -97,68 +98,43 @@ impl Overflow {
         }
     }
 
-    pub fn with_reporter(label: impl Into<String>, quality: QualityReporter) -> Self {
-        Self {
-            quality: Some(quality),
-            ..Self::new(label)
-        }
-    }
-
-    /// Record one dropped frame.
-    pub fn record_drop(&mut self) {
+    fn record_drop(&mut self) {
         self.dropped += 1;
         if self.dropped == 1 || self.last_report.elapsed() >= OVERFLOW_REPORT_INTERVAL {
             error!(
-                endpoint = %self.label,
+                endpoint = %self.source,
                 dropped_total = self.dropped,
                 dropped_since_last_report = self.dropped - self.reported,
                 "writer cannot keep up; dropping frames"
             );
-            if let Some(quality) = &self.quality {
-                quality.report(QualityEvent::MarketDataDropped {
-                    at_ns: QualityEvent::now_ns(),
-                    source: self.label.clone(),
-                    dropped_total: self.dropped,
-                    dropped_since_last_report: self.dropped - self.reported,
-                });
-            }
+            self.quality.report(QualityEvent::MarketDataDropped {
+                at_ns: QualityEvent::now_ns(),
+                source: self.source.to_string(),
+                dropped_total: self.dropped,
+                dropped_since_last_report: self.dropped - self.reported,
+            });
             self.reported = self.dropped;
             self.last_report = Instant::now();
         }
     }
 
-    /// Record one frame that made it through, reporting recovery once.
-    pub fn record_sent(&mut self) {
+    /// Reports recovery once, on the first frame through after a drop.
+    fn record_sent(&mut self) {
         if self.dropped > 0 {
             info!(
-                endpoint = %self.label,
+                endpoint = %self.source,
                 dropped_total = self.dropped,
                 "writer caught up; no longer dropping frames"
             );
-            if let Some(quality) = &self.quality {
-                quality.report(QualityEvent::MarketDataRecovered {
-                    at_ns: QualityEvent::now_ns(),
-                    source: self.label.clone(),
-                    dropped_total: self.dropped,
-                });
-            }
+            self.quality.report(QualityEvent::MarketDataRecovered {
+                at_ns: QualityEvent::now_ns(),
+                source: self.source.to_string(),
+                dropped_total: self.dropped,
+            });
             self.dropped = 0;
             self.reported = 0;
         }
         self.shedding = false;
-    }
-
-    fn is_shedding(&self) -> bool {
-        self.shedding
-    }
-
-    fn begin_shedding(&mut self) {
-        self.shedding = true;
-    }
-
-    #[cfg(test)]
-    pub fn dropped(&self) -> u64 {
-        self.dropped
     }
 }
 
@@ -172,13 +148,6 @@ pub enum Delivery {
     Closed,
     /// A frame that must not be shed could not be delivered.
     Undeliverable,
-}
-
-/// True if `needle` occurs anywhere in `haystack`.
-///
-/// Only used on the slow path, where frames are small and rare.
-pub fn payload_contains(haystack: &[u8], needle: &[u8]) -> bool {
-    haystack.len() >= needle.len() && haystack.windows(needle.len()).any(|w| w == needle)
 }
 
 /// Hand a frame to the consumer without ever starving control frames.
@@ -215,7 +184,7 @@ where
     }
 
     let may_shed = sheddable(&value);
-    if may_shed && overflow.is_shedding() {
+    if may_shed && overflow.shedding {
         overflow.record_drop();
         return Delivery::Dropped;
     }
@@ -228,7 +197,7 @@ where
         }
         Ok(Err(_)) => Delivery::Closed,
         Err(_) if may_shed => {
-            overflow.begin_shedding();
+            overflow.shedding = true;
             overflow.record_drop();
             Delivery::Dropped
         }
@@ -432,18 +401,26 @@ where
     }
 }
 
-/// Open a websocket to `url`.
-///
-/// Bounded by [`CONNECT_TIMEOUT`]: none of TCP, TLS or the upgrade carries a
-/// deadline of its own, and a caller that is reconnecting has nothing to fall
-/// back on while this hangs.
-pub async fn connect(url: &str) -> Result<Connection> {
-    timeout(CONNECT_TIMEOUT, handshake_all(url))
+/// TLS settings for every venue, backed by the Mozilla root bundle. Built once
+/// and shared, so a reconnect does not re-parse ~150 root certificates.
+pub fn tls_config() -> Arc<ClientConfig> {
+    let roots = rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    Arc::new(
+        ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    )
+}
+
+/// Open a websocket to `url`, bounded by [`CONNECT_TIMEOUT`]: none of TCP,
+/// TLS or the upgrade has a deadline of its own.
+pub async fn connect(url: &str, tls: &Arc<ClientConfig>) -> Result<Connection> {
+    timeout(CONNECT_TIMEOUT, handshake_all(url, tls))
         .await
         .map_err(|_| anyhow!("connection attempt timed out after {CONNECT_TIMEOUT:?}"))?
 }
 
-async fn handshake_all(url: &str) -> Result<Connection> {
+async fn handshake_all(url: &str, tls: &Arc<ClientConfig>) -> Result<Connection> {
     let url = Url::parse(url).context("Invalid URL")?;
     let host = url.host_str().ok_or_else(|| anyhow!("No host in url"))?;
     let port = url
@@ -453,12 +430,7 @@ async fn handshake_all(url: &str) -> Result<Connection> {
         .map_err(|e| anyhow!("Invalid domain: {}", e))?
         .to_owned();
 
-    let root_store =
-        rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let config = ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
-    let connector = TlsConnector::from(Arc::new(config));
+    let connector = TlsConnector::from(Arc::clone(tls));
 
     let addr = format!("{}:{}", host, port);
     let tcp_stream = TcpStream::connect(&addr)
@@ -518,6 +490,11 @@ pub fn duplex_pair() -> (
 mod tests {
     use super::*;
 
+    const TEST_SOURCE: Source = Source {
+        endpoint: "test",
+        connection: 0,
+    };
+
     /// The pong must actually reach the wire with the ping's exact payload.
     /// Queuing it on the writer task is not evidence that it was written.
     #[tokio::test]
@@ -575,12 +552,12 @@ mod tests {
     #[test]
     fn overflow_reports_the_first_drop_and_resets_after_recovery() {
         let (quality, rx) = QualityReporter::test_channel();
-        let mut overflow = Overflow::with_reporter("test", quality);
+        let mut overflow = Overflow::new(TEST_SOURCE, quality);
         overflow.record_drop();
         overflow.record_drop();
-        assert_eq!(overflow.dropped(), 2);
+        assert_eq!(overflow.dropped, 2);
         overflow.record_sent();
-        assert_eq!(overflow.dropped(), 0);
+        assert_eq!(overflow.dropped, 0);
         assert!(matches!(
             rx.recv().unwrap(),
             QualityEvent::MarketDataDropped {
@@ -604,7 +581,7 @@ mod tests {
     async fn sustained_backpressure_sheds_without_waiting_after_the_first_grace() {
         let (tx, _rx) = mpsc::channel::<u32>(1);
         tx.try_reserve().unwrap().send(0); // fill it
-        let mut overflow = Overflow::new("test");
+        let mut overflow = Overflow::new(TEST_SOURCE, QualityReporter::disabled());
 
         let before = tokio::time::Instant::now();
         assert_eq!(
@@ -629,7 +606,7 @@ mod tests {
             after_first,
             "shedding must not wait"
         );
-        assert_eq!(overflow.dropped(), 99);
+        assert_eq!(overflow.dropped, 99);
     }
 
     /// A brief burst is absorbed losslessly rather than shed.
@@ -644,12 +621,12 @@ mod tests {
             std::future::pending::<()>().await;
         });
 
-        let mut overflow = Overflow::new("test");
+        let mut overflow = Overflow::new(TEST_SOURCE, QualityReporter::disabled());
         assert_eq!(
             deliver(&tx, &mut overflow, 1, |_| true).await,
             Delivery::Sent
         );
-        assert_eq!(overflow.dropped(), 0);
+        assert_eq!(overflow.dropped, 0);
     }
 
     /// Control responses must never be shed: losing a subscription rejection
@@ -658,32 +635,19 @@ mod tests {
     async fn control_frames_are_never_shed() {
         let (tx, _rx) = mpsc::channel::<u32>(1);
         tx.try_reserve().unwrap().send(0);
-        let mut overflow = Overflow::new("test");
+        let mut overflow = Overflow::new(TEST_SOURCE, QualityReporter::disabled());
 
         // Get into the shedding state with a data frame.
         assert_eq!(
             deliver(&tx, &mut overflow, 1, |_| true).await,
             Delivery::Dropped
         );
-        assert!(overflow.is_shedding());
+        assert!(overflow.shedding);
 
         // A non-sheddable frame reports undeliverable instead of vanishing.
         assert_eq!(
             deliver(&tx, &mut overflow, 2, |_| false).await,
             Delivery::Undeliverable
         );
-    }
-
-    #[test]
-    fn payload_classification_separates_control_from_market_data() {
-        let market = br#"{"topic":"orderbook.1.BTCUSDT","type":"delta","data":{}}"#;
-        let ack = br#"{"success":true,"ret_msg":"subscribe","op":"subscribe","req_id":"BTCUSDT"}"#;
-        let rejection =
-            br#"{"success":false,"ret_msg":"error:handler not found,topic:orderbook.1.FOO","op":"subscribe","req_id":"FOO"}"#;
-
-        assert!(payload_contains(market, br#""topic""#));
-        assert!(!payload_contains(ack, br#""topic""#));
-        // The rejection mentions `topic:` in prose but has no `"topic"` field.
-        assert!(!payload_contains(rejection, br#""topic""#));
     }
 }

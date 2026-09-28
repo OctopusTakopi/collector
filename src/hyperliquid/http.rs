@@ -2,12 +2,14 @@ use std::{
     collections::HashSet,
     io,
     io::ErrorKind,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
 use anyhow::Error;
 use fastwebsockets::OpCode;
 use jiff::Timestamp;
+use rustls::ClientConfig;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, value::RawValue};
 use tokio::{select, sync::mpsc::Sender, time::timeout};
@@ -16,6 +18,7 @@ use tracing::{debug, error, info, warn};
 use crate::{
     quality::QualityReporter,
     readiness::{Readiness, Source},
+    session::Backoff,
     ws::{self, Delivery, FrameSender, Overflow},
 };
 
@@ -215,7 +218,7 @@ async fn control_loop(sender: FrameSender, subscriptions: &[Value], connections:
 }
 
 async fn connect(
-    url: &str,
+    tls: &Arc<ClientConfig>,
     subscriptions: &[Value],
     connection: usize,
     connections: usize,
@@ -223,10 +226,15 @@ async fn connect(
     quality: QualityReporter,
     readiness: Readiness,
 ) -> Result<(), anyhow::Error> {
-    let mut conn = ws::connect(url).await?;
+    let mut conn = ws::connect(MAINNET_WS_URL, tls).await?;
     let sender = conn.sender();
-    let mut overflow =
-        Overflow::with_reporter(format!("hyperliquid/connection-{connection}"), quality);
+    let mut overflow = Overflow::new(
+        Source {
+            endpoint: "hyperliquid",
+            connection,
+        },
+        quality,
+    );
 
     let mut subscription_readiness = SubscriptionReadiness::new(subscriptions);
     let control = control_loop(sender.clone(), subscriptions, connections);
@@ -259,7 +267,7 @@ async fn connect(
                     (recv_time, message.payload),
                     // Rejections arrive on the `error` channel. Shedding one
                     // would hide a permanently incomplete feed.
-                    |(_, payload)| !ws::payload_contains(payload, br#""error""#),
+                    |(_, payload)| !crate::routing::contains(payload, br#""error""#),
                 )
                 .await;
                 match delivery {
@@ -311,7 +319,7 @@ async fn connect(
 /// Hyperliquid's public websocket endpoint.
 pub const MAINNET_WS_URL: &str = "wss://api.hyperliquid.xyz/ws";
 
-/// Keep one connection to `url` alive forever, reconnecting with backoff.
+/// Keep one connection to Hyperliquid alive forever, reconnecting with backoff.
 ///
 /// `subscriptions` are raw subscription objects (`{"type": "trades", "coin":
 /// "BTC"}`, `{"type": "userFills", "user": "0x…"}`, …), sent paced for
@@ -323,7 +331,6 @@ pub const MAINNET_WS_URL: &str = "wss://api.hyperliquid.xyz/ws";
 ///
 /// Returns only when `ws_tx`'s receiver is dropped.
 pub async fn run_connection(
-    url: &str,
     subscriptions: Vec<Value>,
     connection: usize,
     connections: usize,
@@ -338,11 +345,12 @@ pub async fn run_connection(
         "connecting to the Hyperliquid websocket"
     );
 
-    let mut error_count = 0;
+    let mut backoff = Backoff::default();
+    let tls = ws::tls_config();
     loop {
         let connect_time = Instant::now();
         if let Err(error) = connect(
-            url,
+            &tls,
             &subscriptions,
             connection,
             connections,
@@ -354,22 +362,7 @@ pub async fn run_connection(
         {
             let lifetime = connect_time.elapsed();
             error!(connection, ?error, ?lifetime, "websocket error");
-            error_count += 1;
-            if lifetime > Duration::from_secs(30) {
-                error_count = 0;
-            }
-
-            let sleep_duration = if error_count > 20 {
-                Duration::from_secs(10)
-            } else if error_count > 10 {
-                Duration::from_secs(5)
-            } else if error_count > 3 {
-                Duration::from_secs(1)
-            } else {
-                Duration::from_millis(500)
-            };
-
-            tokio::time::sleep(sleep_duration).await;
+            backoff.wait(Some(lifetime)).await;
         } else {
             break;
         }
@@ -400,7 +393,6 @@ pub async fn keep_connection(
         .collect();
 
     run_connection(
-        MAINNET_WS_URL,
         subscriptions,
         connection,
         connections,

@@ -2,12 +2,14 @@ use std::{
     collections::{BTreeSet, HashMap},
     io,
     io::ErrorKind,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
 use anyhow::Error;
 use fastwebsockets::OpCode;
 use jiff::Timestamp;
+use rustls::ClientConfig;
 use tokio::{
     select,
     sync::{
@@ -22,6 +24,7 @@ use crate::{
     quality::QualityReporter,
     readiness::{Readiness, Source},
     routing::BybitMessage,
+    session::Backoff,
     ws::{self, Delivery, FrameSender, Overflow},
 };
 
@@ -213,6 +216,7 @@ async fn control_loop(
 #[allow(clippy::too_many_arguments)]
 async fn connect(
     url: &str,
+    tls: &Arc<ClientConfig>,
     requests: Vec<SubscriptionRequest>,
     connection: usize,
     ws_tx: Sender<Frame>,
@@ -221,9 +225,15 @@ async fn connect(
     quality: QualityReporter,
     readiness: Readiness,
 ) -> Result<(), anyhow::Error> {
-    let mut conn = ws::connect(url).await?;
+    let mut conn = ws::connect(url, tls).await?;
     let sender = conn.sender();
-    let mut overflow = Overflow::with_reporter(format!("bybit/connection-{connection}"), quality);
+    let mut overflow = Overflow::new(
+        Source {
+            endpoint: "bybit",
+            connection,
+        },
+        quality,
+    );
 
     let order: Vec<String> = requests
         .iter()
@@ -277,7 +287,7 @@ async fn connect(
                     // subscription ack or rejection would leave that symbol's
                     // topics unsubscribed with nothing left to trigger a retry,
                     // and no degraded-feed report either.
-                    |(_, _, payload)| ws::payload_contains(payload, br#""topic""#),
+                    |(_, _, payload)| crate::routing::contains(payload, br#""topic""#),
                 )
                 .await;
                 match delivery {
@@ -332,7 +342,8 @@ pub async fn keep_connection(
     quality: QualityReporter,
     readiness: Readiness,
 ) {
-    let mut error_count = 0;
+    let mut backoff = Backoff::default();
+    let tls = ws::tls_config();
     loop {
         let connect_time = Instant::now();
         let requests = symbol_list
@@ -350,6 +361,7 @@ pub async fn keep_connection(
             .collect::<Vec<_>>();
         if let Err(error) = connect(
             "wss://stream.bybit.com/v5/public/linear",
+            &tls,
             requests,
             connection,
             ws_tx.clone(),
@@ -362,17 +374,7 @@ pub async fn keep_connection(
         {
             let lifetime = connect_time.elapsed();
             error!(connection, ?error, ?lifetime, "websocket error");
-            error_count += 1;
-            if lifetime > Duration::from_secs(30) {
-                error_count = 0;
-            }
-            if error_count > 20 {
-                tokio::time::sleep(Duration::from_secs(10)).await;
-            } else if error_count > 10 {
-                tokio::time::sleep(Duration::from_secs(5)).await;
-            } else if error_count > 3 {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
+            backoff.wait(Some(lifetime)).await;
         } else {
             break;
         }

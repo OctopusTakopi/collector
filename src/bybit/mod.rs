@@ -43,7 +43,7 @@ async fn handle(
     // front of a market-data frame, so the scan exits immediately, and the full
     // scan only happens for the small control frames that lack it.
     if dedup.is_enabled()
-        && crate::ws::payload_contains(&data, br#""topic""#)
+        && crate::routing::contains(&data, br#""topic""#)
         && dedup.is_duplicate(&data)
     {
         return Ok(());

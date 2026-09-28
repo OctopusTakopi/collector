@@ -23,6 +23,7 @@ pub mod hyperliquid;
 pub mod quality;
 pub mod readiness;
 pub mod routing;
+mod session;
 pub mod symbol;
 pub mod throttler;
 pub mod ws;

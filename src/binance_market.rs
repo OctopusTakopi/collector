@@ -34,6 +34,7 @@ use crate::{
     quality::QualityReporter,
     readiness::{Readiness, Source},
     routing::{self, BinanceMessage},
+    session::Backoff,
     symbol::{Symbol, SymbolCache},
     throttler::Throttler,
     ws::{self, Delivery, Overflow},
@@ -86,10 +87,6 @@ fn max_session_age(connection: usize) -> Duration {
     MAX_SESSION_AGE.saturating_sub(SESSION_AGE_STAGGER * connection as u32)
 }
 
-/// A session that has lived this long was healthy, so ending it is a venue
-/// decision rather than a local failure.
-const SETTLED: Duration = Duration::from_secs(30);
-
 /// The event Binance pushes before it closes a connection:
 /// `{"e":"serverShutdown","E":...}`, as JSON in a websocket text frame. The
 /// lead time is unspecified — the documented ten minutes was withdrawn on
@@ -136,7 +133,7 @@ const RETIRE_GRACE: Duration = Duration::from_secs(2);
 /// and already contains the word.
 fn is_server_shutdown(payload: &[u8]) -> bool {
     if payload.len() > SHUTDOWN_PROBE_LIMIT
-        || !ws::payload_contains(payload, SERVER_SHUTDOWN.as_bytes())
+        || !routing::contains(payload, SERVER_SHUTDOWN.as_bytes())
     {
         return false;
     }
@@ -421,10 +418,11 @@ where
     S: tokio::io::AsyncRead + Unpin,
 {
     let sender = conn.sender();
-    let mut overflow = Overflow::with_reporter(
-        format!("{}/connection-{connection}", endpoint.label),
-        quality,
-    );
+    let source = Source {
+        endpoint: endpoint.label,
+        connection,
+    };
+    let mut overflow = Overflow::new(source, quality);
     let opened = Instant::now();
     let mut liveness = None;
     let mut announced_live = false;
@@ -524,10 +522,7 @@ where
                 match deliver_frame(&ws_tx, &mut overflow, message.payload).await {
                     Delivery::Sent => {
                         if liveness.is_none() {
-                            liveness = Some(readiness.source_live(Source {
-                                endpoint: endpoint.label,
-                                connection,
-                            }));
+                            liveness = Some(readiness.source_live(source));
                         }
                         if !announced_live {
                             announced_live = true;
@@ -949,8 +944,9 @@ pub async fn keep_connection(
     // — open until the drain timed out.
     let mut lingering: JoinSet<()> = JoinSet::new();
     let mut handover = Handover::default();
-    let mut error_count = 0;
+    let mut backoff = Backoff::default();
     let max_age = max_session_age(connection);
+    let tls = ws::tls_config();
 
     // One channel for every session this slot will ever open, held here so it
     // outlives them. A per-session channel would be dropped the moment its
@@ -965,18 +961,18 @@ pub async fn keep_connection(
         while lingering.try_join_next().is_some() {}
 
         let opened = Instant::now();
-        let conn = match ws::connect(&url).await {
+        let conn = match ws::connect(&url, &tls).await {
             Ok(conn) => conn,
             Err(error) => {
                 error!(
                     endpoint = endpoint.label,
                     connection,
                     ?error,
-                    attempt = error_count + 1,
+                    attempt = backoff.failures + 1,
                     still_delivering = handover.waiting(),
                     "websocket handshake failed"
                 );
-                back_off(&mut error_count, None).await;
+                backoff.wait(None).await;
                 continue;
             }
         };
@@ -1060,7 +1056,7 @@ pub async fn keep_connection(
                 // IP's connection budget in a burst. The old session delivers
                 // until the venue actually cuts it; a cut inside the backoff is
                 // a hole only when no redundant connection is running.
-                back_off(&mut error_count, Some(lifetime)).await;
+                backoff.wait(Some(lifetime)).await;
             }
             // Clean disconnect (ws_tx dropped) — exit. Dropping `lingering`
             // stops the relieved sessions too.
@@ -1077,7 +1073,7 @@ pub async fn keep_connection(
                     session = id,
                     "the active session was retired; this should not happen"
                 );
-                back_off(&mut error_count, None).await;
+                backoff.wait(None).await;
             }
             Step::Ended(SessionEnd::Lost(error)) => {
                 let lifetime = opened.elapsed();
@@ -1092,30 +1088,9 @@ pub async fn keep_connection(
                     still_delivering = handover.waiting(),
                     "websocket error"
                 );
-                back_off(&mut error_count, Some(lifetime)).await;
+                backoff.wait(Some(lifetime)).await;
             }
         }
-    }
-}
-
-/// Pace the next connection attempt, and account for what ended the last one.
-///
-/// `lifetime` is how long the session that just ended lasted, where there was
-/// one — a failed handshake has none. A session that outlived [`SETTLED`] was
-/// healthy, so whatever ended it was the venue's doing and the count starts
-/// over. Anything shorter is a persistent failure until proven otherwise.
-async fn back_off(error_count: &mut u32, lifetime: Option<Duration>) {
-    if lifetime.is_some_and(|lifetime| lifetime > SETTLED) {
-        *error_count = 0;
-    } else {
-        *error_count += 1;
-    }
-    if *error_count > 20 {
-        tokio::time::sleep(Duration::from_secs(10)).await;
-    } else if *error_count > 10 {
-        tokio::time::sleep(Duration::from_secs(5)).await;
-    } else if *error_count > 3 {
-        tokio::time::sleep(Duration::from_secs(1)).await;
     }
 }
 
@@ -1548,7 +1523,7 @@ mod tests {
 
         let (_, first) = harness.data.recv().await.unwrap();
         assert!(
-            !ws::payload_contains(&first, b"serverShutdown"),
+            !routing::contains(&first, b"serverShutdown"),
             "the announcement must not reach the writer"
         );
     }
@@ -1597,7 +1572,13 @@ mod tests {
     async fn retiring_delivers_the_backlog_that_already_arrived() {
         let (mut conn, mut server) = ws::duplex_pair();
         let (ws_tx, data) = tokio::sync::mpsc::channel(16);
-        let mut overflow = Overflow::new("test");
+        let mut overflow = Overflow::new(
+            Source {
+                endpoint: "test",
+                connection: 0,
+            },
+            QualityReporter::disabled(),
+        );
 
         for _ in 0..3 {
             server
@@ -1628,7 +1609,13 @@ mod tests {
     async fn draining_a_caught_up_socket_returns_at_once() {
         let (mut conn, _server) = ws::duplex_pair();
         let (ws_tx, _data) = tokio::sync::mpsc::channel(16);
-        let mut overflow = Overflow::new("test");
+        let mut overflow = Overflow::new(
+            Source {
+                endpoint: "test",
+                connection: 0,
+            },
+            QualityReporter::disabled(),
+        );
 
         let before = tokio::time::Instant::now();
         let drained = drain_buffered(
