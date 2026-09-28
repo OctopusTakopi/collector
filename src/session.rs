@@ -400,8 +400,9 @@ pub(crate) async fn keep_subscribed<P, C>(
             End::Stopped(()) => Lost::WriterStopped,
             End::Lost(lost) => lost,
         };
-        // Withdraw the lease before waiting: the slot is down until reconnected.
+        // Withdraw the lease and release the socket before waiting.
         drop(producer);
+        drop(conn);
         let lifetime = opened.elapsed();
         error!(endpoint, connection, error = %lost, ?lifetime, "websocket session ended");
         backoff.wait(Some(lifetime)).await;
