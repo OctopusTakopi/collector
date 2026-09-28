@@ -24,8 +24,7 @@ const MAX_MESSAGE_BYTES: usize = 64 * 1024;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const READY_TIMEOUT: Duration = Duration::from_secs(180);
 const OVERLAP_GRACE: Duration = Duration::from_secs(2);
-/// How often the promoted challenger retries binding the socket path the
-/// incumbent is about to unlink.
+/// Retry interval while the socket path is still in use after the drain.
 const BIND_RETRY: Duration = Duration::from_millis(10);
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -477,6 +476,51 @@ mod tests {
             .unwrap()
             .unwrap()
             .unwrap();
+    }
+
+    /// Older binaries on the other end of the socket parse exactly this.
+    #[test]
+    fn the_wire_format_is_unchanged() {
+        let hello = Message::Hello {
+            protocol_version: PROTOCOL_VERSION,
+            run_id: "new".to_owned(),
+            identity: Identity {
+                exchange: "binance".to_owned(),
+                symbols: vec!["btcusdt".to_owned(), "ethusdt".to_owned()],
+                connections: 2,
+                output: "/data".to_owned(),
+            },
+        };
+        assert_eq!(
+            serde_json::to_value(&hello).unwrap(),
+            serde_json::json!({
+                "type": "hello",
+                "protocol_version": 1,
+                "run_id": "new",
+                "identity": {
+                    "exchange": "binance",
+                    "symbols": ["btcusdt", "ethusdt"],
+                    "connections": 2,
+                    "output": "/data",
+                },
+            })
+        );
+        let drained: Drained = Err("writer failed".to_owned());
+        assert_eq!(
+            serde_json::to_value(Message::Drained {
+                clean: drained.is_ok(),
+                error: drained.err(),
+            })
+            .unwrap(),
+            serde_json::json!({"type": "drained", "clean": false, "error": "writer failed"})
+        );
+        assert_eq!(
+            serde_json::to_value(Message::HelloAck {
+                run_id: "old".to_owned()
+            })
+            .unwrap(),
+            serde_json::json!({"type": "hello_ack", "run_id": "old"})
+        );
     }
 
     /// An incumbent listening in a fresh directory.
