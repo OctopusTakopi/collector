@@ -1272,51 +1272,61 @@ fn stream_notable(s: &StreamStats) -> bool {
     s.id_count > 0 || s.seq_fwd_events > 0 || s.seq_back_events > 0 || s.time_regressions > 0
 }
 
-fn print_report(report: &SeriesReport, min_gap_ns: i64, max_reported: usize, exact: bool) {
-    println!("{} ({})", report.key, report.family.label());
+fn write_report(
+    out: &mut impl fmt::Write,
+    report: &SeriesReport,
+    min_gap_ns: i64,
+    max_reported: usize,
+    exact: bool,
+) -> fmt::Result {
+    writeln!(out, "{} ({})", report.key, report.family.label())?;
     let files: Vec<String> = report
         .files
         .iter()
         .map(|file| file.path.display().to_string())
         .collect();
-    println!("  files: {}", files.join(", "));
+    writeln!(out, "  files: {}", files.join(", "))?;
     for file in &report.files {
         if file.foreign {
-            println!(
+            writeln!(
+                out,
                 "    {}: foreign format (not `<recv_ns> <json>` lines), skipped",
                 file.path.display()
-            );
+            )?;
         }
         if let Some(error) = &file.decode_error {
             if file.live {
-                println!(
+                writeln!(
+                    out,
                     "    {}: unterminated zstd stream after {} rows (file modified recently — still being written?): {error}",
                     file.path.display(),
                     grouped(file.rows)
-                );
+                )?;
             } else {
-                println!(
+                writeln!(
+                    out,
                     "    {}: decode error after {} rows: {error}",
                     file.path.display(),
                     grouped(file.rows)
-                );
+                )?;
             }
         }
     }
     if report.rows == 0 && report.files.iter().all(|f| !f.foreign) {
-        println!("  (no rows decoded)");
+        writeln!(out, "  (no rows decoded)")?;
     }
     if report.rows > 0 {
         let span = match (report.first_recv, report.last_recv) {
             (Some(a), Some(b)) => format!("{} .. {}", fmt_ts(a), fmt_ts(b)),
             _ => String::from("?"),
         };
-        println!(
+        writeln!(
+            out,
             "  rows: {} | recv span: {} | bad lines: {}",
             grouped(report.rows),
             span,
             grouped(report.bad_lines)
-        );
+        )?;
     }
     if !report.missing_dates.is_empty() {
         let dates: Vec<String> = report
@@ -1324,37 +1334,40 @@ fn print_report(report: &SeriesReport, min_gap_ns: i64, max_reported: usize, exa
             .iter()
             .map(ToString::to_string)
             .collect();
-        println!("  MISSING DATES: {}", dates.join(", "));
+        writeln!(out, "  MISSING DATES: {}", dates.join(", "))?;
     }
     if report.recv_regressions > 0 {
-        println!(
+        writeln!(
+            out,
             "  receive time regressions: {} (arrival-vs-dequeue ordering)",
             grouped(report.recv_regressions)
-        );
+        )?;
     }
 
     let threshold = fmt_dur(min_gap_ns);
     if report.gaps.is_empty() {
-        println!("  recv gaps > {threshold}: none");
+        writeln!(out, "  recv gaps > {threshold}: none")?;
     } else {
         let total: i64 = report.gaps.iter().map(|g| g.end - g.start).sum();
-        println!(
+        writeln!(
+            out,
             "  RECV GAPS > {threshold}: {} (total silence {})",
             report.gaps.len(),
             fmt_dur(total)
-        );
+        )?;
         let mut largest: Vec<&Gap> = report.gaps.iter().collect();
         largest.sort_by_key(|g| std::cmp::Reverse(g.end - g.start));
         for gap in largest.iter().take(max_reported) {
-            println!(
+            writeln!(
+                out,
                 "    {} .. {} ({})",
                 fmt_ts(gap.start),
                 fmt_ts(gap.end),
                 fmt_dur(gap.end - gap.start)
-            );
+            )?;
         }
         if report.gaps.len() > max_reported {
-            println!("    ... {} more", report.gaps.len() - max_reported);
+            writeln!(out, "    ... {} more", report.gaps.len() - max_reported)?;
         }
     }
 
@@ -1365,28 +1378,24 @@ fn print_report(report: &SeriesReport, min_gap_ns: i64, max_reported: usize, exa
         .collect();
     if !streams.is_empty() {
         streams.sort_by(|a, b| a.0.cmp(&b.0));
-        println!("  streams:");
+        writeln!(out, "  streams:")?;
         for (name, s, breaks) in streams {
             let parts = stream_issues(s, breaks, exact);
-            println!("    {name}: {} msgs", grouped(s.messages));
+            writeln!(out, "    {name}: {} msgs", grouped(s.messages))?;
             for part in parts {
-                println!("      {part}");
+                writeln!(out, "      {part}")?;
             }
         }
     }
-    println!();
+    writeln!(out)?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let min_gap_ns = (args.min_gap.max(0.0) * 1e9) as i64;
-
-    let mut series = discover(&args.paths)?;
-    if let Some(filter) = &args.filter {
-        series.retain(|s| s.key.contains(filter));
-    }
+    let series = select_series(&args)?;
     if series.is_empty() {
         println!(
             "no <symbol>_<YYYYMMDD>.zst files found under: {}",
@@ -1397,12 +1406,6 @@ fn main() -> Result<()> {
                 .join(", ")
         );
         return Ok(());
-    }
-    if let Some(override_name) = &args.exchange {
-        let family = Family::from_override(override_name);
-        for s in &mut series {
-            s.family = family;
-        }
     }
 
     let cpus = std::thread::available_parallelism()
@@ -1421,7 +1424,39 @@ fn main() -> Result<()> {
         args.min_gap,
         if args.exact { ", exact id sets" } else { "" }
     );
+    let reports = scan_all(&series, &args, jobs);
 
+    let mut out = String::new();
+    let with_issues =
+        write_output(&mut out, &reports, &args).expect("formatting into a String cannot fail");
+    print!("{out}");
+    if args.fail_on_gaps && with_issues > 0 {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn min_gap_ns(args: &Args) -> i64 {
+    (args.min_gap.max(0.0) * 1e9) as i64
+}
+
+fn select_series(args: &Args) -> Result<Vec<Series>> {
+    let mut series = discover(&args.paths)?;
+    if let Some(filter) = &args.filter {
+        series.retain(|s| s.key.contains(filter));
+    }
+    if let Some(override_name) = &args.exchange {
+        let family = Family::from_override(override_name);
+        for s in &mut series {
+            s.family = family;
+        }
+    }
+    Ok(series)
+}
+
+/// Scan every series on `jobs` threads; reports come back sorted by key.
+fn scan_all(series: &[Series], args: &Args, jobs: usize) -> Vec<SeriesReport> {
+    let min_gap_ns = min_gap_ns(args);
     let next = AtomicUsize::new(0);
     let done = AtomicUsize::new(0);
     let results: Mutex<Vec<SeriesReport>> = Mutex::new(Vec::with_capacity(series.len()));
@@ -1451,12 +1486,21 @@ fn main() -> Result<()> {
 
     let mut reports = results.into_inner().expect("results mutex");
     reports.sort_by(|a, b| a.key.cmp(&b.key));
+    reports
+}
 
-    println!();
-    for report in &reports {
-        print_report(report, min_gap_ns, args.max_reported, args.exact);
+/// Everything printed to stdout after the scan; returns the number of series
+/// with issues.
+fn write_output(
+    out: &mut impl fmt::Write,
+    reports: &[SeriesReport],
+    args: &Args,
+) -> Result<usize, fmt::Error> {
+    let min_gap_ns = min_gap_ns(args);
+    writeln!(out)?;
+    for report in reports {
+        write_report(out, report, min_gap_ns, args.max_reported, args.exact)?;
     }
-
     let foreign_files: usize = reports
         .iter()
         .flat_map(|r| &r.files)
@@ -1509,41 +1553,45 @@ fn main() -> Result<()> {
     let rows: u64 = reports.iter().map(|r| r.rows).sum();
     let with_issues = reports.iter().filter(|r| r.has_issues()).count();
 
-    println!("SUMMARY");
-    println!("  series scanned        : {}", reports.len());
-    println!("  rows decoded          : {}", grouped(rows));
-    println!(
+    writeln!(out, "SUMMARY")?;
+    writeln!(out, "  series scanned        : {}", reports.len())?;
+    writeln!(out, "  rows decoded          : {}", grouped(rows))?;
+    writeln!(
+        out,
         "  recv gaps > {}s  : {} across {} series (total silence {})",
         args.min_gap,
         recv_gaps,
         gap_series,
         fmt_dur(silence_total)
-    );
-    println!(
+    )?;
+    writeln!(
+        out,
         "  forward chain breaks  : {} event(s), {} ids",
         grouped(fwd_events),
         grouped(fwd_ids)
-    );
+    )?;
     if args.exact {
-        println!("  exact missing ids     : {}", grouped(exact_missing));
+        writeln!(out, "  exact missing ids     : {}", grouped(exact_missing))?;
     } else {
-        println!(
+        writeln!(
+            out,
             "  net missing ids       : {} (range accounting)",
             grouped(net_positive as u64)
-        );
+        )?;
     }
-    println!("  dup/reordered events  : {}", grouped(back_events));
-    println!("  time regressions      : {}", grouped(time_regressions));
-    println!("  missing dates         : {missing_dates}");
-    println!("  decode errors         : {decode_errors}");
-    println!("  bad lines             : {}", grouped(bad_lines));
-    println!("  foreign files         : {foreign_files} (skipped)");
+    writeln!(out, "  dup/reordered events  : {}", grouped(back_events))?;
+    writeln!(
+        out,
+        "  time regressions      : {}",
+        grouped(time_regressions)
+    )?;
+    writeln!(out, "  missing dates         : {missing_dates}")?;
+    writeln!(out, "  decode errors         : {decode_errors}")?;
+    writeln!(out, "  bad lines             : {}", grouped(bad_lines))?;
+    writeln!(out, "  foreign files         : {foreign_files} (skipped)")?;
 
-    println!("RESULT: issues found in {with_issues} series");
-    if args.fail_on_gaps && with_issues > 0 {
-        std::process::exit(1);
-    }
-    Ok(())
+    writeln!(out, "RESULT: issues found in {with_issues} series")?;
+    Ok(with_issues)
 }
 
 #[cfg(test)]
@@ -1830,15 +1878,7 @@ mod tests {
     fn legacy_file_streams_in_recorded_order_and_retains_its_path() {
         use std::io::Write;
 
-        let dir = std::env::temp_dir().join(format!(
-            "collector-gap-detector-test-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir_all(&dir).unwrap();
+        let dir = test_dir("legacy");
         let path = dir.join("btcusdt_20260820.zst");
         {
             let file = File::create(&path).unwrap();
@@ -1863,6 +1903,270 @@ mod tests {
         assert_eq!(report.files[0].path, path);
 
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn test_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "collector-gap-{tag}-test-{}-{}",
+            std::process::id(),
+            Timestamp::now().as_nanosecond()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_zst(path: &Path, bytes: &[u8]) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, zstd::encode_all(bytes, 1).unwrap()).unwrap();
+    }
+
+    /// A small recording that exercises every part of the report.
+    fn golden_fixture(dir: &Path) {
+        const DAY_ONE: i64 = 1_787_184_000_000_000_000; // 2026-08-20 00:00 UTC
+        const DAY_THREE: i64 = DAY_ONE + 2 * 86_400 * S;
+        const S: i64 = 1_000_000_000;
+        let lines = |records: &[(i64, String)]| -> Vec<u8> {
+            records
+                .iter()
+                .map(|(recv, json)| format!("{recv} {json}\n"))
+                .collect::<String>()
+                .into_bytes()
+        };
+        let trade = |t: u64, e: u64| {
+            format!(r#"{{"stream":"btcusdt@trade","data":{{"e":"trade","E":{e},"t":{t}}}}}"#)
+        };
+        let depth = |first: u64, last: u64| {
+            format!(
+                r#"{{"stream":"btcusdt@depth@100ms","data":{{"e":"depthUpdate","U":{first},"u":{last},"b":[["1","2"]],"a":[["3","4"]]}}}}"#
+            )
+        };
+        let agg = |a: u64| format!(r#"{{"stream":"btcusdt@aggTrade","data":{{"a":{a}}}}}"#);
+        let spot = dir.join("binance/spot");
+        let mut day_one = lines(&[
+            (DAY_ONE + S, trade(10, 100)),
+            (DAY_ONE + 2 * S, trade(11, 101)),
+            (DAY_ONE + 3 * S, trade(13, 102)),
+            (DAY_ONE + 2 * S + 500, trade(12, 99)),
+            (DAY_ONE + 20 * S, trade(14, 103)),
+            (DAY_ONE + 21 * S, depth(90, 100)),
+            (DAY_ONE + 22 * S, depth(101, 110)),
+            (DAY_ONE + 23 * S, depth(121, 130)),
+            (DAY_ONE + 24 * S, depth(118, 130)),
+            (DAY_ONE + 25 * S, agg(5)),
+            (DAY_ONE + 26 * S, agg(9)),
+            (
+                DAY_ONE + 27 * S,
+                r#"{"stream":"btcusdt@trade","data":{bad}}"#.to_owned(),
+            ),
+        ]);
+        day_one.extend_from_slice(b"garbage line\n");
+        write_zst(&spot.join("btcusdt_20260820.zst"), &day_one);
+        let day_three: Vec<_> = (0..4)
+            .map(|i| (DAY_THREE + i as i64 * S, trade(2_000_000 + i, 200 + i)))
+            .collect();
+        write_zst(&spot.join("btcusdt_20260822.zst"), &lines(&day_three));
+        // Another run's sidecar: two copies stamped with a different `E`.
+        write_zst(
+            &spot.join("btcusdt_20260822_run-b.zst"),
+            &lines(&[
+                (DAY_THREE + S + 300, trade(2_000_001, 900)),
+                (DAY_THREE + 2 * S + 300, trade(2_000_002, 901)),
+                (DAY_THREE + 4 * S, trade(2_000_004, 204)),
+            ]),
+        );
+
+        let futures_depth = |pu: u64, first: u64, last: u64, e: u64| {
+            format!(
+                r#"{{"stream":"ethusdt@depth@0ms","data":{{"e":"depthUpdate","E":{e},"pu":{pu},"U":{first},"u":{last}}}}}"#
+            )
+        };
+        write_zst(
+            &dir.join("binance/futures/um/ethusdt_20260820.zst"),
+            &lines(&[
+                (DAY_ONE + S, futures_depth(100, 150, 160, 1)),
+                (DAY_ONE + 2 * S, futures_depth(160, 400, 410, 2)),
+                (DAY_ONE + 3 * S, futures_depth(430, 500, 520, 3)),
+                (DAY_ONE + 4 * S, futures_depth(500, 510, 515, 2)),
+            ]),
+        );
+
+        let book = |kind: &str, u: u64| {
+            format!(
+                r#"{{"topic":"orderbook.50.BTCUSDT","type":"{kind}","ts":{u},"data":{{"u":{u},"seq":{u}}}}}"#
+            )
+        };
+        write_zst(
+            &dir.join("bybit/btcusdt_20260820.zst"),
+            &lines(&[
+                (DAY_ONE + S, book("delta", 100)),
+                (DAY_ONE + 2 * S, book("snapshot", 50)),
+                (DAY_ONE + 3 * S, book("delta", 90)),
+                (DAY_ONE + 4 * S, book("delta", 110)),
+                (
+                    DAY_ONE + 5 * S,
+                    r#"{"topic":"publicTrade.BTCUSDT","data":[{"T":5},{"T":9}]}"#.to_owned(),
+                ),
+                (
+                    DAY_ONE + 6 * S,
+                    r#"{"topic":"publicTrade.BTCUSDT","data":[{"T":7}]}"#.to_owned(),
+                ),
+                (
+                    DAY_ONE + 7 * S,
+                    r#"{"success":true,"op":"subscribe"}"#.to_owned(),
+                ),
+            ]),
+        );
+
+        write_zst(
+            &dir.join("hyperliquid/btc_20260820.zst"),
+            &lines(&[
+                (
+                    DAY_ONE + S,
+                    r#"{"channel":"trades","data":[{"time":50},{"time":70}]}"#.to_owned(),
+                ),
+                (
+                    DAY_ONE + 2 * S,
+                    r#"{"channel":"trades","data":[{"time":60}]}"#.to_owned(),
+                ),
+                (
+                    DAY_ONE + 3 * S,
+                    r#"{"channel":"l2Book","data":{"coin":"BTC","time":80,"levels":[[],[]]}}"#
+                        .to_owned(),
+                ),
+            ]),
+        );
+
+        let generic = dir.join("generic");
+        write_zst(
+            &generic.join("foreign_20260820.zst"),
+            &(0..=255u8).cycle().take(2048).collect::<Vec<_>>(),
+        );
+        let gappy: Vec<_> = (0..4)
+            .map(|i| (DAY_ONE + i * 90 * S, "{}".to_owned()))
+            .collect();
+        write_zst(&generic.join("gappy_20260820.zst"), &lines(&gappy));
+        let whole = zstd::encode_all(&lines(&gappy)[..], 1).unwrap();
+        let truncated = &whole[..whole.len() - 3];
+        fs::write(generic.join("live_20260820.zst"), truncated).unwrap();
+        let broken = generic.join("broken_20260820.zst");
+        fs::write(&broken, truncated).unwrap();
+        File::options()
+            .write(true)
+            .open(&broken)
+            .unwrap()
+            .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(1_767_225_600))
+            .unwrap();
+    }
+
+    /// stdout for `golden_fixture` with `--max-reported 2`, as printed by the
+    /// gap detector before its report code was restructured.
+    const GOLDEN: &str = r#"
+<dir>/binance/futures/um/ethusdt (binance-futures)
+  files: <dir>/binance/futures/um/ethusdt_20260820.zst
+  rows: 4 | recv span: 2026-08-20 00:00:01.000Z .. 2026-08-20 00:00:04.000Z | bad lines: 0
+  recv gaps > 5.000s: none
+  streams:
+    ethusdt@depth@0ms: 4 msgs
+      1 forward chain break(s), 20 ids
+      breaks at: 2026-08-20 00:00:03.000Z
+      1 duplicate/reordered event(s)
+      1 time regression(s)
+
+<dir>/binance/spot/btcusdt (binance-spot)
+  files: <dir>/binance/spot/btcusdt_20260820.zst, <dir>/binance/spot/btcusdt_20260822.zst, <dir>/binance/spot/btcusdt_20260822_run-b.zst
+  rows: 17 | recv span: 2026-08-20 00:00:01.000Z .. 2026-08-22 00:00:04.000Z | bad lines: 2
+  MISSING DATES: 2026-08-21
+  receive time regressions: 1 (arrival-vs-dequeue ordering)
+  RECV GAPS > 5.000s: 2 (total silence 47h59m50s)
+    2026-08-20 00:00:27.000Z .. 2026-08-22 00:00:00.000Z (47h59m33s)
+    2026-08-20 00:00:02.000Z .. 2026-08-20 00:00:20.000Z (18.000s)
+  streams:
+    btcusdt@aggTrade: 2 msgs
+      ids 5..9: net 3 missing (2 observed)
+      1 forward chain break(s), 3 ids
+      breaks at: 2026-08-20 00:00:26.000Z
+    btcusdt@depth@100ms: 4 msgs
+      1 forward chain break(s), 10 ids
+      breaks at: 2026-08-20 00:00:23.000Z
+      1 duplicate/reordered event(s)
+    btcusdt@trade: 10 msgs
+      ids 10..2,000,004: net 1,999,985 missing (10 observed)
+      2 forward chain break(s), 1,999,986 ids
+      breaks at: 2026-08-20 00:00:03.000Z, 2026-08-22 00:00:00.000Z
+      1 duplicate/reordered event(s)
+      1 time regression(s)
+
+<dir>/bybit/btcusdt (bybit)
+  files: <dir>/bybit/btcusdt_20260820.zst
+  rows: 7 | recv span: 2026-08-20 00:00:01.000Z .. 2026-08-20 00:00:07.000Z | bad lines: 0
+  recv gaps > 5.000s: none
+  streams:
+    orderbook.50.BTCUSDT: 4 msgs
+      2 duplicate/reordered event(s)
+      1 time regression(s)
+    publicTrade.BTCUSDT: 2 msgs
+      1 time regression(s)
+
+<dir>/generic/broken (generic)
+  files: <dir>/generic/broken_20260820.zst
+    <dir>/generic/broken_20260820.zst: decode error after 0 rows: incomplete frame
+  (no rows decoded)
+  recv gaps > 5.000s: none
+
+<dir>/generic/foreign (generic)
+  files: <dir>/generic/foreign_20260820.zst
+    <dir>/generic/foreign_20260820.zst: foreign format (not `<recv_ns> <json>` lines), skipped
+  recv gaps > 5.000s: none
+
+<dir>/generic/gappy (generic)
+  files: <dir>/generic/gappy_20260820.zst
+  rows: 4 | recv span: 2026-08-20 00:00:00.000Z .. 2026-08-20 00:04:30.000Z | bad lines: 0
+  RECV GAPS > 5.000s: 3 (total silence 4m30s)
+    2026-08-20 00:00:00.000Z .. 2026-08-20 00:01:30.000Z (1m30s)
+    2026-08-20 00:01:30.000Z .. 2026-08-20 00:03:00.000Z (1m30s)
+    ... 1 more
+
+<dir>/generic/live (generic)
+  files: <dir>/generic/live_20260820.zst
+    <dir>/generic/live_20260820.zst: unterminated zstd stream after 0 rows (file modified recently — still being written?): incomplete frame
+  (no rows decoded)
+  recv gaps > 5.000s: none
+
+<dir>/hyperliquid/btc (hyperliquid)
+  files: <dir>/hyperliquid/btc_20260820.zst
+  rows: 3 | recv span: 2026-08-20 00:00:01.000Z .. 2026-08-20 00:00:03.000Z | bad lines: 0
+  recv gaps > 5.000s: none
+  streams:
+    trades: 2 msgs
+      1 time regression(s)
+
+SUMMARY
+  series scanned        : 8
+  rows decoded          : 35
+  recv gaps > 5s  : 5 across 2 series (total silence 48h04m20s)
+  forward chain breaks  : 5 event(s), 2,000,019 ids
+  net missing ids       : 1,999,988 (range accounting)
+  dup/reordered events  : 5
+  time regressions      : 5
+  missing dates         : 1
+  decode errors         : 2
+  bad lines             : 2
+  foreign files         : 1 (skipped)
+RESULT: issues found in 5 series
+"#;
+
+    #[test]
+    fn report_text_is_pinned() {
+        let dir = test_dir("golden");
+        golden_fixture(&dir);
+        let root = dir.to_str().unwrap();
+        let args = Args::try_parse_from(["gap_detector", root, "--max-reported", "2"]).unwrap();
+        let reports = scan_all(&select_series(&args).unwrap(), &args, 2);
+        let mut out = String::new();
+        let with_issues = write_output(&mut out, &reports, &args).unwrap();
+        assert_eq!(with_issues, 5);
+        assert_eq!(out.replace(root, "<dir>"), GOLDEN);
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
