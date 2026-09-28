@@ -652,7 +652,7 @@ async fn handle(
     // Spot's bookTicker frames carry no `e`, so absence just means "not a depth
     // update" rather than a malformed frame.
     if is_depth_update {
-        let u = u.ok_or(ConnectorError::FormatError)?;
+        let u = u.ok_or(ConnectorError::MissingField("u"))?;
         match prev_u_map.get_mut(symbol.as_ref()) {
             Some(prev_u) => {
                 // A book that restarts its update ids (relist, maintenance)
@@ -685,11 +685,11 @@ async fn handle(
                 // update, for as long as the connections stay skewed.
                 let gap = match endpoint.depth_continuity {
                     DepthContinuity::FirstUpdateId => {
-                        first_update_id.ok_or(ConnectorError::FormatError)?
+                        first_update_id.ok_or(ConnectorError::MissingField("U"))?
                             > prev_u.saturating_add(1)
                     }
                     DepthContinuity::PrevUpdateId => {
-                        pu.ok_or(ConnectorError::FormatError)? > *prev_u
+                        pu.ok_or(ConnectorError::MissingField("pu"))? > *prev_u
                     }
                 };
                 if gap {

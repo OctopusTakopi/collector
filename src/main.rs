@@ -3,13 +3,15 @@ use std::time::Duration;
 use anyhow::anyhow;
 use clap::Parser;
 use tokio::{
-    self, select, signal,
+    select, signal,
     sync::{mpsc::channel, oneshot, watch},
+    task::{JoinError, JoinHandle},
+    time::timeout,
 };
 use tracing::{error, info};
 
 use collector::file::{self, Writer};
-use collector::quality::{self, QualityEvent};
+use collector::quality::{self, HandoverState, QualityEvent};
 use collector::{
     binance, binancefuturescm, binancefuturesum, bybit, handover, hyperliquid, readiness,
 };
@@ -18,6 +20,8 @@ const WRITER_QUEUE_CAPACITY: usize = 65_536;
 /// How long the collection task is given to hand its already-received messages
 /// to the writer before it is aborted outright.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long the drained incumbent waits for its last handover reply to go out.
+const HANDOVER_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Hoisted out of the exchange match because readiness, created first, needs to
 /// know how many endpoint workers these streams split into.
 const USDM_STREAMS: &[&str] = &[
@@ -113,8 +117,12 @@ async fn main() -> Result<(), anyhow::Error> {
         jiff::Timestamp::now().as_nanosecond(),
         std::process::id()
     );
-    let (quality, quality_thread, mut quality_done_rx, quality_path) =
-        quality::start(std::path::Path::new(&args.path), &run_id)?;
+    let quality::QualityLog {
+        reporter: quality,
+        thread: quality_thread,
+        stopped: mut quality_stopped,
+        path: quality_path,
+    } = quality::start(std::path::Path::new(&args.path), &run_id)?;
     info!(run_id, path = %quality_path.display(), "quality log started");
     let handover_path = args
         .handover_socket
@@ -301,7 +309,7 @@ async fn main() -> Result<(), anyhow::Error> {
             error!("writer stopped; shutting down collection");
             Shutdown::Writer
         }
-        _ = &mut quality_done_rx => {
+        _ = &mut quality_stopped => {
             error!("quality log stopped; shutting down collection");
             Shutdown::Quality
         }
@@ -317,72 +325,23 @@ async fn main() -> Result<(), anyhow::Error> {
             };
             Shutdown::HandoverFailed(error)
         }
-        result = &mut handle => {
-            Shutdown::Collection(match result {
-                Ok(result) => result,
-                Err(error) => Err(anyhow!("collection task failed: {error}")),
-            })
-        }
+        result = &mut handle => Shutdown::Collection(joined(result)),
     };
 
-    let (mut collection_result, takeover_request, handover_error) = match shutdown {
-        Shutdown::Signal | Shutdown::Writer | Shutdown::Quality => {
-            // Ask the collection task to stop reading and flush what it already
-            // has, rather than aborting it with a full queue.
-            shutdown_tx.send_replace(true);
-            let result = match tokio::time::timeout(DRAIN_TIMEOUT, &mut handle).await {
-                Ok(Ok(result)) => result,
-                Ok(Err(error)) => Err(anyhow!("collection task failed: {error}")),
-                Err(_) => {
-                    handle.abort();
-                    let _ = handle.await;
-                    // Whatever was still queued is gone. Exiting 0 here would
-                    // make an incomplete dump look like a clean shutdown.
-                    Err(anyhow!(
-                        "collection task did not finish draining within {DRAIN_TIMEOUT:?}; \
-                         queued records were discarded"
-                    ))
-                }
-            };
-            (result, None, None)
-        }
-        Shutdown::Takeover(request) => {
-            shutdown_tx.send_replace(true);
-            let result = match tokio::time::timeout(DRAIN_TIMEOUT, &mut handle).await {
-                Ok(Ok(result)) => result,
-                Ok(Err(error)) => Err(anyhow!("collection task failed: {error}")),
-                Err(_) => {
-                    handle.abort();
-                    let _ = handle.await;
-                    Err(anyhow!(
-                        "collection task did not finish draining within {DRAIN_TIMEOUT:?}; \
-                         queued records were discarded"
-                    ))
-                }
-            };
-            (result, Some(request), None)
-        }
+    let (collection_result, takeover_request) = match shutdown {
+        Shutdown::Collection(result) => (result, None),
+        Shutdown::Takeover(request) => (drain(&shutdown_tx, &mut handle).await, Some(request)),
         Shutdown::HandoverFailed(error) => {
-            shutdown_tx.send_replace(true);
-            let result = match tokio::time::timeout(DRAIN_TIMEOUT, &mut handle).await {
-                Ok(Ok(result)) => result,
-                Ok(Err(error)) => Err(anyhow!("collection task failed: {error}")),
-                Err(_) => {
-                    handle.abort();
-                    let _ = handle.await;
-                    Err(anyhow!("collection drain timed out after handover failure"))
-                }
-            };
-            (result, None, Some(error))
+            let drained = drain(&shutdown_tx, &mut handle).await;
+            (
+                first_error([("collection", drained), ("handover", Err(error))]),
+                None,
+            )
         }
-        Shutdown::Collection(result) => (result, None, None),
+        Shutdown::Signal | Shutdown::Writer | Shutdown::Quality => {
+            (drain(&shutdown_tx, &mut handle).await, None)
+        }
     };
-
-    if collection_result.is_ok()
-        && let Some(error) = handover_error
-    {
-        collection_result = Err(error);
-    }
 
     let writer_result = match writer_thread.join() {
         Ok(result) => result,
@@ -404,26 +363,17 @@ async fn main() -> Result<(), anyhow::Error> {
         });
     }
     if let Some(request) = takeover_request {
-        let error = collection_result
-            .as_ref()
-            .err()
-            .or_else(|| writer_result.as_ref().err())
-            .map(ToString::to_string);
+        let drained = match (&collection_result, &writer_result) {
+            (Err(error), _) | (_, Err(error)) => Err(error.to_string()),
+            (Ok(()), Ok(())) => Ok(()),
+        };
         quality.report(QualityEvent::Handover {
             at_ns: QualityEvent::now_ns(),
-            state: if error.is_none() {
-                "incumbent_drained"
-            } else {
-                "incumbent_drained_degraded"
-            }
-            .to_owned(),
-            peer_run_id: Some(request.peer_run_id.clone()),
+            state: HandoverState::drained(drained.is_ok()),
+            peer_run_id: request.peer_run_id.clone(),
         });
-        request.complete(handover::DrainReport {
-            clean: error.is_none(),
-            error,
-        });
-        if tokio::time::timeout(std::time::Duration::from_secs(5), &mut handover_handle)
+        request.complete(drained);
+        if timeout(HANDOVER_REPLY_TIMEOUT, &mut handover_handle)
             .await
             .is_err()
         {
@@ -441,46 +391,66 @@ async fn main() -> Result<(), anyhow::Error> {
     };
 
     // The collection error is the root cause; a writer close failure is usually
-    // a symptom of the same underlying problem, so it must not mask it.
-    let result = match (collection_result, writer_result) {
-        (Err(collection), Err(writer)) => {
-            error!(%writer, "the writer also failed while shutting down");
-            Err(collection)
+    // a symptom of the same problem, so it must not mask it.
+    first_error([
+        ("collection", collection_result),
+        ("writer", writer_result),
+        ("quality log", quality_result),
+    ])
+}
+
+/// Asks the collection to stop reading and waits for it to hand what it
+/// already received to the writer, aborting it after [`DRAIN_TIMEOUT`].
+async fn drain(
+    shutdown_tx: &watch::Sender<bool>,
+    handle: &mut JoinHandle<anyhow::Result<()>>,
+) -> anyhow::Result<()> {
+    shutdown_tx.send_replace(true);
+    match timeout(DRAIN_TIMEOUT, &mut *handle).await {
+        Ok(result) => joined(result),
+        Err(_) => {
+            handle.abort();
+            let _ = handle.await;
+            // Exiting 0 here would make an incomplete dump look clean.
+            Err(anyhow!(
+                "collection task did not finish draining within {DRAIN_TIMEOUT:?}; \
+                 queued records were discarded"
+            ))
         }
-        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
-        (Ok(()), Ok(())) => Ok(()),
-    };
-    match (result, quality_result) {
-        (Err(error), Err(quality_error)) => {
-            error!(%quality_error, "the quality log also failed while shutting down");
-            Err(error)
-        }
-        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
-        (Ok(()), Ok(())) => Ok(()),
     }
 }
 
-async fn shutdown_signal() -> std::io::Result<&'static str> {
-    #[cfg(unix)]
-    {
-        let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())?;
-        // `tmux kill-session` (run_collector.sh cold restart) delivers SIGHUP;
-        // without a handler it kills the process before buffered records are
-        // written, leaving every open daily file without its zstd footer.
-        let mut sighup = signal::unix::signal(signal::unix::SignalKind::hangup())?;
-        select! {
-            result = signal::ctrl_c() => {
-                result?;
-                Ok("SIGINT")
-            }
-            _ = sigterm.recv() => Ok("SIGTERM"),
-            _ = sighup.recv() => Ok("SIGHUP"),
+fn joined(result: Result<anyhow::Result<()>, JoinError>) -> anyhow::Result<()> {
+    result.unwrap_or_else(|error| Err(anyhow!("collection task failed: {error}")))
+}
+
+/// The first failure, in the order given; later ones are logged.
+fn first_error<const N: usize>(
+    results: [(&'static str, anyhow::Result<()>); N],
+) -> anyhow::Result<()> {
+    let mut first = Ok(());
+    for (what, result) in results {
+        match (&first, result) {
+            (_, Ok(())) => {}
+            (Ok(()), Err(error)) => first = Err(error),
+            (Err(_), Err(error)) => error!(%error, "the {what} also failed while shutting down"),
         }
     }
+    first
+}
 
-    #[cfg(not(unix))]
-    {
-        signal::ctrl_c().await?;
-        Ok("SIGINT")
+async fn shutdown_signal() -> std::io::Result<&'static str> {
+    let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())?;
+    // `tmux kill-session` (run_collector.sh cold restart) delivers SIGHUP;
+    // without a handler it kills the process before buffered records are
+    // written, leaving every open daily file without its zstd footer.
+    let mut sighup = signal::unix::signal(signal::unix::SignalKind::hangup())?;
+    select! {
+        result = signal::ctrl_c() => {
+            result?;
+            Ok("SIGINT")
+        }
+        _ = sigterm.recv() => Ok("SIGTERM"),
+        _ = sighup.recv() => Ok("SIGHUP"),
     }
 }

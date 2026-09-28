@@ -43,9 +43,31 @@ pub enum QualityEvent {
     },
     Handover {
         at_ns: i64,
-        state: String,
-        peer_run_id: Option<String>,
+        state: HandoverState,
+        peer_run_id: String,
     },
+}
+
+/// A step of the rolling handover, as recorded in the quality log.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HandoverState {
+    ChallengerReady,
+    TakeoverRequested,
+    IncumbentDrained,
+    IncumbentDrainedDegraded,
+    IncumbentLostAfterReadyPromoted,
+}
+
+impl HandoverState {
+    /// How the incumbent's drain went, as the challenger is told it.
+    pub fn drained(clean: bool) -> Self {
+        if clean {
+            Self::IncumbentDrained
+        } else {
+            Self::IncumbentDrainedDegraded
+        }
+    }
 }
 
 impl QualityEvent {
@@ -59,12 +81,15 @@ pub struct QualityReporter {
     tx: Option<Sender<QualityEvent>>,
 }
 
-pub type QualityLog = (
-    QualityReporter,
-    JoinHandle<io::Result<()>>,
-    oneshot::Receiver<()>,
-    PathBuf,
-);
+/// A running quality log.
+pub struct QualityLog {
+    pub reporter: QualityReporter,
+    /// The writer thread; joins once every reporter is dropped.
+    pub thread: JoinHandle<io::Result<()>>,
+    /// Fires when the writer thread stops, for whatever reason.
+    pub stopped: oneshot::Receiver<()>,
+    pub path: PathBuf,
+}
 
 impl QualityReporter {
     pub fn report(&self, event: QualityEvent) {
@@ -94,7 +119,7 @@ pub fn start(directory: &Path, run_id: &str) -> io::Result<QualityLog> {
     File::open(directory)?.sync_all()?;
     let (tx, rx) = mpsc::channel::<QualityEvent>();
     let (done_tx, done_rx) = oneshot::channel();
-    let handle = std::thread::Builder::new()
+    let thread = std::thread::Builder::new()
         .name("quality-writer".to_owned())
         .spawn(move || {
             let result = (|| {
@@ -110,7 +135,12 @@ pub fn start(directory: &Path, run_id: &str) -> io::Result<QualityLog> {
             let _ = done_tx.send(());
             result
         })?;
-    Ok((QualityReporter { tx: Some(tx) }, handle, done_rx, path))
+    Ok(QualityLog {
+        reporter: QualityReporter { tx: Some(tx) },
+        thread,
+        stopped: done_rx,
+        path,
+    })
 }
 
 #[cfg(test)]
@@ -125,20 +155,55 @@ mod tests {
             QualityEvent::now_ns()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let (reporter, handle, _done, path) = start(&dir, "test-run").unwrap();
-        reporter.report(QualityEvent::MarketDataDropped {
+        let log = start(&dir, "test-run").unwrap();
+        log.reporter.report(QualityEvent::MarketDataDropped {
             at_ns: 42,
             source: "test".to_owned(),
             dropped_total: 3,
             dropped_since_last_report: 3,
         });
-        drop(reporter);
-        handle.join().unwrap().unwrap();
+        drop(log.reporter);
+        log.thread.join().unwrap().unwrap();
 
-        let line = std::fs::read_to_string(path).unwrap();
+        let line = std::fs::read_to_string(log.path).unwrap();
         let value: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
         assert_eq!(value["kind"], "market_data_dropped");
         assert_eq!(value["dropped_total"], 3);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The handover states are read by operators and scripts; their spelling
+    /// is part of the log format.
+    #[test]
+    fn handover_states_keep_their_log_spelling() {
+        for (state, spelled) in [
+            (HandoverState::ChallengerReady, "challenger_ready"),
+            (HandoverState::TakeoverRequested, "takeover_requested"),
+            (HandoverState::IncumbentDrained, "incumbent_drained"),
+            (
+                HandoverState::IncumbentDrainedDegraded,
+                "incumbent_drained_degraded",
+            ),
+            (
+                HandoverState::IncumbentLostAfterReadyPromoted,
+                "incumbent_lost_after_ready_promoted",
+            ),
+        ] {
+            let event = serde_json::to_value(QualityEvent::Handover {
+                at_ns: 1,
+                state,
+                peer_run_id: "peer".to_owned(),
+            })
+            .unwrap();
+            assert_eq!(
+                event,
+                serde_json::json!({
+                    "kind": "handover",
+                    "at_ns": 1,
+                    "state": spelled,
+                    "peer_run_id": "peer",
+                })
+            );
+        }
     }
 }

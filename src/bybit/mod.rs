@@ -76,19 +76,14 @@ async fn handle(
                         payload = %String::from_utf8_lossy(&data),
                         "subscribe acknowledgement without a success flag"
                     );
-                    return Err(ConnectorError::FormatError);
+                    return Err(ConnectorError::MissingField("success"));
                 }
             }
         }
         return Ok(());
     }
     if let Some(topic) = message.topic {
-        let symbol_raw = topic
-            .split('.')
-            .next_back()
-            .ok_or(ConnectorError::FormatError)?;
-
-        let symbol = symbols.resolve(symbol_raw);
+        let symbol = symbols.resolve(topic.rsplit_once('.').map_or(topic, |(_, symbol)| symbol));
 
         writer_tx
             .send(WriteRecord {
