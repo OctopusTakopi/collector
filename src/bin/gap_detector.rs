@@ -59,6 +59,7 @@ const LIVE_FILE_WINDOW: Duration = Duration::from_secs(15 * 60);
 /// Keep at most this many break timestamps per stream.
 const MAX_BREAK_TIMES: usize = 16;
 
+/// Overlapping runs record their copies of one event at most this far apart.
 const OVERLAP_DEDUP_WINDOW_NS: i64 = 5_000_000_000;
 
 #[derive(Parser)]
@@ -303,10 +304,6 @@ fn logical_run_id(run_id: &str) -> &str {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Payload parsing
-// ---------------------------------------------------------------------------
-
 /// A field that is a numeric id on some streams (aggTrade `a`) and a big
 /// nested array on others (depth asks). Deserialises numbers and skips
 /// everything else without materialising it.
@@ -423,10 +420,6 @@ struct HyperliquidObject {
 struct HyperliquidTradeItem {
     time: Option<i64>,
 }
-
-// ---------------------------------------------------------------------------
-// Scanning
-// ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, Default)]
 struct StreamStats {
@@ -548,12 +541,6 @@ struct Gap {
     end: i64,
 }
 
-#[cfg(test)]
-enum LineOutcome {
-    Ok,
-    Bad,
-}
-
 #[derive(Default)]
 struct SeriesScan {
     exact: bool,
@@ -599,15 +586,6 @@ impl SeriesScan {
         }
         self.prev_recv = Some(recv);
         self.last_recv = Some(recv);
-    }
-
-    #[cfg(test)]
-    fn process_line(&mut self, family: Family, line: &[u8], min_gap_ns: i64) -> LineOutcome {
-        let Some((recv, payload)) = parse_record_line(line) else {
-            return LineOutcome::Bad;
-        };
-        self.process_payload(family, recv, payload, min_gap_ns);
-        LineOutcome::Ok
     }
 
     fn process_payload(&mut self, family: Family, recv: i64, payload: &[u8], min_gap_ns: i64) {
@@ -813,10 +791,6 @@ fn parse_record_line(line: &[u8]) -> Option<(i64, &[u8])> {
     (payload.first() == Some(&b'{')).then_some((recv, payload))
 }
 
-// ---------------------------------------------------------------------------
-// Reports
-// ---------------------------------------------------------------------------
-
 struct FileReport {
     path: PathBuf,
     rows: u64,
@@ -942,20 +916,14 @@ where
     FileRead { report, bad_lines }
 }
 
-fn process_lines(
+/// Merge the records of overlapping runs by receive time, dropping each copy
+/// another run recorded within the window while both runs were recording.
+fn merge_overlapping_runs(
     scan: &mut SeriesScan,
     family: Family,
     mut records: Vec<RawLine>,
     min_gap_ns: i64,
-    overlapping_runs: bool,
 ) {
-    if !overlapping_runs {
-        for record in records {
-            scan.process_payload(family, record.recv, &record.payload, min_gap_ns);
-        }
-        return;
-    }
-
     let mut source_ranges: HashMap<usize, (i64, i64)> = HashMap::new();
     for record in &records {
         source_ranges
@@ -1063,7 +1031,7 @@ fn scan_series(series: &Series, min_gap_ns: i64, exact: bool) -> SeriesReport {
                 scan.bad_lines += read.bad_lines;
                 files.push(read.report);
             }
-            process_lines(&mut scan, series.family, records, min_gap_ns, true);
+            merge_overlapping_runs(&mut scan, series.family, records, min_gap_ns);
             if decode_error {
                 scan.prev_recv = None;
             }
@@ -1118,10 +1086,6 @@ fn scan_series(series: &Series, min_gap_ns: i64, exact: bool) -> SeriesReport {
             .collect(),
     }
 }
-
-// ---------------------------------------------------------------------------
-// Formatting
-// ---------------------------------------------------------------------------
 
 fn fmt_ts(ns: i64) -> String {
     let zoned = Timestamp::from_nanosecond(i128::from(ns))
@@ -1352,8 +1316,6 @@ fn write_report(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-
 fn main() -> Result<()> {
     let args = Args::parse();
     let series = select_series(&args)?;
@@ -1570,11 +1532,7 @@ mod tests {
     use super::*;
 
     fn scan_line(scan: &mut SeriesScan, family: Family, recv: i64, json: &str) {
-        let line = format!("{recv} {json}");
-        assert!(matches!(
-            scan.process_line(family, line.as_bytes(), 5_000_000_000),
-            LineOutcome::Ok
-        ));
+        scan.process_payload(family, recv, json.as_bytes(), 5_000_000_000);
     }
 
     #[test]
@@ -1705,13 +1663,14 @@ mod tests {
     }
 
     #[test]
-    fn foreign_first_line_is_detected() {
-        let mut scan = SeriesScan::default();
-        let binary: Vec<u8> = vec![0u8, 1, 2, 3, 255, 254, 253, 252];
-        assert!(matches!(
-            scan.process_line(Family::Generic, &binary, 5_000_000_000),
-            LineOutcome::Bad
-        ));
+    fn record_lines_parse_and_a_binary_first_line_is_foreign() {
+        assert_eq!(
+            parse_record_line(b"123 {\"a\":1}"),
+            Some((123, &b"{\"a\":1}"[..]))
+        );
+        assert_eq!(parse_record_line(b"123 [1]"), None);
+        let binary = [0u8, 1, 2, 3, 255, 254, 253, 252];
+        assert_eq!(parse_record_line(&binary), None);
         assert!(is_foreign(&binary));
         assert!(!is_foreign(b"123 {\"a\":1}"));
     }
@@ -1756,25 +1715,6 @@ mod tests {
     }
 
     #[test]
-    fn non_overlapping_records_preserve_recorded_order() {
-        let records = vec![
-            RawLine {
-                recv: 200,
-                payload: b"{}".to_vec(),
-                source: 0,
-            },
-            RawLine {
-                recv: 100,
-                payload: b"{}".to_vec(),
-                source: 0,
-            },
-        ];
-        let mut scan = SeriesScan::default();
-        process_lines(&mut scan, Family::Generic, records, 1_000, false);
-        assert_eq!(scan.recv_regressions, 1);
-    }
-
-    #[test]
     fn overlapping_runs_are_time_merged_and_cross_run_duplicates_are_removed() {
         let ten_old = br#"{"stream":"btcusdt@trade","data":{"e":"trade","E":10,"t":10}}"#.to_vec();
         let ten_new = br#"{"stream":"btcusdt@trade","data":{"e":"trade","E":11,"t":10}}"#.to_vec();
@@ -1815,7 +1755,7 @@ mod tests {
             },
         ];
         let mut scan = SeriesScan::default();
-        process_lines(&mut scan, Family::BinanceSpot, records, 5_000_000_000, true);
+        merge_overlapping_runs(&mut scan, Family::BinanceSpot, records, 5_000_000_000);
         let stats = &scan.streams[0].stats;
         assert_eq!(scan.rows, 4);
         assert_eq!(scan.recv_regressions, 0);
@@ -1841,7 +1781,7 @@ mod tests {
             raw(20, br#"{"run":"new-end"}"#, 1),
         ];
         let mut scan = SeriesScan::default();
-        process_lines(&mut scan, Family::Generic, records, 100, true);
+        merge_overlapping_runs(&mut scan, Family::Generic, records, 100);
         assert_eq!(scan.rows, 6);
     }
 
