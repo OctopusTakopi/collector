@@ -28,10 +28,10 @@ const OVERLAP_GRACE: Duration = Duration::from_secs(2);
 const BIND_RETRY: Duration = Duration::from_millis(10);
 /// Pause before choosing a role again after the incumbent vanished
 /// mid-handover.
-const RESELECT_DELAY: Duration = Duration::from_millis(100);
-/// Incumbents that may vanish mid-handover before the challenger gives up, so
-/// a flapping peer cannot keep it spinning.
-const MAX_LOST_INCUMBENTS: u32 = 10;
+const RESELECT_DELAY: Duration = Duration::from_millis(250);
+/// Role selections after a vanished incumbent before the challenger gives
+/// up, so a flapping peer cannot keep it spinning.
+const MAX_RESELECTIONS: u32 = 5;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Identity {
@@ -122,6 +122,9 @@ enum Role {
 enum Challenge {
     /// The incumbent drained and released the socket to this process.
     Won(Bound),
+    /// Shutdown came before this process told the incumbent it was ready.
+    /// Retiring the incumbent now would leave nothing collecting.
+    Stopped,
     /// The incumbent's stream closed or failed before its drain report.
     Lost {
         error: io::Error,
@@ -148,10 +151,17 @@ pub async fn run(
             .with_context(|| format!("cannot create UDS directory {}", parent.display()))?;
     }
 
-    let bound = tokio::select! {
-        biased;
-        _ = shutdown.wait_for(|stop| *stop) => return Ok(()),
-        bound = take_role(&path, &identity, &run_id, &mut ready, &quality) => bound?,
+    let Some(bound) = take_role(
+        &path,
+        &identity,
+        &run_id,
+        &mut ready,
+        &mut shutdown,
+        &quality,
+    )
+    .await?
+    else {
+        return Ok(());
     };
     server_loop(
         bound,
@@ -165,16 +175,18 @@ pub async fn run(
     .await
 }
 
-/// Bind the socket, or challenge its owner until it hands the socket over.
-/// An incumbent that vanishes mid-handover sends the challenger back to role
-/// selection: it binds the freed path or challenges whoever owns it now.
+/// Bind the socket, or challenge its owner until it hands the socket over;
+/// `None` if shutdown came first. An incumbent that vanishes mid-handover
+/// sends the challenger back to role selection: it binds the freed path or
+/// challenges whoever owns it now.
 async fn take_role(
     path: &Path,
     identity: &Identity,
     run_id: &str,
     ready: &mut watch::Receiver<ReadinessState>,
+    shutdown: &mut watch::Receiver<bool>,
     quality: &QualityReporter,
-) -> anyhow::Result<Bound> {
+) -> anyhow::Result<Option<Bound>> {
     let mut lost_incumbents = 0;
     let mut lost_after_ready: Option<String> = None;
     loop {
@@ -190,17 +202,18 @@ async fn take_role(
                         &incumbent_run_id,
                     );
                 }
-                return Ok(bound);
+                return Ok(Some(bound));
             }
             Role::Challenger(stream) => stream,
         };
-        match challenge(stream, path, identity, run_id, ready, quality).await? {
-            Challenge::Won(bound) => return Ok(bound),
+        match challenge(stream, path, identity, run_id, ready, shutdown, quality).await? {
+            Challenge::Won(bound) => return Ok(Some(bound)),
+            Challenge::Stopped => return Ok(None),
             Challenge::Lost { error, ready_for } => {
                 lost_incumbents += 1;
-                if lost_incumbents == MAX_LOST_INCUMBENTS {
+                if lost_incumbents > MAX_RESELECTIONS {
                     return Err(error).context(format!(
-                        "{MAX_LOST_INCUMBENTS} incumbents in a row vanished mid-handover"
+                        "handover incumbent disappeared {lost_incumbents} times before draining"
                     ));
                 }
                 tracing::warn!(%error, "incumbent vanished mid-handover; choosing a role again");
@@ -212,12 +225,15 @@ async fn take_role(
 }
 
 /// One handshake with the incumbent on `stream`, through its drain report.
+/// Shutdown is heeded until `Ready` is sent; after that the incumbent is
+/// already draining for this process.
 async fn challenge(
     mut stream: UnixStream,
     path: &Path,
     identity: &Identity,
     run_id: &str,
     ready: &mut watch::Receiver<ReadinessState>,
+    shutdown: &mut watch::Receiver<bool>,
     quality: &QualityReporter,
 ) -> anyhow::Result<Challenge> {
     let lost = |error, ready_for| Ok(Challenge::Lost { error, ready_for });
@@ -231,7 +247,12 @@ async fn challenge(
         Err(WireError::Gone(error)) => return lost(error, None),
         Err(error) => return Err(error.into()),
     }
-    let incumbent_run_id = match timeout(HANDSHAKE_TIMEOUT, read_message(&mut stream)).await {
+    let acknowledged = tokio::select! {
+        biased;
+        _ = shutdown.wait_for(|stop| *stop) => return Ok(Challenge::Stopped),
+        read = timeout(HANDSHAKE_TIMEOUT, read_message(&mut stream)) => read,
+    };
+    let incumbent_run_id = match acknowledged {
         Ok(Ok(Message::HelloAck { run_id })) => run_id,
         Ok(Ok(Message::Reject { reason })) => bail!("handover rejected: {reason}"),
         Ok(Ok(message)) => bail!("unexpected handover response: {message:?}"),
@@ -244,6 +265,8 @@ async fn challenge(
     // readable meanwhile is its exit or a protocol error.
     let mut probe = [0_u8; 1];
     tokio::select! {
+        biased;
+        _ = shutdown.wait_for(|stop| *stop) => return Ok(Challenge::Stopped),
         result = wait_until_stably_ready(ready, OVERLAP_GRACE) => result?,
         read = stream.read(&mut probe) => match read {
             Ok(0) => return lost(io::ErrorKind::UnexpectedEof.into(), None),
@@ -839,6 +862,35 @@ mod tests {
         assert!(error.to_string().contains("rejected"));
         assert!(fixture.takeovers.try_recv().is_err());
         assert!(!fixture.incumbent.is_finished());
+    }
+
+    #[tokio::test]
+    async fn a_challenger_shut_down_before_readiness_leaves_the_incumbent_alone() {
+        let mut fixture = Fixture::start("challenger-shutdown").await;
+        let (_readiness, ready) = Readiness::new(1);
+        let (takeover_tx, _takeovers) = mpsc::channel(1);
+        let (shutdown, shutdown_rx) = watch::channel(false);
+        let challenger = tokio::spawn(run(
+            fixture.path.clone(),
+            fixture.identity.clone(),
+            "new".to_owned(),
+            ready,
+            takeover_tx,
+            shutdown_rx,
+            QualityReporter::disabled(),
+        ));
+        // Time to connect and be acknowledged; it then waits for readiness.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        shutdown.send_replace(true);
+        timeout(Duration::from_secs(2), challenger)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(fixture.takeovers.try_recv().is_err());
+        assert!(!fixture.incumbent.is_finished());
+        assert!(UnixStream::connect(&fixture.path).await.is_ok());
     }
 
     /// One collector's handover task on its own thread and runtime, as a
