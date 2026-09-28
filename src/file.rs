@@ -1,16 +1,18 @@
 use std::{
     borrow::Cow,
     collections::HashMap,
-    fs::{File, TryLockError},
+    fmt::{self, Write as _},
+    fs::{self, File, TryLockError},
     io::{self, Seek, SeekFrom, Write},
+    mem,
     os::unix::fs::{FileExt, MetadataExt},
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
-use bytes::BufMut;
-use jiff::Timestamp;
+use bytes::{BufMut, Bytes, BytesMut};
+use jiff::{Timestamp, civil::Date, tz::TimeZone};
 use tracing::{error, info, warn};
-use zstd::stream::write::Encoder as ZstdEncoder;
 
 use crate::quality::{QualityEvent, QualityReporter};
 use crate::symbol::Symbol;
@@ -22,40 +24,34 @@ pub struct WriteRecord {
     pub data: bytes::Bytes,
 }
 
-/// Uncompressed bytes accumulated before they are handed to zstd. Matches the
-/// compressor's block size so we do not call into it once per websocket frame.
+type ZstdEncoder = zstd::stream::write::Encoder<'static, File>;
+
+const ZSTD_LEVEL: i32 = 1;
+/// Uncompressed bytes batched before they are handed to zstd: one compressor
+/// block, so zstd is not called once per websocket frame.
 const ZSTD_BATCH_BYTES: usize = 128 * 1024;
-/// How long a failed sidecar merge waits before the next attempt. An attempt
-/// walks and fsyncs the daily file, so retrying on every record would stall
-/// the writer for every symbol.
+/// A failed sidecar merge is not retried before this: an attempt walks and
+/// fsyncs the daily file, so retrying on every record would stall the writer
+/// for every symbol.
 const MERGE_RETRY_BACKOFF: Duration = Duration::from_secs(5);
 const ZSTD_MAGIC: u32 = 0xFD2F_B528;
 const SKIPPABLE_MAGIC: u32 = 0x184D_2A50;
 const SKIPPABLE_MAGIC_MASK: u32 = 0xFFFF_FFF0;
 
-/// Characters left as-is in a filename.
-///
-/// Deliberately permissive: the point is to keep the exchange's own identifier
-/// readable on disk, so only genuinely path-hostile bytes get escaped. `@` is
-/// the obvious one to allow — Hyperliquid names 315 of its 316 spot pairs `@1`
-/// … `@315` — and `+`/`=` show up in dated contracts elsewhere. All of these
-/// are legal filename characters on Linux, macOS and Windows alike.
+/// Bytes kept as-is in a filename: only path-hostile bytes are escaped, so
+/// the exchange's identifier stays readable on disk. Hyperliquid names 315 of
+/// its 316 spot pairs `@1` … `@315`; `+`/`=` occur in dated contracts. All are
+/// legal filename characters on Linux, macOS and Windows.
 fn is_safe_in_filename(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'@' | b'+' | b'=')
 }
 
-/// Encode an exchange-supplied symbol into a filename component.
+/// Percent-encode a symbol into a filename component (Hyperliquid's
+/// `PURR/USDC` is not one).
 ///
-/// Some symbols are not valid path components — Hyperliquid reports spot pairs
-/// as `PURR/USDC`, which would open a file inside a directory that was never
-/// created and take the whole collector down with it.
-///
-/// The encoding must be **injective**. Folding unsafe bytes to a single `_`
-/// would map `purr/usdc` and `purr_usdc` to the same name, and since each
-/// symbol gets its own `RotatingFile`, two independent zstd encoders would
-/// append interleaved frames to one file and render it undecodable. Percent
-/// escaping avoids that: `%` is itself unsafe, so it is always escaped and no
-/// two distinct symbols can collide.
+/// The encoding is injective: two symbols sharing a file would interleave the
+/// frames of two zstd encoders and render it undecodable. `%` is itself
+/// unsafe, so it is always escaped and no two symbols collide.
 fn encode_symbol(symbol: &str) -> Cow<'_, str> {
     if symbol.bytes().all(is_safe_in_filename) {
         return Cow::Borrowed(symbol);
@@ -74,8 +70,36 @@ fn encode_symbol(symbol: &str) -> Cow<'_, str> {
     Cow::Owned(encoded)
 }
 
-/// Take the exclusive lock without blocking; `false` if another writer
-/// holds it. On Linux this is `flock(LOCK_EX | LOCK_NB)`.
+/// `<prefix>_<YYYYMMDD><suffix>.zst`, where `prefix` is
+/// `<dir>/<encoded symbol>`.
+fn day_file(prefix: &Path, date: Date, suffix: fmt::Arguments<'_>) -> PathBuf {
+    let mut name = prefix.as_os_str().to_owned();
+    write!(name, "_{}{suffix}.zst", date.strftime("%Y%m%d"))
+        .expect("formatting into an OsString cannot fail");
+    PathBuf::from(name)
+}
+
+/// A UTC calendar day and the instant the next one starts.
+#[derive(Clone, Copy)]
+struct Day {
+    date: Date,
+    end: Timestamp,
+}
+
+impl Day {
+    fn containing(timestamp: Timestamp) -> io::Result<Self> {
+        let date = TimeZone::UTC.to_datetime(timestamp).date();
+        let end = date
+            .tomorrow()
+            .and_then(|next| next.to_zoned(TimeZone::UTC))
+            .map_err(io::Error::other)?
+            .timestamp();
+        Ok(Self { date, end })
+    }
+}
+
+/// Take the exclusive lock without blocking; `false` if another writer holds
+/// it. On Linux this is `flock(LOCK_EX | LOCK_NB)`.
 fn try_exclusive_lock(file: &File) -> io::Result<bool> {
     match file.try_lock() {
         Ok(()) => Ok(true),
@@ -84,22 +108,22 @@ fn try_exclusive_lock(file: &File) -> io::Result<bool> {
     }
 }
 
-fn lock_exclusively(file: &File, path: &str) -> io::Result<()> {
+fn lock_exclusively(file: &File, path: &Path) -> io::Result<()> {
     if try_exclusive_lock(file)? {
         Ok(())
     } else {
         Err(io::Error::new(
             io::ErrorKind::WouldBlock,
-            format!("{path} is locked by another writer"),
+            format!("{} is locked by another writer", path.display()),
         ))
     }
 }
 
 /// Whether `path` still names the inode `file` refers to. A lock taken on a
 /// file that was renamed away in the meantime guards nothing.
-fn names_file(path: &str, file: &File) -> io::Result<bool> {
+fn names_file(path: &Path, file: &File) -> io::Result<bool> {
     let held = file.metadata()?;
-    match std::fs::metadata(path) {
+    match fs::metadata(path) {
         Ok(named) => Ok(named.dev() == held.dev() && named.ino() == held.ino()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error),
@@ -171,172 +195,447 @@ fn ends_on_frame_boundary(file: &File) -> io::Result<bool> {
     Ok(pos == len)
 }
 
-fn rollback_append(canonical: &mut File, start: u64) -> io::Result<()> {
-    canonical.set_len(start)?;
-    canonical.seek(SeekFrom::Start(start))?;
-    canonical.sync_all()
+fn rollback_append(daily: &mut File, start: u64) -> io::Result<()> {
+    daily.set_len(start)?;
+    daily.seek(SeekFrom::Start(start))?;
+    daily.sync_all()
 }
 
-pub struct RotatingFile {
-    next_rotation: i64,
-    /// UTC `YYYYMMDD` of the file currently open. The daily-file lock is
-    /// always probed for this day, never for a record's own timestamp.
-    day: String,
-    path: String,
+/// Open `path` for appending and lock it, unless another writer holds it or
+/// it was renamed away before the lock was taken.
+fn open_locked(path: &Path) -> io::Result<Option<File>> {
+    let file = File::options()
+        .create(true)
+        .read(true)
+        .append(true)
+        .open(path)?;
+    Ok((try_exclusive_lock(&file)? && names_file(path, &file)?).then_some(file))
+}
+
+/// Lock the day's file for appending; `None` while another writer holds it.
+fn try_lock_daily(prefix: &Path, date: Date) -> io::Result<Option<File>> {
+    let daily = day_file(prefix, date, format_args!(""));
+    let Some(file) = open_locked(&daily)? else {
+        return Ok(None);
+    };
+    if ends_on_frame_boundary(&file)? {
+        return Ok(Some(file));
+    }
+    // The last writer died mid-frame and appending after that would make
+    // every later frame undecodable: set the file aside, readable up to where
+    // it stops, and start the day again in a fresh one.
+    let salvage = day_file(
+        prefix,
+        date,
+        format_args!("_unterminated-{}", Timestamp::now().as_nanosecond()),
+    );
+    fs::rename(&daily, &salvage)?;
+    warn!(
+        path = %daily.display(),
+        salvage = %salvage.display(),
+        "daily file ends mid-frame; moved it aside instead of appending to it"
+    );
+    let fresh = open_locked(&daily);
+    // The old inode stays locked until the fresh one is.
+    drop(file);
+    fresh
+}
+
+/// Append a finished sidecar to the locked daily file, fsync, and delete the
+/// sidecar. A failed append is rolled back, so the daily file never ends
+/// mid-frame.
+fn merge_sidecar(daily: &mut File, sidecar: &Path) -> io::Result<()> {
+    let start = daily.metadata()?.len();
+    let appended = File::open(sidecar)
+        .and_then(|mut src| io::copy(&mut src, daily))
+        .and_then(|_| daily.sync_all());
+    if let Err(error) = appended {
+        return Err(match rollback_append(daily, start) {
+            Ok(()) => error,
+            Err(rollback) => io::Error::new(
+                error.kind(),
+                format!("{error}; also failed to roll back partial append: {rollback}"),
+            ),
+        });
+    }
+    match fs::remove_file(sidecar) {
+        Ok(()) => info!(
+            sidecar = %sidecar.display(),
+            "switch complete; merged and removed overlap sidecar"
+        ),
+        Err(error) => warn!(
+            sidecar = %sidecar.display(),
+            %error,
+            "switch complete; merged overlap sidecar but failed to remove it"
+        ),
+    }
+    Ok(())
+}
+
+/// Merge a finished sidecar into its day's file; `false` while another writer
+/// still holds that file.
+fn merge_into_daily(prefix: &Path, date: Date, sidecar: &Path) -> io::Result<bool> {
+    let Some(mut daily) = try_lock_daily(prefix, date)? else {
+        return Ok(false);
+    };
+    merge_sidecar(&mut daily, sidecar)?;
+    Ok(true)
+}
+
+/// The day's file, or this run's sidecar while another writer holds it.
+fn open_sink(prefix: &Path, date: Date, run_id: &str) -> io::Result<Sink> {
+    if let Some(daily) = try_lock_daily(prefix, date)? {
+        return Ok(Sink::Daily(ZstdEncoder::new(daily, ZSTD_LEVEL)?));
+    }
+    let path = day_file(prefix, date, format_args!("_{run_id}"));
+    let file = File::options().create_new(true).write(true).open(&path)?;
+    lock_exclusively(&file, &path)?;
+    warn!(
+        path = %path.display(),
+        "daily file busy; writing a run-local sidecar until the incumbent releases it"
+    );
+    Ok(Sink::Sidecar {
+        encoder: ZstdEncoder::new(file, ZSTD_LEVEL)?,
+        path,
+    })
+}
+
+fn reopen_sidecar(path: &Path) -> io::Result<ZstdEncoder> {
+    let file = File::options().append(true).open(path)?;
+    lock_exclusively(&file, path)?;
+    ZstdEncoder::new(file, ZSTD_LEVEL)
+}
+
+fn no_open_file(prefix: &Path) -> io::Error {
+    io::Error::other(format!("{} has no open file", prefix.display()))
+}
+
+/// Where a symbol's records go.
+enum Sink {
+    /// The day's file, locked by this process.
+    Daily(ZstdEncoder),
+    /// Another writer holds the day's file: this run's sidecar, appended to
+    /// the daily file and deleted once that is free.
+    Sidecar {
+        encoder: ZstdEncoder,
+        path: PathBuf,
+    },
+    /// A finished sidecar still waiting to be appended. Nothing can be
+    /// written until the switch succeeds.
+    SealedSidecar(PathBuf),
+    Closed,
+}
+
+impl Sink {
+    fn encoder(&mut self) -> Option<&mut ZstdEncoder> {
+        match self {
+            Sink::Daily(encoder) | Sink::Sidecar { encoder, .. } => Some(encoder),
+            Sink::SealedSidecar(_) | Sink::Closed => None,
+        }
+    }
+
+    fn sidecar(&self) -> Option<&Path> {
+        match self {
+            Sink::Sidecar { path, .. } | Sink::SealedSidecar(path) => Some(path),
+            Sink::Daily(_) | Sink::Closed => None,
+        }
+    }
+}
+
+/// What the daily file is for once the sidecar has been appended to it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AfterSwitch {
+    /// More records of the day follow: write them to the daily file.
+    Continue,
+    /// Rotating or closing: release the daily file. An encoder opened on it
+    /// now would finish as an empty extra frame.
+    Release,
+}
+
+/// A sidecar sealed at UTC midnight, still owned by this run, appended once
+/// its day's file is free.
+struct PendingSidecar {
+    date: Date,
+    path: PathBuf,
+}
+
+/// One symbol's recording, rotated at UTC midnight.
+struct RotatingFile {
+    /// `<dir>/<encoded symbol>`, which every file name of the symbol extends.
+    prefix: PathBuf,
     run_id: String,
-    /// Set while this process is writing a run-local overlap file because the
-    /// canonical daily path is locked by another writer. Cleared after the
-    /// switch: the sidecar has been appended into the daily file and removed.
-    sidecar_path: Option<String>,
-    /// Sidecars sealed at UTC midnight that still belong to this process and
-    /// will be appended when that day's daily file lock is free.
-    pending_sidecars: Vec<(String, String)>,
-    file: Option<ZstdEncoder<'static, File>>,
-    buf: bytes::BytesMut,
-    /// Set when a rotation could not be finalized, so the already-rotated file
-    /// may be missing its zstd footer. Collection continues, but the process
-    /// must not report a clean exit.
+    /// The day of the open file. The daily-file lock is probed for this day,
+    /// never for a record's timestamp.
+    day: Day,
+    sink: Sink,
+    pending_sidecars: Vec<PendingSidecar>,
+    batch: BytesMut,
+    /// A file could not be finalized or a sidecar not merged. Collection
+    /// continues, but close must not report a clean exit.
     degraded: bool,
-    /// Set after a sidecar merge failed; no merge is attempted before then.
+    /// Set after a sidecar merge failed; no switch or merge is attempted
+    /// before then.
     merge_retry_at: Option<Instant>,
     quality: QualityReporter,
 }
 
 impl RotatingFile {
-    fn open_locked(canonical: &str) -> io::Result<Option<File>> {
-        let file = File::options()
-            .create(true)
-            .read(true)
-            .append(true)
-            .open(canonical)?;
-        Ok((try_exclusive_lock(&file)? && names_file(canonical, &file)?).then_some(file))
+    fn new(
+        timestamp: Timestamp,
+        prefix: PathBuf,
+        run_id: String,
+        quality: QualityReporter,
+    ) -> io::Result<Self> {
+        let day = Day::containing(timestamp)?;
+        let sink = open_sink(&prefix, day.date, &run_id)?;
+        Ok(Self {
+            prefix,
+            run_id,
+            day,
+            sink,
+            pending_sidecars: Vec::new(),
+            batch: BytesMut::with_capacity(ZSTD_BATCH_BYTES),
+            degraded: false,
+            merge_retry_at: None,
+            quality,
+        })
     }
 
-    fn try_lock_canonical_file(path: &str, date_str: &str) -> Result<Option<File>, io::Error> {
-        let canonical = format!("{path}_{date_str}.zst");
-        let Some(primary) = Self::open_locked(&canonical)? else {
-            return Ok(None);
-        };
-        if ends_on_frame_boundary(&primary)? {
-            return Ok(Some(primary));
+    fn write(&mut self, timestamp: Timestamp, data: Bytes) -> io::Result<()> {
+        if timestamp >= self.day.end {
+            self.rotate(timestamp)?;
         }
-        // The last writer died mid-frame. Appending after that would make every
-        // later frame undecodable, so set the damaged file aside — readable up
-        // to where it stops — and start the day again in a fresh file. The old
-        // inode stays locked until the fresh one is.
-        let salvage = format!(
-            "{path}_{date_str}_unterminated-{}.zst",
-            Timestamp::now().as_nanosecond()
-        );
-        std::fs::rename(&canonical, &salvage)?;
-        warn!(
-            path = %canonical,
-            %salvage,
-            "daily file ends mid-frame; moved it aside instead of appending to it"
-        );
-        Self::open_locked(&canonical)
-    }
-
-    fn try_lock_canonical(
-        path: &str,
-        date_str: &str,
-    ) -> Result<Option<ZstdEncoder<'static, File>>, io::Error> {
-        match Self::try_lock_canonical_file(path, date_str)? {
-            Some(file) => Ok(Some(ZstdEncoder::new(file, 1)?)),
-            None => Ok(None),
+        if self
+            .merge_retry_at
+            .is_none_or(|retry_at| Instant::now() >= retry_at)
+        {
+            self.merge_retry_at = None;
+            self.switch_to_daily(AfterSwitch::Continue)?;
+            self.merge_pending_sidecars();
         }
-    }
+        if self.sink.encoder().is_none() {
+            return Err(no_open_file(&self.prefix));
+        }
 
-    fn append_sidecar(canonical: &mut File, sidecar: &str) -> io::Result<()> {
-        let start = canonical.metadata()?.len();
-        let copied = (|| {
-            let mut src = File::open(sidecar)?;
-            io::copy(&mut src, canonical)?;
-            canonical.sync_all()
-        })();
-        if let Err(error) = copied {
-            return match rollback_append(canonical, start) {
-                Ok(()) => Err(error),
-                Err(rollback) => Err(io::Error::new(
-                    error.kind(),
-                    format!("{error}; also failed to roll back partial append: {rollback}"),
-                )),
-            };
+        let mut itoa = itoa::Buffer::new();
+        self.batch
+            .put_slice(itoa.format(timestamp.as_nanosecond()).as_bytes());
+        self.batch.put_u8(b' ');
+        self.batch.put(data);
+        self.batch.put_u8(b'\n');
+        if self.batch.len() >= ZSTD_BATCH_BYTES {
+            self.flush_batch()?;
         }
         Ok(())
     }
 
-    fn open_sidecar(
-        path: &str,
-        date_str: &str,
-        run_id: &str,
-    ) -> Result<(ZstdEncoder<'static, File>, String), io::Error> {
-        let sidecar = format!("{path}_{date_str}_{run_id}.zst");
-        let file = File::options()
-            .create_new(true)
-            .write(true)
-            .open(&sidecar)?;
-        lock_exclusively(&file, &sidecar)?;
-        warn!(
-            path = %sidecar,
-            "daily file busy; writing a run-local sidecar until the incumbent releases it"
-        );
-        Ok((ZstdEncoder::new(file, 1)?, sidecar))
-    }
-
-    fn open_daily(
-        path: &str,
-        date_str: &str,
-        run_id: &str,
-    ) -> Result<(ZstdEncoder<'static, File>, Option<String>), io::Error> {
-        if let Some(encoder) = Self::try_lock_canonical(path, date_str)? {
-            return Ok((encoder, None));
+    /// Finish the day's file, queue a sidecar that could not be switched yet,
+    /// and open the next day's file.
+    fn rotate(&mut self, timestamp: Timestamp) -> io::Result<()> {
+        self.switch_to_daily(AfterSwitch::Release)?;
+        let finalized = match self.finalize() {
+            Ok(()) => true,
+            Err(error) => {
+                error!(
+                    path = %self.prefix.display(),
+                    %error,
+                    "failed to finalize file on rotation; continuing with the new file"
+                );
+                self.mark_degraded(self.prefix.display().to_string(), &error);
+                false
+            }
+        };
+        match mem::replace(&mut self.sink, Sink::Closed) {
+            Sink::Sidecar { path, .. } | Sink::SealedSidecar(path) if finalized => {
+                warn!(
+                    path = %path.display(),
+                    "UTC date changed before switch; keeping the overlap sidecar until the daily file is free"
+                );
+                self.pending_sidecars.push(PendingSidecar {
+                    date: self.day.date,
+                    path,
+                });
+            }
+            Sink::Sidecar { path, .. } | Sink::SealedSidecar(path) => warn!(
+                path = %path.display(),
+                "UTC date changed before switch; leaving incomplete overlap sidecar on disk"
+            ),
+            daily_or_closed => self.sink = daily_or_closed,
         }
-        let (encoder, sidecar) = Self::open_sidecar(path, date_str, run_id)?;
-        Ok((encoder, Some(sidecar)))
+        let day = Day::containing(timestamp)?;
+        let sink = open_sink(&self.prefix, day.date, &self.run_id)?;
+        self.batch.clear();
+        self.sink = sink;
+        self.day = day;
+        info!(path = %self.prefix.display(), "date changed, file rotated");
+        Ok(())
     }
 
-    fn create(
-        timestamp: Timestamp,
-        path: &str,
-        run_id: &str,
-    ) -> Result<(ZstdEncoder<'static, File>, i64, String, Option<String>), io::Error> {
-        let zoned = timestamp.to_zoned(jiff::tz::TimeZone::UTC);
-        let day = zoned.date().strftime("%Y%m%d").to_string();
-        let (encoder, sidecar_path) = Self::open_daily(path, &day, run_id)?;
-
-        let next_rotation = zoned
-            .date()
-            .tomorrow()
-            .map_err(io::Error::other)?
-            .at(0, 0, 0, 0)
-            .to_zoned(jiff::tz::TimeZone::UTC)
-            .map_err(io::Error::other)?
-            .timestamp()
-            .as_nanosecond();
-
-        Ok((encoder, next_rotation as i64, day, sidecar_path))
+    /// Once the incumbent has released the daily file, append this run's
+    /// sidecar to it and delete the sidecar — the only time one is removed.
+    ///
+    /// The lock is probed for the open file's day: a late pre-midnight record
+    /// must not switch today's sidecar into yesterday's file.
+    fn switch_to_daily(&mut self, after: AfterSwitch) -> io::Result<()> {
+        let Some(sidecar) = self.sink.sidecar() else {
+            return Ok(());
+        };
+        let Some(mut daily) = try_lock_daily(&self.prefix, self.day.date)? else {
+            return Ok(());
+        };
+        let sidecar = sidecar.to_path_buf();
+        if let Err(error) = self.finalize() {
+            error!(
+                path = %sidecar.display(),
+                %error,
+                "failed to finalize handover sidecar before switching to the daily file"
+            );
+            self.mark_degraded(sidecar.display().to_string(), &error);
+            // An unfinished frame must never be appended: everything after it
+            // in the daily file would be undecodable.
+            warn!(path = %sidecar.display(), "leaving unfinished overlap sidecar on disk");
+            // Records the sidecar did not take go to the daily file.
+            let after = if self.batch.is_empty() {
+                after
+            } else {
+                AfterSwitch::Continue
+            };
+            return self.continue_in(daily, after);
+        }
+        if let Err(error) = merge_sidecar(&mut daily, &sidecar) {
+            error!(
+                path = %sidecar.display(),
+                %error,
+                "failed to append overlap sidecar after switch"
+            );
+            self.mark_degraded(sidecar.display().to_string(), &error);
+            self.merge_retry_at = Some(Instant::now() + MERGE_RETRY_BACKOFF);
+            // Unlock: the fallback probes the lock again through another fd.
+            drop(daily);
+            return self.resume_or_queue_sidecar(sidecar, after);
+        }
+        self.continue_in(daily, after)
     }
 
-    pub fn new(
-        timestamp: Timestamp,
-        path: String,
-        run_id: String,
-        quality: QualityReporter,
-    ) -> Result<Self, io::Error> {
-        let (file, next_rotation, day, sidecar_path) = Self::create(timestamp, &path, &run_id)?;
-        Ok(Self {
-            next_rotation,
-            day,
-            file: Some(file),
-            path,
-            run_id,
-            sidecar_path,
-            pending_sidecars: Vec::new(),
-            buf: bytes::BytesMut::with_capacity(ZSTD_BATCH_BYTES),
-            degraded: false,
-            merge_retry_at: None,
-            quality,
+    /// After a failed append of a finished sidecar: reopen it, so the day's
+    /// records keep going there and a later switch retries the append.
+    /// Failing that, append it now if the daily file is free, or queue it
+    /// when releasing.
+    fn resume_or_queue_sidecar(&mut self, sidecar: PathBuf, after: AfterSwitch) -> io::Result<()> {
+        let resume_error = match reopen_sidecar(&sidecar) {
+            Ok(encoder) => {
+                self.sink = Sink::Sidecar {
+                    encoder,
+                    path: sidecar,
+                };
+                return Ok(());
+            }
+            Err(error) => error,
+        };
+        error!(
+            path = %sidecar.display(),
+            %resume_error,
+            "failed to resume overlap sidecar after a failed merge"
+        );
+        let merged = match try_lock_daily(&self.prefix, self.day.date)? {
+            None => Err(resume_error),
+            Some(mut daily) => match merge_sidecar(&mut daily, &sidecar) {
+                Ok(()) => Ok(daily),
+                Err(error) => {
+                    self.mark_degraded(sidecar.display().to_string(), &error);
+                    Err(error)
+                }
+            },
+        };
+        match (merged, after) {
+            (Ok(daily), after) => self.continue_in(daily, after),
+            // The sink stays a sealed sidecar for the next switch to retry.
+            (Err(error), AfterSwitch::Continue) => Err(error),
+            (Err(_), AfterSwitch::Release) => {
+                self.pending_sidecars.push(PendingSidecar {
+                    date: self.day.date,
+                    path: sidecar,
+                });
+                self.sink = Sink::Closed;
+                Ok(())
+            }
+        }
+    }
+
+    fn continue_in(&mut self, daily: File, after: AfterSwitch) -> io::Result<()> {
+        self.sink = Sink::Closed;
+        if after == AfterSwitch::Continue {
+            self.sink = Sink::Daily(ZstdEncoder::new(daily, ZSTD_LEVEL)?);
+        }
+        Ok(())
+    }
+
+    fn merge_pending_sidecars(&mut self) {
+        for sidecar in mem::take(&mut self.pending_sidecars) {
+            match merge_into_daily(&self.prefix, sidecar.date, &sidecar.path) {
+                Ok(true) => {}
+                Ok(false) => self.pending_sidecars.push(sidecar),
+                Err(error) => {
+                    error!(
+                        path = %sidecar.path.display(),
+                        %error,
+                        "failed to append overlap sidecar after switch"
+                    );
+                    self.mark_degraded(sidecar.path.display().to_string(), &error);
+                    self.merge_retry_at = Some(Instant::now() + MERGE_RETRY_BACKOFF);
+                    self.pending_sidecars.push(sidecar);
+                }
+            }
+        }
+    }
+
+    fn holds_sidecars(&self) -> bool {
+        self.sink.sidecar().is_some() || !self.pending_sidecars.is_empty()
+    }
+
+    fn flush_batch(&mut self) -> io::Result<()> {
+        if self.batch.is_empty() {
+            return Ok(());
+        }
+        let Some(encoder) = self.sink.encoder() else {
+            return Err(no_open_file(&self.prefix));
+        };
+        encoder.write_all(&self.batch)?;
+        self.batch.clear();
+        Ok(())
+    }
+
+    /// Flush the batch, finish the open zstd frame and fsync it. A finished
+    /// sidecar stays the sink until it is appended.
+    fn finalize(&mut self) -> io::Result<()> {
+        self.flush_batch()?;
+        let encoder = match mem::replace(&mut self.sink, Sink::Closed) {
+            Sink::Daily(encoder) => encoder,
+            Sink::Sidecar { encoder, path } => {
+                self.sink = Sink::SealedSidecar(path);
+                encoder
+            }
+            idle => {
+                self.sink = idle;
+                return Ok(());
+            }
+        };
+        let file = encoder.finish().map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "failed to finish zstd stream {}: {error}",
+                    self.prefix.display()
+                ),
+            )
+        })?;
+        // A failed fsync may already have dropped the dirty pages and marked
+        // them clean, so a retry could succeed with the data lost.
+        file.sync_all().map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("failed to sync {}: {error}", self.prefix.display()),
+            )
         })
     }
 
@@ -348,272 +647,12 @@ impl RotatingFile {
             error: error.to_string(),
         });
     }
-
-    fn finalize_or_degrade(&mut self) -> bool {
-        match self.finalize() {
-            Ok(()) => true,
-            Err(error) => {
-                error!(
-                    path = %self.path,
-                    %error,
-                    "failed to finalize file on rotation; continuing with the new file"
-                );
-                self.mark_degraded(self.path.clone(), &error);
-                false
-            }
-        }
-    }
-
-    fn resume_sidecar_encoder(sidecar: &str) -> io::Result<ZstdEncoder<'static, File>> {
-        let file = File::options().append(true).open(sidecar)?;
-        lock_exclusively(&file, sidecar)?;
-        ZstdEncoder::new(file, 1)
-    }
-
-    fn append_and_remove_sidecar(canonical: &mut File, sidecar: &str) -> io::Result<()> {
-        Self::append_sidecar(canonical, sidecar)?;
-        match std::fs::remove_file(sidecar) {
-            Ok(()) => info!(
-                sidecar,
-                "switch complete; merged and removed overlap sidecar"
-            ),
-            Err(error) => warn!(
-                sidecar,
-                %error,
-                "switch complete; merged overlap sidecar but failed to remove it"
-            ),
-        }
-        Ok(())
-    }
-
-    fn try_merge_owned_sidecar(path: &str, date_str: &str, sidecar: &str) -> io::Result<bool> {
-        let Some(mut canonical) = Self::try_lock_canonical_file(path, date_str)? else {
-            return Ok(false);
-        };
-        Self::append_and_remove_sidecar(&mut canonical, sidecar)?;
-        Ok(true)
-    }
-
-    fn merge_pending_sidecars(&mut self) -> io::Result<()> {
-        let pending = std::mem::take(&mut self.pending_sidecars);
-        for (date_str, sidecar) in pending {
-            match Self::try_merge_owned_sidecar(&self.path, &date_str, &sidecar) {
-                Ok(true) => {}
-                Ok(false) => self.pending_sidecars.push((date_str, sidecar)),
-                Err(error) => {
-                    error!(
-                        path = %sidecar,
-                        %error,
-                        "failed to append overlap sidecar after switch"
-                    );
-                    self.mark_degraded(sidecar.clone(), &error);
-                    self.merge_retry_at = Some(Instant::now() + MERGE_RETRY_BACKOFF);
-                    self.pending_sidecars.push((date_str, sidecar));
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// After a failed append of a *finished* sidecar: keep writing into it so
-    /// a later attempt can merge it, or queue it if it cannot be reopened.
-    fn resume_or_abandon_sidecar(
-        &mut self,
-        sidecar: String,
-        date_str: &str,
-        keep_writing: bool,
-    ) -> io::Result<()> {
-        match Self::resume_sidecar_encoder(&sidecar) {
-            Ok(encoder) => {
-                self.file = Some(encoder);
-                Ok(())
-            }
-            Err(resume_error) => {
-                error!(
-                    path = %sidecar,
-                    %resume_error,
-                    "failed to resume overlap sidecar after a failed merge"
-                );
-                let Some(mut canonical) = Self::try_lock_canonical_file(&self.path, date_str)?
-                else {
-                    if keep_writing {
-                        return Err(resume_error);
-                    }
-                    self.pending_sidecars.push((date_str.to_string(), sidecar));
-                    self.sidecar_path = None;
-                    return Ok(());
-                };
-                if let Err(error) = Self::append_and_remove_sidecar(&mut canonical, &sidecar) {
-                    self.mark_degraded(sidecar.clone(), &error);
-                    if keep_writing {
-                        return Err(error);
-                    }
-                    self.pending_sidecars.push((date_str.to_string(), sidecar));
-                    self.sidecar_path = None;
-                    return Ok(());
-                }
-                self.sidecar_path = None;
-                if keep_writing {
-                    self.file = Some(ZstdEncoder::new(canonical, 1)?);
-                }
-                Ok(())
-            }
-        }
-    }
-
-    /// After the incumbent releases the daily file lock, append this process's
-    /// sidecar and delete it. That is the only time the sidecar is removed.
-    ///
-    /// `keep_writing`: wrap the canonical file so later records of this UTC day
-    /// can follow. Pass false when rotating or closing — otherwise we would
-    /// finish an empty extra frame.
-    ///
-    /// The lock is probed for the open file's day (`self.day`), never for a
-    /// record's timestamp: a late pre-midnight record must not switch today's
-    /// sidecar into yesterday's file.
-    fn reclaim_canonical_if_free(&mut self, keep_writing: bool) -> io::Result<()> {
-        let Some(sidecar) = self.sidecar_path.as_deref() else {
-            return Ok(());
-        };
-        let Some(mut canonical) = Self::try_lock_canonical_file(&self.path, &self.day)? else {
-            return Ok(());
-        };
-        let sidecar = sidecar.to_owned();
-        if let Err(error) = self.finalize() {
-            error!(
-                path = %sidecar,
-                %error,
-                "failed to finalize handover sidecar before switching to the daily file"
-            );
-            self.mark_degraded(sidecar.clone(), &error);
-            // An unfinished frame must never be appended: everything after it
-            // in the daily file would be undecodable. Leave the sidecar on disk
-            // as it is and carry on in the daily file, whose lock is held here.
-            warn!(path = %sidecar, "leaving unfinished overlap sidecar on disk");
-            self.sidecar_path = None;
-            // Drop what is left of the sidecar encoder (and its lock); records
-            // still buffered go to the daily file instead.
-            self.file = None;
-            if keep_writing || !self.buf.is_empty() {
-                self.file = Some(ZstdEncoder::new(canonical, 1)?);
-            }
-            return Ok(());
-        }
-        if let Err(error) = Self::append_and_remove_sidecar(&mut canonical, &sidecar) {
-            error!(
-                path = %sidecar,
-                %error,
-                "failed to append overlap sidecar after switch"
-            );
-            self.mark_degraded(sidecar.clone(), &error);
-            self.merge_retry_at = Some(Instant::now() + MERGE_RETRY_BACKOFF);
-            drop(canonical);
-            let day = self.day.clone();
-            return self.resume_or_abandon_sidecar(sidecar, &day, keep_writing);
-        }
-        self.sidecar_path = None;
-        if keep_writing {
-            self.file = Some(ZstdEncoder::new(canonical, 1)?);
-        }
-        Ok(())
-    }
-
-    fn flush_pending(&mut self) -> io::Result<()> {
-        if self.buf.is_empty() {
-            return Ok(());
-        }
-        let file = self
-            .file
-            .as_mut()
-            .ok_or_else(|| io::Error::other(format!("{} has no open file", self.path)))?;
-        file.write_all(&self.buf)?;
-        self.buf.clear();
-        Ok(())
-    }
-
-    pub fn finalize(&mut self) -> io::Result<()> {
-        self.flush_pending()?;
-        let Some(encoder) = self.file.take() else {
-            return Ok(());
-        };
-
-        let file = encoder.finish().map_err(|error| {
-            io::Error::new(
-                error.kind(),
-                format!("failed to finish zstd stream {}: {error}", self.path),
-            )
-        })?;
-
-        // A failed fsync may already have dropped the dirty pages and marked
-        // them clean, so a retry could succeed with the data lost.
-        file.sync_all().map_err(|error| {
-            io::Error::new(
-                error.kind(),
-                format!("failed to sync {}: {error}", self.path),
-            )
-        })
-    }
-
-    pub fn write(&mut self, timestamp: Timestamp, data: bytes::Bytes) -> Result<(), io::Error> {
-        let ts_nanos = timestamp.as_nanosecond();
-        if ts_nanos >= self.next_rotation as i128 {
-            self.reclaim_canonical_if_free(false)?;
-            let finalized = self.finalize_or_degrade();
-            if let Some(sidecar) = self.sidecar_path.take() {
-                if finalized {
-                    warn!(
-                        path = %sidecar,
-                        "UTC date changed before switch; keeping the overlap sidecar until the daily file is free"
-                    );
-                    self.pending_sidecars.push((self.day.clone(), sidecar));
-                } else {
-                    warn!(
-                        path = %sidecar,
-                        "UTC date changed before switch; leaving incomplete overlap sidecar on disk"
-                    );
-                }
-            }
-            let (new_file, next_rotation, day, sidecar_path) =
-                Self::create(timestamp, &self.path, &self.run_id)?;
-            self.buf.clear();
-            self.file = Some(new_file);
-            self.next_rotation = next_rotation;
-            self.day = day;
-            self.sidecar_path = sidecar_path;
-            info!(%self.path, "date changed, file rotated");
-        }
-
-        if self
-            .merge_retry_at
-            .is_none_or(|retry_at| Instant::now() >= retry_at)
-        {
-            self.merge_retry_at = None;
-            self.reclaim_canonical_if_free(true)?;
-            self.merge_pending_sidecars()?;
-        }
-
-        if self.file.is_none() {
-            return Err(io::Error::other(format!("{} has no open file", self.path)));
-        }
-
-        let mut itoa_buf = itoa::Buffer::new();
-        self.buf
-            .put_slice(itoa_buf.format(ts_nanos as i64).as_bytes());
-        self.buf.put_u8(b' ');
-        self.buf.put(data);
-        self.buf.put_u8(b'\n');
-
-        if self.buf.len() >= ZSTD_BATCH_BYTES {
-            self.flush_pending()?;
-        }
-        Ok(())
-    }
 }
 
 impl Drop for RotatingFile {
     fn drop(&mut self) {
         if let Err(error) = self.finalize() {
-            warn!(path = %self.path, %error, "failed to finalize file on drop");
+            warn!(path = %self.prefix.display(), %error, "failed to finalize file on drop");
         }
     }
 }
@@ -645,9 +684,9 @@ impl Writer {
         if let Some(rotating_file) = self.files.get_mut(name.as_ref()) {
             rotating_file.write(recv_time, data)?;
         } else {
-            let path = format!("{}/{}", self.path, name);
+            let prefix = Path::new(&self.path).join(name.as_ref());
             let mut rotating_file =
-                RotatingFile::new(recv_time, path, self.run_id.clone(), self.quality.clone())?;
+                RotatingFile::new(recv_time, prefix, self.run_id.clone(), self.quality.clone())?;
             rotating_file.write(recv_time, data)?;
             self.files
                 .insert(Symbol::from(name.as_ref()), rotating_file);
@@ -661,7 +700,7 @@ impl Writer {
     pub fn close(&mut self) -> Result<(), anyhow::Error> {
         let mut result = Ok(());
         for (symbol, file) in &mut self.files {
-            if let Err(error) = file.reclaim_canonical_if_free(false) {
+            if let Err(error) = file.switch_to_daily(AfterSwitch::Release) {
                 error!(
                     symbol = %symbol,
                     %error,
@@ -671,17 +710,8 @@ impl Writer {
                     result = Err(error.into());
                 }
             }
-            if let Err(error) = file.merge_pending_sidecars() {
-                error!(
-                    symbol = %symbol,
-                    %error,
-                    "failed to merge overlap sidecar after switch"
-                );
-                if result.is_ok() {
-                    result = Err(error.into());
-                }
-            }
-            if file.sidecar_path.is_some() || !file.pending_sidecars.is_empty() {
+            file.merge_pending_sidecars();
+            if file.holds_sidecars() {
                 info!(
                     symbol = %symbol,
                     "closing before switch; leaving overlap sidecar on disk"
@@ -966,7 +996,8 @@ mod tests {
             .unwrap();
         assert!(
             challenger.files[&Symbol::from("btcusdt")]
-                .sidecar_path
+                .sink
+                .sidecar()
                 .is_some(),
             "challenger must use a sidecar while the daily file is locked"
         );
@@ -981,7 +1012,8 @@ mod tests {
             .unwrap();
         assert!(
             challenger.files[&Symbol::from("btcusdt")]
-                .sidecar_path
+                .sink
+                .sidecar()
                 .is_none(),
             "after the incumbent exits, writes must reclaim the canonical daily file"
         );
@@ -1380,7 +1412,7 @@ mod tests {
             std::fs::write(&path, bytes).unwrap();
             ends_on_frame_boundary(&File::open(&path).unwrap()).unwrap()
         };
-        let mut streamed = ZstdEncoder::new(Vec::new(), 1).unwrap();
+        let mut streamed = zstd::stream::write::Encoder::new(Vec::new(), 1).unwrap();
         streamed.write_all(b"streamed, no content size").unwrap();
         let streamed = streamed.finish().unwrap();
         let whole = [
@@ -1488,8 +1520,8 @@ mod tests {
             b"a",
         );
         let dev_null = File::options().write(true).open("/dev/null").unwrap();
-        writer.files.get_mut("btcusdt").unwrap().file =
-            Some(ZstdEncoder::new(dev_null, 1).unwrap());
+        writer.files.get_mut("btcusdt").unwrap().sink =
+            Sink::Daily(ZstdEncoder::new(dev_null, ZSTD_LEVEL).unwrap());
         put(
             &mut writer,
             Timestamp::from_nanosecond(1_800_086_400_000_000_000).unwrap(),
