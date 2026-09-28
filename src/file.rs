@@ -291,17 +291,46 @@ fn try_lock_daily(prefix: &Path, date: Date) -> io::Result<Option<File>> {
     fresh
 }
 
-/// End a file whose last frame is finished with its trailer and fsync it. A
+/// Why a sink could not be closed cleanly.
+#[derive(Debug, thiserror::Error)]
+enum FinalizeError {
+    /// The batch or the end of the frame was not written: the file may end
+    /// mid-frame and must never be appended.
+    #[error(transparent)]
+    Unfinished(io::Error),
+    /// The frame is finished but was not synced: the file is whole, so a
+    /// sidecar is still appended.
+    #[error(transparent)]
+    Unsynced(io::Error),
+}
+
+/// End `file`, whose last frame is finished, with its trailer and fsync it. A
 /// torn trailer is cut off again, so the file still ends on its frame.
-fn seal(file: &mut File) -> io::Result<()> {
-    let start = file.metadata()?.len();
+fn seal(file: &mut File, name: &Path) -> Result<(), FinalizeError> {
+    let failed = |what: &str, error: io::Error| {
+        io::Error::new(
+            error.kind(),
+            format!("failed to {what} {}: {error}", name.display()),
+        )
+    };
+    let start = file
+        .metadata()
+        .map_err(|error| FinalizeError::Unsynced(failed("stat", error)))?
+        .len();
     if let Err(error) = file.write_all(&trailer(start)) {
-        file.set_len(start)?;
-        return Err(error);
+        let error = failed("write the trailer of", error);
+        return Err(match file.set_len(start) {
+            Ok(()) => FinalizeError::Unsynced(error),
+            Err(_) => FinalizeError::Unfinished(error),
+        });
     }
+    #[cfg(test)]
+    fault::check(fault::Step::Sync)
+        .map_err(|error| FinalizeError::Unsynced(failed("sync", error)))?;
     // A failed fsync may already have dropped the dirty pages and marked them
     // clean, so a retry could succeed with the data lost.
     file.sync_all()
+        .map_err(|error| FinalizeError::Unsynced(failed("sync", error)))
 }
 
 /// What became of a finished sidecar.
@@ -569,20 +598,19 @@ impl RotatingFile {
     fn rotate(&mut self, timestamp: Timestamp) -> io::Result<()> {
         let switched = self.switch_to_daily(AfterSwitch::Release)?;
         self.retry.record(switched);
-        let finalized = match self.finalize() {
-            Ok(()) => true,
-            Err(error) => {
-                error!(
-                    path = %self.prefix.display(),
-                    %error,
-                    "failed to finalize file on rotation; continuing with the new file"
-                );
-                self.mark_degraded(self.prefix.display().to_string(), &error);
-                false
-            }
-        };
+        let finalized = self.finalize();
+        if let Err(error) = &finalized {
+            error!(
+                path = %self.prefix.display(),
+                %error,
+                "failed to finalize file on rotation; continuing with the new file"
+            );
+            self.mark_degraded(self.prefix.display().to_string(), error);
+        }
+        // A finished frame is whole even if its sync failed.
+        let whole = !matches!(finalized, Err(FinalizeError::Unfinished(_)));
         match mem::replace(&mut self.sink, Sink::Closed) {
-            Sink::Sidecar { path, .. } | Sink::SealedSidecar(path) if finalized => {
+            Sink::Sidecar { path, .. } | Sink::SealedSidecar(path) if whole => {
                 warn!(
                     path = %path.display(),
                     "UTC date changed before switch; keeping the overlap sidecar until the daily file is free"
@@ -624,23 +652,34 @@ impl RotatingFile {
             }
         };
         let sidecar = sidecar.to_path_buf();
-        if let Err(error) = self.finalize() {
-            error!(
-                path = %sidecar.display(),
-                %error,
-                "failed to finalize handover sidecar before switching to the daily file"
-            );
-            self.mark_degraded(sidecar.display().to_string(), &error);
-            // An unfinished frame must never be appended.
-            warn!(path = %sidecar.display(), "leaving unfinished overlap sidecar on disk");
-            // Records the sidecar did not take go to the daily file.
-            let after = if self.batch.is_empty() {
-                after
-            } else {
-                AfterSwitch::Continue
-            };
-            self.continue_in(daily, after)?;
-            return Ok(Progress::Done);
+        match self.finalize() {
+            Ok(()) => {}
+            Err(FinalizeError::Unsynced(error)) => {
+                error!(
+                    path = %sidecar.display(),
+                    %error,
+                    "handover sidecar is finished but not synced; appending it anyway"
+                );
+                self.mark_degraded(sidecar.display().to_string(), &error);
+            }
+            Err(FinalizeError::Unfinished(error)) => {
+                error!(
+                    path = %sidecar.display(),
+                    %error,
+                    "failed to finalize handover sidecar before switching to the daily file"
+                );
+                self.mark_degraded(sidecar.display().to_string(), &error);
+                // An unfinished frame must never be appended.
+                warn!(path = %sidecar.display(), "leaving unfinished overlap sidecar on disk");
+                // Records the sidecar did not take go to the daily file.
+                let after = if self.batch.is_empty() {
+                    after
+                } else {
+                    AfterSwitch::Continue
+                };
+                self.continue_in(daily, after)?;
+                return Ok(Progress::Done);
+            }
         }
         match merge_sidecar(&mut daily, &sidecar) {
             Ok(Merge::Appended) => {}
@@ -767,8 +806,8 @@ impl RotatingFile {
     /// Flush the batch, finish the open zstd frame, end the file with its
     /// trailer and fsync it. A finished sidecar stays the sink until it is
     /// appended.
-    fn finalize(&mut self) -> io::Result<()> {
-        self.flush_batch()?;
+    fn finalize(&mut self) -> Result<(), FinalizeError> {
+        self.flush_batch().map_err(FinalizeError::Unfinished)?;
         let encoder = match mem::replace(&mut self.sink, Sink::Closed) {
             Sink::Daily(encoder) => encoder,
             Sink::Sidecar { encoder, path } => {
@@ -780,21 +819,18 @@ impl RotatingFile {
                 return Ok(());
             }
         };
+        #[cfg(test)]
+        fault::check(fault::Step::Finish).map_err(FinalizeError::Unfinished)?;
         let mut file = encoder.finish().map_err(|error| {
-            io::Error::new(
+            FinalizeError::Unfinished(io::Error::new(
                 error.kind(),
                 format!(
                     "failed to finish zstd stream {}: {error}",
                     self.prefix.display()
                 ),
-            )
+            ))
         })?;
-        seal(&mut file).map_err(|error| {
-            io::Error::new(
-                error.kind(),
-                format!("failed to sync {}: {error}", self.prefix.display()),
-            )
-        })
+        seal(&mut file, &self.prefix)
     }
 
     fn mark_degraded(&mut self, target: String, error: impl fmt::Display) {
@@ -898,8 +934,10 @@ mod fault {
         SetAside,
         Append,
         Resume,
+        Finish,
+        Sync,
     }
-    const STEPS: usize = 5;
+    const STEPS: usize = 7;
 
     thread_local! {
         static ARMED: Cell<[u32; STEPS]> = const { Cell::new([0; STEPS]) };
@@ -1557,6 +1595,68 @@ mod tests {
         backoff.record(Progress::Done);
         assert!(backoff.ready());
         assert_eq!(backoff.failures, 0);
+    }
+
+    #[test]
+    fn a_finished_sidecar_whose_sync_failed_is_still_appended() {
+        let dir = test_dir("unsynced-switch");
+        let mut incumbent = writer(&dir, "incumbent");
+        put(&mut incumbent, day_one(), br#"{"n":1}"#);
+        let (quality, events) = QualityReporter::test_channel();
+        let mut challenger = Writer::new(&dir, "challenger", quality);
+        put(&mut challenger, day_one(), br#"{"n":2}"#);
+        incumbent.close().unwrap();
+        fault::arm(fault::Step::Sync, 1);
+
+        put(&mut challenger, day_one(), br#"{"n":3}"#);
+        assert!(matches!(
+            events.try_recv(),
+            Ok(QualityEvent::StorageDegraded { error, .. }) if error.contains("failed to sync")
+        ));
+        assert_eq!(names(&dir), [DAY_ONE], "the whole sidecar must be appended");
+        challenger.close().unwrap_err();
+        let text = decoded(dir.join(DAY_ONE));
+        for record in [r#"{"n":1}"#, r#"{"n":2}"#, r#"{"n":3}"#] {
+            assert!(text.contains(record), "{record} missing: {text}");
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_unsynced_sidecar_sealed_at_midnight_is_queued() {
+        let dir = test_dir("unsynced-midnight");
+        let mut incumbent = writer(&dir, "incumbent");
+        put(&mut incumbent, day_one(), br#"{"n":1}"#);
+        let mut challenger = writer(&dir, "challenger");
+        put(&mut challenger, day_one(), br#"{"n":2}"#);
+        fault::arm(fault::Step::Sync, 1);
+        put(&mut challenger, day_two(), br#"{"n":3}"#);
+        assert_eq!(challenger.files["btcusdt"].pending_sidecars.len(), 1);
+
+        incumbent.close().unwrap();
+        challenger.close().unwrap_err();
+        assert_eq!(names(&dir), [DAY_ONE, DAY_TWO]);
+        assert!(decoded(dir.join(DAY_ONE)).contains(r#"{"n":2}"#));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_unfinished_sidecar_is_left_on_disk() {
+        let dir = test_dir("unfinished-switch");
+        let mut incumbent = writer(&dir, "incumbent");
+        put(&mut incumbent, day_one(), br#"{"n":1}"#);
+        let mut challenger = writer(&dir, "challenger");
+        put(&mut challenger, day_one(), br#"{"n":2}"#);
+        incumbent.close().unwrap();
+        fault::arm(fault::Step::Finish, 1);
+
+        put(&mut challenger, day_one(), br#"{"n":3}"#);
+        assert!(matches!(challenger.files["btcusdt"].sink, Sink::Daily(_)));
+        challenger.close().unwrap_err();
+        assert!(has_sidecar(&dir, "challenger"), "it must never be appended");
+        let text = decoded(dir.join(DAY_ONE));
+        assert!(text.contains(r#"{"n":3}"#), "{text}");
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
