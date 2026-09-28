@@ -20,13 +20,19 @@ does it request takeover. A disconnect or dropped delivery restarts the overlap
 grace; the incumbent then drains, fsyncs, and exits only after a healthy
 request.
 
+A collector stopped by a signal releases the handover socket at once, before
+its drain, so a replacement started right away (as `run_collector.sh` does
+after `tmux kill-session`) becomes the incumbent; one that had already
+connected chooses its role again instead of failing.
+
 Steady-state recordings use one file per symbol per UTC day:
 `<symbol>_<UTC-date>.zst`. During handover overlap the challenger writes a
 run-local sidecar. After the incumbent releases the daily file lock (the
 switch), that sidecar's finished zstd frame is appended into
-`<symbol>_<UTC-date>.zst` and the sidecar is deleted. If the challenger exits
-before the switch, the sidecar stays on disk. Overlap intentionally favors no
-gaps over no duplicates.
+`<symbol>_<UTC-date>.zst`, followed by a fresh clean-close trailer (a 24-byte
+skippable frame that zstd readers skip), and the sidecar is deleted. If the
+challenger exits before the switch, the sidecar stays on disk. Overlap
+intentionally favors no gaps over no duplicates.
 
 The first upgrade from a binary without UDS support is necessarily a normal
 stop/start. Existing deployment scripts that stop the old tmux session must be

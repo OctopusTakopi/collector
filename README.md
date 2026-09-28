@@ -39,13 +39,18 @@ What we added on top of the original process:
 * A daily file left mid-frame by a crash is never appended to, since a decoder
   cannot step past a truncated frame: the next writer moves it aside to
   `<symbol>_<date>_unterminated-<ns>.zst` and starts the day in a fresh file.
+  Every file the collector closes, and every merge, ends with a 24-byte zstd
+  skippable frame (the clean-close trailer), so that check is one read instead
+  of a walk over every block; `zstd -dc` and other libzstd readers skip it.
 * A `_quality_<run-id>.jsonl` next to the data when frames are dropped or the
   writer cannot fsync.
 * `gap_detector`, which scans a directory tree for recv-time holes and venue
   sequence breaks.
 
 `scripts/run_collector.sh` is a first-start helper. It kills the existing tmux
-session, so it is the wrong tool for a rolling upgrade.
+session, so it is the wrong tool for a rolling upgrade. The SIGHUP that
+`tmux kill-session` sends drains and closes the files like SIGTERM, unless
+SIGHUP was already ignored when the collector started (e.g. under `nohup`).
 
 ## Build and run
 
