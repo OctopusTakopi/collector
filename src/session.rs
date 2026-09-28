@@ -333,6 +333,8 @@ where
                     Delivery::Dropped => false,
                     Delivery::Closed => return End::Finished,
                 };
+                // Lease first: going live may retire an older session at once.
+                producer.set_live(market_delivered && protocol.subscribed());
                 protocol.delivered();
             }
             OpCode::Ping => {
