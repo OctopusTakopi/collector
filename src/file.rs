@@ -30,10 +30,12 @@ const ZSTD_LEVEL: i32 = 1;
 /// Uncompressed bytes batched before they are handed to zstd: one compressor
 /// block, so zstd is not called once per websocket frame.
 const ZSTD_BATCH_BYTES: usize = 128 * 1024;
-/// A failed sidecar merge is not retried before this: an attempt walks and
-/// fsyncs the daily file, so retrying on every record would stall the writer
-/// for every symbol.
+/// A failed merge or reclaim is not retried before this, doubled per
+/// consecutive failure up to `MERGE_RETRY_MAX`: an attempt may walk and fsync
+/// the daily file, so retrying on every record would stall the writer for
+/// every symbol.
 const MERGE_RETRY_BACKOFF: Duration = Duration::from_secs(5);
+const MERGE_RETRY_MAX: Duration = Duration::from_secs(600);
 const ZSTD_MAGIC: u32 = 0xFD2F_B528;
 const SKIPPABLE_MAGIC: u32 = 0x184D_2A50;
 const SKIPPABLE_MAGIC_MASK: u32 = 0xFFFF_FFF0;
@@ -412,6 +414,47 @@ enum AfterSwitch {
     Release,
 }
 
+/// What a merge or reclaim attempt came to. Ordered so that combining
+/// attempts keeps the outcome the backoff must see.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Progress {
+    /// Nothing to do, or another writer still holds the daily file.
+    Idle,
+    Done,
+    Failed,
+}
+
+/// When merges and reclaims may be attempted again.
+#[derive(Default)]
+struct Backoff {
+    failures: u32,
+    until: Option<Instant>,
+}
+
+impl Backoff {
+    fn ready(&self) -> bool {
+        self.until.is_none_or(|until| Instant::now() >= until)
+    }
+
+    fn record(&mut self, progress: Progress) {
+        match progress {
+            Progress::Idle => {}
+            Progress::Done => *self = Self::default(),
+            Progress::Failed => {
+                self.until = Some(Instant::now() + retry_delay(self.failures));
+                self.failures = self.failures.saturating_add(1);
+            }
+        }
+    }
+}
+
+/// The wait after a failure that follows `failures` consecutive ones.
+fn retry_delay(failures: u32) -> Duration {
+    MERGE_RETRY_BACKOFF
+        .saturating_mul(2_u32.saturating_pow(failures))
+        .min(MERGE_RETRY_MAX)
+}
+
 /// A sidecar sealed at UTC midnight, still owned by this run, appended once
 /// its day's file is free.
 struct PendingSidecar {
@@ -434,9 +477,8 @@ struct RotatingFile {
     /// A file could not be finalized or a sidecar not merged. Collection
     /// continues, but close must not report a clean exit.
     degraded: bool,
-    /// Set after a sidecar merge failed; no switch or merge is attempted
-    /// before then.
-    merge_retry_at: Option<Instant>,
+    /// No switch or merge is attempted before a failed one's backoff ends.
+    retry: Backoff,
     quality: QualityReporter,
 }
 
@@ -456,7 +498,7 @@ impl RotatingFile {
             pending_sidecars: Vec::new(),
             batch: BytesMut::with_capacity(ZSTD_BATCH_BYTES),
             degraded: false,
-            merge_retry_at: None,
+            retry: Backoff::default(),
             quality,
         };
         file.sink = file.open_sink(day.date)?;
@@ -473,7 +515,10 @@ impl RotatingFile {
                 path = %path.display(),
                 "daily file busy; writing a run-local sidecar until the incumbent releases it"
             ),
-            Err(error) => self.daily_unusable(date, &error),
+            Err(error) => {
+                self.daily_unusable(date, &error);
+                self.retry.record(Progress::Failed);
+            }
         }
         let file = File::options().create_new(true).write(true).open(&path)?;
         lock_exclusively(&file, &path)?;
@@ -483,8 +528,7 @@ impl RotatingFile {
         })
     }
 
-    /// The day's file could not be locked, verified or set aside: report it,
-    /// and probe it again only after the backoff.
+    /// The day's file could not be locked, verified or set aside.
     fn daily_unusable(&mut self, date: Date, error: &io::Error) {
         let daily = day_file(&self.prefix, date, format_args!(""));
         error!(
@@ -493,20 +537,16 @@ impl RotatingFile {
             "cannot use the daily file; records go to a run-local sidecar meanwhile"
         );
         self.mark_degraded(daily.display().to_string(), error);
-        self.merge_retry_at = Some(Instant::now() + MERGE_RETRY_BACKOFF);
     }
 
     fn write(&mut self, timestamp: Timestamp, data: Bytes) -> io::Result<()> {
         if timestamp >= self.day.end {
             self.rotate(timestamp)?;
         }
-        if self
-            .merge_retry_at
-            .is_none_or(|retry_at| Instant::now() >= retry_at)
-        {
-            self.merge_retry_at = None;
-            self.switch_to_daily(AfterSwitch::Continue)?;
-            self.merge_pending_sidecars();
+        if self.retry.ready() {
+            let switched = self.switch_to_daily(AfterSwitch::Continue)?;
+            let merged = self.merge_pending_sidecars();
+            self.retry.record(switched.max(merged));
         }
         if self.sink.encoder().is_none() {
             return Err(no_open_file(&self.prefix));
@@ -527,7 +567,8 @@ impl RotatingFile {
     /// Finish the day's file, queue a sidecar that could not be switched yet,
     /// and open the next day's file.
     fn rotate(&mut self, timestamp: Timestamp) -> io::Result<()> {
-        self.switch_to_daily(AfterSwitch::Release)?;
+        let switched = self.switch_to_daily(AfterSwitch::Release)?;
+        self.retry.record(switched);
         let finalized = match self.finalize() {
             Ok(()) => true,
             Err(error) => {
@@ -568,18 +609,18 @@ impl RotatingFile {
 
     /// Once the incumbent has released the daily file, append this run's
     /// sidecar to it and delete the sidecar — the only time one is removed.
-    /// Failures are reported and retried after the backoff; only opening an
-    /// encoder on the daily file fails this.
-    fn switch_to_daily(&mut self, after: AfterSwitch) -> io::Result<()> {
+    /// Failures are reported for the backoff; only opening an encoder on the
+    /// daily file fails this.
+    fn switch_to_daily(&mut self, after: AfterSwitch) -> io::Result<Progress> {
         let Some(sidecar) = self.sink.sidecar() else {
-            return Ok(());
+            return Ok(Progress::Idle);
         };
         let mut daily = match try_lock_daily(&self.prefix, self.day.date) {
             Ok(Some(daily)) => daily,
-            Ok(None) => return Ok(()),
+            Ok(None) => return Ok(Progress::Idle),
             Err(error) => {
                 self.daily_unusable(self.day.date, &error);
-                return Ok(());
+                return Ok(Progress::Failed);
             }
         };
         let sidecar = sidecar.to_path_buf();
@@ -598,7 +639,8 @@ impl RotatingFile {
             } else {
                 AfterSwitch::Continue
             };
-            return self.continue_in(daily, after);
+            self.continue_in(daily, after)?;
+            return Ok(Progress::Done);
         }
         match merge_sidecar(&mut daily, &sidecar) {
             Ok(Merge::Appended) => {}
@@ -610,11 +652,12 @@ impl RotatingFile {
                     "failed to append overlap sidecar after switch"
                 );
                 self.mark_degraded(sidecar.display().to_string(), &error);
-                self.merge_retry_at = Some(Instant::now() + MERGE_RETRY_BACKOFF);
-                return self.resume_or_queue_sidecar(sidecar, daily, after);
+                self.resume_or_queue_sidecar(sidecar, daily, after)?;
+                return Ok(Progress::Failed);
             }
         }
-        self.continue_in(daily, after)
+        self.continue_in(daily, after)?;
+        Ok(Progress::Done)
     }
 
     /// After a failed append of a finished sidecar: reopen it, so the day's
@@ -664,7 +707,8 @@ impl RotatingFile {
         Ok(())
     }
 
-    fn merge_pending_sidecars(&mut self) {
+    fn merge_pending_sidecars(&mut self) -> Progress {
+        let mut progress = Progress::Idle;
         for sidecar in mem::take(&mut self.pending_sidecars) {
             // This run holds that daily file: the sidecar goes in once the
             // file is released, at rotation or close.
@@ -672,10 +716,16 @@ impl RotatingFile {
                 self.pending_sidecars.push(sidecar);
                 continue;
             }
-            match merge_into_daily(&self.prefix, sidecar.date, &sidecar.path) {
-                Ok(Some(Merge::Appended)) => {}
-                Ok(Some(Merge::Unterminated)) => self.sidecar_unterminated(&sidecar.path),
-                Ok(None) => self.pending_sidecars.push(sidecar),
+            let step = match merge_into_daily(&self.prefix, sidecar.date, &sidecar.path) {
+                Ok(Some(Merge::Appended)) => Progress::Done,
+                Ok(Some(Merge::Unterminated)) => {
+                    self.sidecar_unterminated(&sidecar.path);
+                    Progress::Done
+                }
+                Ok(None) => {
+                    self.pending_sidecars.push(sidecar);
+                    Progress::Idle
+                }
                 Err(error) => {
                     error!(
                         path = %sidecar.path.display(),
@@ -683,11 +733,13 @@ impl RotatingFile {
                         "failed to append overlap sidecar after switch"
                     );
                     self.mark_degraded(sidecar.path.display().to_string(), &error);
-                    self.merge_retry_at = Some(Instant::now() + MERGE_RETRY_BACKOFF);
                     self.pending_sidecars.push(sidecar);
+                    Progress::Failed
                 }
-            }
+            };
+            progress = progress.max(step);
         }
+        progress
     }
 
     fn sidecar_unterminated(&mut self, sidecar: &Path) {
@@ -1476,7 +1528,7 @@ mod tests {
         put(&mut writer, day_one(), b"backing-off");
         assert!(has_sidecar(&dir, "restart"), "no retry before the backoff");
 
-        writer.files.get_mut("btcusdt").unwrap().merge_retry_at = None;
+        writer.files.get_mut("btcusdt").unwrap().retry = Backoff::default();
         put(&mut writer, day_one(), b"after");
         writer.close().unwrap_err();
         assert!(!has_sidecar(&dir, "restart"));
@@ -1485,6 +1537,26 @@ mod tests {
             assert!(text.contains(record), "{record} missing: {text}");
         }
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn failed_merges_back_off_exponentially_until_a_success() {
+        let delays: Vec<u64> = (0..9).map(|n| retry_delay(n).as_secs()).collect();
+        assert_eq!(delays, [5, 10, 20, 40, 80, 160, 320, 600, 600]);
+        assert_eq!(retry_delay(u32::MAX), MERGE_RETRY_MAX);
+
+        let mut backoff = Backoff::default();
+        assert!(backoff.ready());
+        backoff.record(Progress::Failed);
+        backoff.record(Progress::Failed);
+        assert!(!backoff.ready());
+        assert_eq!(backoff.failures, 2);
+        // A daily file still held elsewhere is neither failure nor success.
+        backoff.record(Progress::Idle);
+        assert_eq!(backoff.failures, 2);
+        backoff.record(Progress::Done);
+        assert!(backoff.ready());
+        assert_eq!(backoff.failures, 0);
     }
 
     #[test]
