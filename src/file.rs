@@ -25,7 +25,6 @@ pub struct WriteRecord {
     pub data: bytes::Bytes,
 }
 
-const SYNC_ATTEMPTS: u32 = 3;
 /// Uncompressed bytes accumulated before they are handed to zstd. Matches the
 /// compressor's block size so we do not call into it once per websocket frame.
 const ZSTD_BATCH_BYTES: usize = 128 * 1024;
@@ -551,25 +550,12 @@ impl RotatingFile {
             )
         })?;
 
-        for attempt in 1..SYNC_ATTEMPTS {
-            match file.sync_all() {
-                Ok(()) => {
-                    let _ = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
-                    return Ok(());
-                }
-                Err(error) => {
-                    warn!(path = %self.path, attempt, %error, "sync_all failed; retrying");
-                    std::thread::sleep(Duration::from_millis(25 * u64::from(attempt)));
-                }
-            }
-        }
+        // A failed fsync may already have dropped the dirty pages and marked
+        // them clean, so a retry could succeed with the data lost.
         file.sync_all().map_err(|error| {
             io::Error::new(
                 error.kind(),
-                format!(
-                    "failed to sync {} after {SYNC_ATTEMPTS} attempts: {error}",
-                    self.path
-                ),
+                format!("failed to sync {}: {error}", self.path),
             )
         })?;
         let _ = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
@@ -1494,6 +1480,37 @@ mod tests {
         for payload in [&b"incumbent-day-two"[..], b"sidecar-day-two", b"late"] {
             assert!(contains(&day_two, payload), "day two missing {payload:?}");
         }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// fsync(2) on /dev/null fails with EINVAL, standing in for a disk error.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn failed_fsync_is_reported_and_fails_close() {
+        let dir = test_dir("fsync");
+        let (quality, events) = QualityReporter::test_channel();
+        let mut writer = Writer::new(dir.to_str().unwrap(), "fsync", quality);
+        put(
+            &mut writer,
+            Timestamp::from_nanosecond(1_800_000_000_000_000_000).unwrap(),
+            b"a",
+        );
+        let dev_null = File::options().write(true).open("/dev/null").unwrap();
+        writer.files.get_mut("btcusdt").unwrap().file =
+            Some(ZstdEncoder::new(dev_null, 1).unwrap());
+        put(
+            &mut writer,
+            Timestamp::from_nanosecond(1_800_086_400_000_000_000).unwrap(),
+            b"b",
+        );
+        assert!(
+            matches!(events.try_recv(), Ok(QualityEvent::StorageDegraded { error, .. }) if error.contains("failed to sync")),
+            "a failed fsync must be reported"
+        );
+        assert!(
+            writer.close().is_err(),
+            "close must not report a clean exit"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
