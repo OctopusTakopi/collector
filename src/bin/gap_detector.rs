@@ -1457,101 +1457,112 @@ fn write_output(
     args: &Args,
 ) -> Result<usize, fmt::Error> {
     let min_gap_ns = min_gap_ns(args);
+    let mut totals = Totals::default();
     writeln!(out)?;
     for report in reports {
         write_report(out, report, min_gap_ns, args.max_reported, args.exact)?;
+        totals.add(report);
     }
-    let foreign_files: usize = reports
-        .iter()
-        .flat_map(|r| &r.files)
-        .filter(|f| f.foreign)
-        .count();
-    let decode_errors: usize = reports
-        .iter()
-        .flat_map(|r| &r.files)
-        .filter(|f| f.decode_error.is_some())
-        .count();
-    let recv_gaps: usize = reports.iter().map(|r| r.gaps.len()).sum();
-    let gap_series = reports.iter().filter(|r| !r.gaps.is_empty()).count();
-    let silence_total: i64 = reports
-        .iter()
-        .flat_map(|r| &r.gaps)
-        .map(|g| g.end - g.start)
-        .sum();
-    let fwd_events: u64 = reports
-        .iter()
-        .flat_map(|r| &r.streams)
-        .map(|stream| stream.stats.seq_fwd_events)
-        .sum();
-    let fwd_ids: u64 = reports
-        .iter()
-        .flat_map(|r| &r.streams)
-        .map(|stream| stream.stats.seq_fwd_ids)
-        .sum();
-    let net_positive: i64 = reports
-        .iter()
-        .flat_map(|r| &r.streams)
-        .map(|stream| stream.stats.net_deficit().max(0))
-        .sum();
-    let exact_missing: u64 = reports
-        .iter()
-        .flat_map(|r| &r.streams)
-        .map(|stream| stream.stats.exact_missing)
-        .sum();
-    let back_events: u64 = reports
-        .iter()
-        .flat_map(|r| &r.streams)
-        .map(|stream| stream.stats.seq_back_events)
-        .sum();
-    let time_regressions: u64 = reports
-        .iter()
-        .flat_map(|r| &r.streams)
-        .map(|stream| stream.stats.time_regressions)
-        .sum();
-    let missing_dates: usize = reports.iter().map(|r| r.missing_dates.len()).sum();
-    let bad_lines: u64 = reports.iter().map(|r| r.bad_lines).sum();
-    let rows: u64 = reports.iter().map(|r| r.rows).sum();
-    let with_issues = reports.iter().filter(|r| r.has_issues()).count();
+    totals.write(out, args)?;
+    Ok(totals.with_issues)
+}
 
-    writeln!(out, "SUMMARY")?;
-    writeln!(out, "  series scanned        : {}", reports.len())?;
-    writeln!(out, "  rows decoded          : {}", grouped(rows))?;
-    writeln!(
-        out,
-        "  recv gaps > {}s  : {} across {} series (total silence {})",
-        args.min_gap,
-        recv_gaps,
-        gap_series,
-        fmt_dur(silence_total)
-    )?;
-    writeln!(
-        out,
-        "  forward chain breaks  : {} event(s), {} ids",
-        grouped(fwd_events),
-        grouped(fwd_ids)
-    )?;
-    if args.exact {
-        writeln!(out, "  exact missing ids     : {}", grouped(exact_missing))?;
-    } else {
+/// Sums over every series for the SUMMARY block.
+#[derive(Default)]
+struct Totals {
+    series: usize,
+    rows: u64,
+    recv_gaps: usize,
+    gap_series: usize,
+    silence: i64,
+    fwd_events: u64,
+    fwd_ids: u64,
+    net_missing: i64,
+    exact_missing: u64,
+    back_events: u64,
+    time_regressions: u64,
+    missing_dates: usize,
+    decode_errors: usize,
+    bad_lines: u64,
+    foreign_files: usize,
+    with_issues: usize,
+}
+
+impl Totals {
+    fn add(&mut self, report: &SeriesReport) {
+        self.series += 1;
+        self.rows += report.rows;
+        self.recv_gaps += report.gaps.len();
+        self.gap_series += usize::from(!report.gaps.is_empty());
+        self.silence += report.gaps.iter().map(|g| g.end - g.start).sum::<i64>();
+        for s in report.streams.iter().map(|stream| &stream.stats) {
+            self.fwd_events += s.seq_fwd_events;
+            self.fwd_ids += s.seq_fwd_ids;
+            self.net_missing += s.net_deficit().max(0);
+            self.exact_missing += s.exact_missing;
+            self.back_events += s.seq_back_events;
+            self.time_regressions += s.time_regressions;
+        }
+        self.missing_dates += report.missing_dates.len();
+        for file in &report.files {
+            self.decode_errors += usize::from(file.decode_error.is_some());
+            self.foreign_files += usize::from(file.foreign);
+        }
+        self.bad_lines += report.bad_lines;
+        self.with_issues += usize::from(report.has_issues());
+    }
+
+    fn write(&self, out: &mut impl fmt::Write, args: &Args) -> fmt::Result {
+        writeln!(out, "SUMMARY")?;
+        writeln!(out, "  series scanned        : {}", self.series)?;
+        writeln!(out, "  rows decoded          : {}", grouped(self.rows))?;
         writeln!(
             out,
-            "  net missing ids       : {} (range accounting)",
-            grouped(net_positive as u64)
+            "  recv gaps > {}s  : {} across {} series (total silence {})",
+            args.min_gap,
+            self.recv_gaps,
+            self.gap_series,
+            fmt_dur(self.silence)
         )?;
+        writeln!(
+            out,
+            "  forward chain breaks  : {} event(s), {} ids",
+            grouped(self.fwd_events),
+            grouped(self.fwd_ids)
+        )?;
+        if args.exact {
+            writeln!(
+                out,
+                "  exact missing ids     : {}",
+                grouped(self.exact_missing)
+            )?;
+        } else {
+            writeln!(
+                out,
+                "  net missing ids       : {} (range accounting)",
+                grouped(self.net_missing as u64)
+            )?;
+        }
+        writeln!(
+            out,
+            "  dup/reordered events  : {}",
+            grouped(self.back_events)
+        )?;
+        writeln!(
+            out,
+            "  time regressions      : {}",
+            grouped(self.time_regressions)
+        )?;
+        writeln!(out, "  missing dates         : {}", self.missing_dates)?;
+        writeln!(out, "  decode errors         : {}", self.decode_errors)?;
+        writeln!(out, "  bad lines             : {}", grouped(self.bad_lines))?;
+        writeln!(
+            out,
+            "  foreign files         : {} (skipped)",
+            self.foreign_files
+        )?;
+        writeln!(out, "RESULT: issues found in {} series", self.with_issues)
     }
-    writeln!(out, "  dup/reordered events  : {}", grouped(back_events))?;
-    writeln!(
-        out,
-        "  time regressions      : {}",
-        grouped(time_regressions)
-    )?;
-    writeln!(out, "  missing dates         : {missing_dates}")?;
-    writeln!(out, "  decode errors         : {decode_errors}")?;
-    writeln!(out, "  bad lines             : {}", grouped(bad_lines))?;
-    writeln!(out, "  foreign files         : {foreign_files} (skipped)")?;
-
-    writeln!(out, "RESULT: issues found in {with_issues} series")?;
-    Ok(with_issues)
 }
 
 #[cfg(test)]
