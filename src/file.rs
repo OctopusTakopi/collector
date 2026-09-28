@@ -658,18 +658,18 @@ impl Drop for RotatingFile {
 }
 
 pub struct Writer {
-    path: String,
+    dir: PathBuf,
     run_id: String,
     files: HashMap<Symbol, RotatingFile>,
     quality: QualityReporter,
 }
 
 impl Writer {
-    pub fn new(path: &str, run_id: &str, quality: QualityReporter) -> Self {
+    pub fn new(dir: impl AsRef<Path>, run_id: &str, quality: QualityReporter) -> Self {
         Self {
-            path: path.to_string(),
+            dir: dir.as_ref().to_path_buf(),
             run_id: run_id.to_owned(),
-            files: Default::default(),
+            files: HashMap::new(),
             quality,
         }
     }
@@ -678,69 +678,51 @@ impl Writer {
         &mut self,
         recv_time: Timestamp,
         symbol: Symbol,
-        data: bytes::Bytes,
-    ) -> Result<(), anyhow::Error> {
-        let name = encode_symbol(&symbol);
-        if let Some(rotating_file) = self.files.get_mut(name.as_ref()) {
-            rotating_file.write(recv_time, data)?;
-        } else {
-            let prefix = Path::new(&self.path).join(name.as_ref());
-            let mut rotating_file =
-                RotatingFile::new(recv_time, prefix, self.run_id.clone(), self.quality.clone())?;
-            rotating_file.write(recv_time, data)?;
-            self.files
-                .insert(Symbol::from(name.as_ref()), rotating_file);
+        data: Bytes,
+    ) -> anyhow::Result<()> {
+        if let Some(file) = self.files.get_mut(&symbol) {
+            return Ok(file.write(recv_time, data)?);
         }
+        // Distinct symbols never share a file: the encoding is injective.
+        let prefix = self.dir.join(&*encode_symbol(&symbol));
+        let mut file =
+            RotatingFile::new(recv_time, prefix, self.run_id.clone(), self.quality.clone())?;
+        file.write(recv_time, data)?;
+        self.files.insert(symbol, file);
         Ok(())
     }
 
-    /// If the switch has finished, any sidecar this process owns is appended
-    /// and deleted first. If the incumbent still holds the daily file, the
-    /// sidecar is sealed and left on disk.
-    pub fn close(&mut self) -> Result<(), anyhow::Error> {
-        let mut result = Ok(());
+    /// Append and delete every sidecar whose daily file is free, then seal
+    /// what is left: a sidecar whose daily file the incumbent still holds
+    /// stays on disk. Every file is closed even after an error; the first
+    /// one is returned.
+    pub fn close(&mut self) -> anyhow::Result<()> {
+        let mut first_error = None;
         for (symbol, file) in &mut self.files {
             if let Err(error) = file.switch_to_daily(AfterSwitch::Release) {
-                error!(
-                    symbol = %symbol,
-                    %error,
-                    "failed to merge overlap sidecar after switch"
-                );
-                if result.is_ok() {
-                    result = Err(error.into());
-                }
+                error!(%symbol, %error, "failed to merge overlap sidecar after switch");
+                first_error.get_or_insert(error.into());
             }
             file.merge_pending_sidecars();
             if file.holds_sidecars() {
-                info!(
-                    symbol = %symbol,
-                    "closing before switch; leaving overlap sidecar on disk"
-                );
+                info!(%symbol, "closing before switch; leaving overlap sidecar on disk");
             }
-            let degraded = file.degraded;
             match file.finalize() {
-                Ok(()) if degraded => {
-                    error!(
-                        symbol = %symbol,
-                        "file closed, but an earlier rotation could not be finalized"
-                    );
-                    if result.is_ok() {
-                        result = Err(anyhow::anyhow!(
-                            "{symbol}: an earlier rotation could not be finalized"
-                        ));
-                    }
+                Ok(()) if file.degraded => {
+                    error!(%symbol, "file closed, but an earlier rotation could not be finalized");
+                    first_error.get_or_insert(anyhow::anyhow!(
+                        "{symbol}: an earlier rotation could not be finalized"
+                    ));
                 }
-                Ok(()) => info!(symbol = %symbol, "file closed cleanly"),
+                Ok(()) => info!(%symbol, "file closed cleanly"),
                 Err(error) => {
-                    error!(symbol = %symbol, %error, "failed to close file");
-                    if result.is_ok() {
-                        result = Err(error.into());
-                    }
+                    error!(%symbol, %error, "failed to close file");
+                    first_error.get_or_insert(error.into());
                 }
             }
         }
         self.files.clear();
-        result
+        first_error.map_or(Ok(()), Err)
     }
 }
 
