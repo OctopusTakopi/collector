@@ -61,7 +61,7 @@ Exchanges:
 | `binance` / `binancespot` | spot, depth at 100ms |
 | `binancefutures` / `binancefuturesum` | USD-M, depth at 0ms |
 | `binancefuturescm` | COIN-M, depth at 0ms (undocumented, accepted since the 2026-06-30 CM-UM integration) |
-| `bybit` | linear public topics |
+| `bybit` | linear public topics, plus the full-depth book |
 | `hyperliquid` | symbols are uppercase (`BTC`, not `btcusdt`) |
 
 Same streams as upstream for the most part. All Binance markets also
@@ -69,6 +69,14 @@ subscribe to `aggTrade`, which groups fills by taker order; spot adds
 `blockTrade` and futures add `forceOrder`. USD-M serves `aggTrade` and
 `forceOrder` on `/market`, book and trade streams on `/public`. Bybit also
 takes liquidations and `orderbook.200` instead of `.500`.
+
+Bybit's `orderbook.full` is deltas only, with no snapshot on the socket. The
+collector mixes REST snapshots into the same file: one per symbol per hour,
+and another whenever `u` skips or resets to 1. A snapshot line is the raw
+`/v5/market/full_orderbook` reply, `{"retCode":0,...,"result":{...,"u":...}}`,
+so it has no `topic`; rebuild the book from the latest snapshot and apply the
+deltas whose `u` follows its `result.u`. hftbacktest's Bybit converter skips
+those lines and folds the deltas into its fused book.
 
 ## Checking files
 

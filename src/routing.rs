@@ -215,6 +215,14 @@ pub(crate) struct BybitMessage<'a> {
     #[serde(borrow)]
     pub(crate) req_id: Option<&'a str>,
     pub(crate) success: Option<bool>,
+    #[serde(borrow)]
+    pub(crate) data: Option<&'a RawValue>,
+}
+
+/// The update id in a Bybit book frame's `data`.
+#[derive(Deserialize)]
+pub(crate) struct BybitBookUpdate {
+    pub(crate) u: u64,
 }
 
 /// The coin a Hyperliquid frame is about.

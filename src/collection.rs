@@ -90,6 +90,9 @@ impl Exchange {
                 "orderbook.1.$symbol",
                 "orderbook.50.$symbol",
                 "orderbook.200.$symbol",
+                // Full depth, deltas only; seeded by REST snapshots. Covers
+                // futures since 2026-08-11.
+                "orderbook.full.$symbol",
                 "publicTrade.$symbol",
                 "allLiquidation.$symbol",
             ],
