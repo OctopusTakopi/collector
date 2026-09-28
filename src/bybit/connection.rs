@@ -31,25 +31,24 @@ const RETRY_SWEEP_INTERVAL: Duration = Duration::from_millis(250);
 /// visible on an otherwise healthy connection.
 const DEGRADED_REPORT_INTERVAL: Duration = Duration::from_secs(60);
 
-/// One subscribe request: a symbol's topics, identified by the symbol.
+/// One subscribe request: a single topic, which is also its request id.
 pub(super) struct Group {
-    req_id: String,
-    topics: Vec<String>,
+    topic: String,
 }
 
-/// One group per symbol, with `$symbol` filled in.
+/// One group per topic of every symbol, with `$symbol` filled in.
+///
+/// Bybit rejects a whole request when any one topic in it is invalid, and
+/// delivers none of the others (checked live 2026-10-03), so a topic one symbol
+/// lacks must not travel with that symbol's other topics.
 pub(super) fn groups(topics: &[&str], symbols: &[String]) -> Arc<[Group]> {
     symbols
         .iter()
-        .map(|symbol| {
+        .flat_map(|symbol| {
             let symbol = symbol.to_uppercase();
-            Group {
-                topics: topics
-                    .iter()
-                    .map(|topic| topic.replace("$symbol", &symbol))
-                    .collect(),
-                req_id: symbol,
-            }
+            topics.iter().map(move |topic| Group {
+                topic: topic.replace("$symbol", &symbol),
+            })
         })
         .collect()
 }
@@ -86,7 +85,7 @@ impl Subscriptions {
     }
 
     fn position(&self, req_id: &str) -> Option<usize> {
-        self.groups.iter().position(|group| group.req_id == req_id)
+        self.groups.iter().position(|group| group.topic == req_id)
     }
 }
 
@@ -169,9 +168,9 @@ impl Protocol for Subscriptions {
 
 async fn subscribe(sender: &FrameSender, group: &Group) -> anyhow::Result<()> {
     let message = serde_json::to_vec(&serde_json::json!({
-        "req_id": group.req_id,
+        "req_id": group.topic,
         "op": "subscribe",
-        "args": group.topics,
+        "args": [group.topic],
     }))?;
     sender.text(message).await
 }
@@ -211,7 +210,7 @@ async fn control_loop(
                 next += 1;
             }
             Some(index) = retries.recv() => {
-                let req_id = groups[index].req_id.as_str();
+                let req_id = groups[index].topic.as_str();
                 attempts[index] += 1;
                 if attempts[index] > MAX_SUBSCRIBE_ATTEMPTS {
                     error!(
@@ -232,7 +231,7 @@ async fn control_loop(
             _ = sweep.tick(), if !pending.is_empty() => {
                 let now = Instant::now();
                 for (index, _) in pending.extract_if(.., |&mut (_, due)| due <= now) {
-                    warn!(req_id = %groups[index].req_id, "retrying rejected subscription group");
+                    warn!(req_id = %groups[index].topic, "retrying rejected subscription group");
                     if subscribe(&sender, &groups[index]).await.is_err() {
                         return;
                     }
@@ -262,16 +261,22 @@ mod tests {
         (Subscriptions::new(0, groups, retry_tx), retry_rx)
     }
 
+    /// One rejected topic must not cost a symbol its other topics.
     #[test]
-    fn groups_are_keyed_by_the_uppercased_symbol() {
+    fn every_topic_is_its_own_request() {
         let groups = groups(
-            &["orderbook.1.$symbol", "publicTrade.$symbol"],
-            &["btcusdt".to_owned()],
+            &["orderbook.1.$symbol", "orderbook.full.$symbol"],
+            &["btcusdt".to_owned(), "ETHUSDT".to_owned()],
         );
-        assert_eq!(groups[0].req_id, "BTCUSDT");
+        let topics: Vec<&str> = groups.iter().map(|group| group.topic.as_str()).collect();
         assert_eq!(
-            groups[0].topics,
-            ["orderbook.1.BTCUSDT", "publicTrade.BTCUSDT"]
+            topics,
+            [
+                "orderbook.1.BTCUSDT",
+                "orderbook.full.BTCUSDT",
+                "orderbook.1.ETHUSDT",
+                "orderbook.full.ETHUSDT"
+            ]
         );
     }
 
@@ -288,11 +293,11 @@ mod tests {
     fn readiness_requires_every_group_acknowledged() {
         let (mut subscriptions, _retries) = subscriptions();
         subscriptions
-            .control(br#"{"success":true,"req_id":"BTCUSDT","op":"subscribe"}"#)
+            .control(br#"{"success":true,"req_id":"publicTrade.BTCUSDT","op":"subscribe"}"#)
             .unwrap();
         assert!(!subscriptions.subscribed());
         subscriptions
-            .control(br#"{"success":true,"req_id":"ETHUSDT","op":"subscribe"}"#)
+            .control(br#"{"success":true,"req_id":"publicTrade.ETHUSDT","op":"subscribe"}"#)
             .unwrap();
         assert!(subscriptions.subscribed());
     }
@@ -302,7 +307,7 @@ mod tests {
     #[test]
     fn a_rejected_group_is_retried_and_revokes_readiness() {
         let (mut subscriptions, mut retries) = subscriptions();
-        for req_id in ["BTCUSDT", "ETHUSDT"] {
+        for req_id in ["publicTrade.BTCUSDT", "publicTrade.ETHUSDT"] {
             subscriptions
                 .control(
                     format!(r#"{{"success":true,"req_id":"{req_id}","op":"subscribe"}}"#)
@@ -312,7 +317,7 @@ mod tests {
         }
 
         subscriptions
-            .control(br#"{"success":false,"ret_msg":"rate limited","req_id":"ETHUSDT","op":"subscribe"}"#)
+            .control(br#"{"success":false,"ret_msg":"rate limited","req_id":"publicTrade.ETHUSDT","op":"subscribe"}"#)
             .unwrap();
 
         assert!(!subscriptions.subscribed());
