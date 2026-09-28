@@ -173,7 +173,7 @@ async fn wait_until_stably_ready(
 ) -> anyhow::Result<()> {
     timeout(READY_TIMEOUT, async {
         loop {
-            while !ready.borrow_and_update().ready {
+            while !ready.borrow_and_update().ready() {
                 ready
                     .changed()
                     .await
@@ -188,8 +188,11 @@ async fn wait_until_stably_ready(
                     biased;
                     result = ready.changed() => {
                         result.map_err(|_| anyhow!("readiness sender closed"))?;
-                        let state = *ready.borrow_and_update();
-                        if !state.ready || state.outage_epoch != outage_epoch {
+                        let (live, epoch) = {
+                            let state = ready.borrow_and_update();
+                            (state.ready(), state.outage_epoch)
+                        };
+                        if !live || epoch != outage_epoch {
                             break;
                         }
                     }
@@ -441,13 +444,18 @@ async fn read_message(stream: &mut UnixStream) -> anyhow::Result<Message> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::readiness::Readiness;
+    use crate::readiness::{Readiness, Source};
+
+    const SOURCE: Source = Source {
+        endpoint: "test",
+        connection: 0,
+    };
 
     #[tokio::test]
     async fn readiness_must_remain_live_for_the_whole_overlap() {
         let (readiness, mut ready) = Readiness::new(1);
         readiness.mark_writer_ready();
-        let first = readiness.source_live("source");
+        let first = readiness.source_live(SOURCE);
         let mut waiter = tokio::spawn(async move {
             wait_until_stably_ready(&mut ready, Duration::from_millis(200)).await
         });
@@ -456,7 +464,7 @@ mod tests {
         drop(first);
         // Reconnect without yielding: a boolean watch can coalesce this
         // false->true transition, while the outage epoch cannot.
-        let _second = readiness.source_live("source");
+        let _second = readiness.source_live(SOURCE);
         assert!(
             timeout(Duration::from_millis(150), &mut waiter)
                 .await
@@ -525,7 +533,7 @@ mod tests {
         fn spawn_ready_challenger(&self) -> tokio::task::JoinHandle<anyhow::Result<()>> {
             let (readiness, ready) = Readiness::new(1);
             readiness.mark_writer_ready();
-            let source = readiness.source_live("source");
+            let source = readiness.source_live(SOURCE);
             let (takeover_tx, _takeovers) = mpsc::channel(1);
             let challenger = run(
                 self.path.clone(),

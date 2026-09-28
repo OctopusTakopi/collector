@@ -15,7 +15,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::{
     quality::QualityReporter,
-    readiness::Readiness,
+    readiness::{Readiness, Source},
     ws::{self, Delivery, FrameSender, Overflow},
 };
 
@@ -284,9 +284,10 @@ async fn connect(
 
                 if subscription_readiness.ready() {
                     if liveness.is_none() {
-                        liveness = Some(
-                            readiness.source_live(format!("hyperliquid/connection-{connection}")),
-                        );
+                        liveness = Some(readiness.source_live(Source {
+                            endpoint: "hyperliquid",
+                            connection,
+                        }));
                     }
                 } else {
                     liveness = None;

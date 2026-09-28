@@ -32,7 +32,7 @@ use crate::{
     feed::{BackgroundResult, Feed},
     file::WriteRecord,
     quality::QualityReporter,
-    readiness::Readiness,
+    readiness::{Readiness, Source},
     routing::{self, BinanceMessage},
     symbol::{Symbol, SymbolCache},
     throttler::Throttler,
@@ -524,10 +524,10 @@ where
                 match deliver_frame(&ws_tx, &mut overflow, message.payload).await {
                     Delivery::Sent => {
                         if liveness.is_none() {
-                            liveness = Some(readiness.source_live(format!(
-                                "{}/connection-{connection}",
-                                endpoint.label
-                            )));
+                            liveness = Some(readiness.source_live(Source {
+                                endpoint: endpoint.label,
+                                connection,
+                            }));
                         }
                         if !announced_live {
                             announced_live = true;

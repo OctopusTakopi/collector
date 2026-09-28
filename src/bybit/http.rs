@@ -20,7 +20,7 @@ use tracing::{error, warn};
 
 use crate::{
     quality::QualityReporter,
-    readiness::Readiness,
+    readiness::{Readiness, Source},
     routing::BybitMessage,
     ws::{self, Delivery, FrameSender, Overflow},
 };
@@ -297,8 +297,10 @@ async fn connect(
                 }
                 if subscription_readiness.ready() {
                     if liveness.is_none() {
-                        liveness =
-                            Some(readiness.source_live(format!("bybit/connection-{connection}")));
+                        liveness = Some(readiness.source_live(Source {
+                            endpoint: "bybit",
+                            connection,
+                        }));
                     }
                 } else {
                     liveness = None;
