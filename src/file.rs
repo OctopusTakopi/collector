@@ -221,9 +221,8 @@ fn try_lock_daily(prefix: &Path, date: Date) -> io::Result<Option<File>> {
     if ends_on_frame_boundary(&file)? {
         return Ok(Some(file));
     }
-    // The last writer died mid-frame and appending after that would make
-    // every later frame undecodable: set the file aside, readable up to where
-    // it stops, and start the day again in a fresh one.
+    // The last writer died mid-frame: set the file aside, readable up to
+    // where it stops, and start the day again in a fresh one.
     let salvage = day_file(
         prefix,
         date,
@@ -365,7 +364,8 @@ struct RotatingFile {
     prefix: PathBuf,
     run_id: String,
     /// The day of the open file. The daily-file lock is probed for this day,
-    /// never for a record's timestamp.
+    /// never for a record's timestamp: a late pre-midnight record must not
+    /// switch today's sidecar into yesterday's file.
     day: Day,
     sink: Sink,
     pending_sidecars: Vec<PendingSidecar>,
@@ -473,9 +473,6 @@ impl RotatingFile {
 
     /// Once the incumbent has released the daily file, append this run's
     /// sidecar to it and delete the sidecar — the only time one is removed.
-    ///
-    /// The lock is probed for the open file's day: a late pre-midnight record
-    /// must not switch today's sidecar into yesterday's file.
     fn switch_to_daily(&mut self, after: AfterSwitch) -> io::Result<()> {
         let Some(sidecar) = self.sink.sidecar() else {
             return Ok(());
@@ -491,8 +488,7 @@ impl RotatingFile {
                 "failed to finalize handover sidecar before switching to the daily file"
             );
             self.mark_degraded(sidecar.display().to_string(), &error);
-            // An unfinished frame must never be appended: everything after it
-            // in the daily file would be undecodable.
+            // An unfinished frame must never be appended.
             warn!(path = %sidecar.display(), "leaving unfinished overlap sidecar on disk");
             // Records the sidecar did not take go to the daily file.
             let after = if self.batch.is_empty() {
