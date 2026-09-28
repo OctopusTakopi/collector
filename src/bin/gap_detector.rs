@@ -44,7 +44,8 @@ use std::{
 };
 
 use anyhow::{Context as _, Result};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
+use collector::routing::binance_dedup_key;
 use jiff::{Span, Timestamp, civil, tz::TimeZone};
 use serde::Deserialize;
 use serde::de::{self, IgnoredAny, SeqAccess, Visitor};
@@ -80,11 +81,8 @@ struct Args {
     filter: Option<String>,
 
     /// Exchange family to apply to every file instead of guessing from paths.
-    #[arg(
-        long,
-        value_parser = ["binance-spot", "binance-futures", "bybit", "hyperliquid", "generic"]
-    )]
-    exchange: Option<String>,
+    #[arg(long, value_enum)]
+    exchange: Option<Family>,
 
     /// Worker threads (0 = auto: one per CPU, capped at 16).
     #[arg(long, default_value_t = 0)]
@@ -100,7 +98,7 @@ struct Args {
     fail_on_gaps: bool,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, ValueEnum)]
 enum Family {
     BinanceSpot,
     BinanceFutures,
@@ -109,27 +107,17 @@ enum Family {
     Generic,
 }
 
+/// The `--exchange` value, e.g. `binance-spot`.
+impl fmt::Display for Family {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let value = self
+            .to_possible_value()
+            .expect("no Family variant is skipped");
+        f.write_str(value.get_name())
+    }
+}
+
 impl Family {
-    fn label(self) -> &'static str {
-        match self {
-            Family::BinanceSpot => "binance-spot",
-            Family::BinanceFutures => "binance-futures",
-            Family::Bybit => "bybit",
-            Family::Hyperliquid => "hyperliquid",
-            Family::Generic => "generic",
-        }
-    }
-
-    fn from_override(name: &str) -> Family {
-        match name {
-            "binance-spot" => Family::BinanceSpot,
-            "binance-futures" => Family::BinanceFutures,
-            "bybit" => Family::Bybit,
-            "hyperliquid" => Family::Hyperliquid,
-            _ => Family::Generic,
-        }
-    }
-
     /// Guess the family from directory names such as
     /// `raw/binance/futures/um`, `raw/bybit`, `raw/hyperliquid`.
     fn guess(dir: &Path) -> Family {
@@ -1011,33 +999,13 @@ fn process_lines(
     }
 }
 
+/// Spot copies of one event differ only in the per-connection `E` stamp, so
+/// spot uses the collector's own dedup key.
 fn overlap_key(family: Family, payload: &[u8]) -> u128 {
-    if family != Family::BinanceSpot {
-        return xxhash_rust::xxh3::xxh3_128(payload);
+    match family {
+        Family::BinanceSpot => binance_dedup_key(payload),
+        _ => xxhash_rust::xxh3::xxh3_128(payload),
     }
-    let Some((before, after)) = cut_binance_event_time(payload) else {
-        return xxhash_rust::xxh3::xxh3_128(payload);
-    };
-    let mut hasher = xxhash_rust::xxh3::Xxh3Default::new();
-    hasher.update(before);
-    hasher.update(after);
-    hasher.digest128()
-}
-
-fn cut_binance_event_time(payload: &[u8]) -> Option<(&[u8], &[u8])> {
-    const NEEDLE: &[u8] = b"\"E\":";
-    let position = payload
-        .windows(NEEDLE.len())
-        .position(|bytes| bytes == NEEDLE)?;
-    let mut end = position + NEEDLE.len();
-    if end < payload.len() && payload[end] == b'-' {
-        end += 1;
-    }
-    let digits = end;
-    while end < payload.len() && payload[end].is_ascii_digit() {
-        end += 1;
-    }
-    (end != digits).then_some((&payload[..position], &payload[end..]))
 }
 
 /// A first line that neither parses nor looks like text marks the whole file
@@ -1279,7 +1247,7 @@ fn write_report(
     max_reported: usize,
     exact: bool,
 ) -> fmt::Result {
-    writeln!(out, "{} ({})", report.key, report.family.label())?;
+    writeln!(out, "{} ({})", report.key, report.family)?;
     let files: Vec<String> = report
         .files
         .iter()
@@ -1445,8 +1413,7 @@ fn select_series(args: &Args) -> Result<Vec<Series>> {
     if let Some(filter) = &args.filter {
         series.retain(|s| s.key.contains(filter));
     }
-    if let Some(override_name) = &args.exchange {
-        let family = Family::from_override(override_name);
+    if let Some(family) = args.exchange {
         for s in &mut series {
             s.family = family;
         }
@@ -2167,6 +2134,25 @@ RESULT: issues found in 5 series
         assert_eq!(with_issues, 5);
         assert_eq!(out.replace(root, "<dir>"), GOLDEN);
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `--exchange` values, which are also the family labels in the report.
+    #[test]
+    fn exchange_values_match_the_cli() {
+        let names: Vec<String> = Family::value_variants()
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "binance-spot",
+                "binance-futures",
+                "bybit",
+                "hyperliquid",
+                "generic"
+            ]
+        );
     }
 
     #[test]
