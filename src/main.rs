@@ -25,7 +25,8 @@ const WRITER_QUEUE_CAPACITY: usize = 65_536;
 /// How long the collection may take to hand what it already received to the
 /// writer before it is aborted.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
-/// How long the drained incumbent waits for its last handover reply to go out.
+/// How long an exiting collector waits for the handover task to send its last
+/// reply or release the socket.
 const HANDOVER_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Parser, Debug)]
@@ -145,16 +146,17 @@ async fn main() -> Result<(), anyhow::Error> {
         output: std::fs::canonicalize(&args.path)?.display().to_string(),
     };
     let (takeover_tx, mut takeover_rx) = tokio::sync::mpsc::channel(1);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut handover_handle = tokio::spawn(handover::run(
         handover_path,
         identity,
         run_id.clone(),
         ready_rx,
         takeover_tx,
+        shutdown_rx.clone(),
         quality.clone(),
     ));
     let (writer_tx, mut writer_rx) = channel::<file::WriteRecord>(WRITER_QUEUE_CAPACITY);
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut handle = tokio::spawn(exchange.collect(
         args.symbols,
         Context {
@@ -290,8 +292,18 @@ async fn main() -> Result<(), anyhow::Error> {
             let _ = handover_handle.await;
         }
     } else if !handover_handle.is_finished() {
-        handover_handle.abort();
-        let _ = handover_handle.await;
+        // The task releases the socket once it sees the shutdown. A takeover
+        // request that raced the shutdown is dropped with the channel; its
+        // challenger then chooses its role again.
+        shutdown_tx.send_replace(true);
+        drop(takeover_rx);
+        if timeout(HANDOVER_REPLY_TIMEOUT, &mut handover_handle)
+            .await
+            .is_err()
+        {
+            handover_handle.abort();
+            let _ = handover_handle.await;
+        }
     }
     drop(quality);
     let quality_result = match quality_thread.join() {
