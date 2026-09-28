@@ -103,9 +103,15 @@ pub fn usdm_endpoints(streams: &[&'static str]) -> Vec<(&'static Endpoint, Vec<&
 /// True for USD-M streams served on `/public`: book tickers, every depth
 /// variant (including `@0ms` and `rpiDepth`), and `trade`, which is
 /// undocumented on futures and delivered on `/public` only (checked live
-/// 2026-10-03).
+/// 2026-10-03). The event kind follows the symbol (`btcusdt@depth@0ms`), or
+/// the `!` of an all-market stream (`!bookTicker`, `!forceOrder@arr`).
 fn is_public(stream: &str) -> bool {
-    let kind = stream.split('@').nth(1).unwrap_or("");
+    let kind = match stream.strip_prefix('!') {
+        Some(all_market) => all_market
+            .split_once('@')
+            .map_or(all_market, |(kind, _)| kind),
+        None => stream.split('@').nth(1).unwrap_or(""),
+    };
     matches!(kind, "trade" | "bookTicker" | "rpiDepth") || kind.starts_with("depth")
 }
 
@@ -390,6 +396,7 @@ mod tests {
             "$symbol@depth@0ms",
             "$symbol@depth20@100ms",
             "$symbol@rpiDepth@500ms",
+            "!bookTicker",
         ] {
             assert!(is_public(stream), "{stream}");
         }
@@ -398,6 +405,9 @@ mod tests {
             "$symbol@forceOrder",
             "$symbol@markPrice@1s",
             "$symbol@kline_1m",
+            "!forceOrder@arr",
+            "!markPrice@arr@1s",
+            "!miniTicker@arr",
         ] {
             assert!(!is_public(stream), "{stream}");
         }
