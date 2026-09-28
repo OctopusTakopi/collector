@@ -464,16 +464,82 @@ impl StreamStats {
 
 #[derive(Default)]
 struct StreamState {
+    name: String,
     stats: StreamStats,
-    /// depth: running max `u`; trade: running max `t`; bybit book: max `u`
-    last_id: Option<u64>,
-    /// aggTrade: max `t`; bybit book: max `seq`
-    last_id2: Option<u64>,
+    /// Running max of the stream's id: depth `u`, trade `t`, aggTrade `a`,
+    /// Bybit book `u`.
+    max_id: Option<u64>,
+    /// Running max of a second id on the same stream: aggTrade `t`, Bybit
+    /// book `seq`.
+    max_second_id: Option<u64>,
     last_time: Option<i64>,
     /// Exact id set, only with `--exact` and only for point-id streams.
     ids: Option<HashSet<u64>>,
     /// Receive times of forward chain breaks, for locating incidents.
     break_times: Vec<i64>,
+}
+
+/// How an event moved its stream's id chain. Chains track the running max,
+/// so a reordered or duplicated event costs one backward step instead of
+/// poisoning later checks.
+enum Step {
+    InOrder,
+    /// This many ids the recording never saw.
+    Skipped(u64),
+    /// Nothing new: a late duplicate, a reordered event or a duplicate window.
+    Stale,
+}
+
+impl StreamState {
+    fn count(&mut self, step: Step, recv: i64) {
+        match step {
+            Step::InOrder => {}
+            Step::Skipped(ids) => {
+                self.stats.seq_fwd_events += 1;
+                self.stats.seq_fwd_ids += ids;
+                if self.break_times.len() < MAX_BREAK_TIMES {
+                    self.break_times.push(recv);
+                }
+            }
+            Step::Stale => self.stats.seq_back_events += 1,
+        }
+    }
+
+    /// A point id (trade `t`, aggTrade `a`): chained, and tracked for range
+    /// accounting.
+    fn point_id(&mut self, id: u64, recv: i64) {
+        let step = chain(&mut self.max_id, id);
+        self.count(step, recv);
+        let stats = &mut self.stats;
+        if stats.id_count == 0 {
+            stats.id_min = id;
+            stats.id_max = id;
+        } else {
+            stats.id_min = stats.id_min.min(id);
+            stats.id_max = stats.id_max.max(id);
+        }
+        stats.id_count += 1;
+        if let Some(set) = &mut self.ids {
+            set.insert(id);
+        }
+    }
+
+    fn into_report(mut self) -> StreamReport {
+        if let Some(set) = &self.ids
+            && self.stats.id_count > 0
+        {
+            let distinct = set.len() as u64;
+            let span = self.stats.id_max - self.stats.id_min + 1;
+            self.stats.exact_missing = span.saturating_sub(distinct);
+            self.stats.exact_dups = self.stats.id_count.saturating_sub(distinct);
+        }
+        self.break_times.sort_unstable();
+        StreamReport {
+            name: self.name,
+            stats: self.stats,
+            break_times: self.break_times,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -498,30 +564,23 @@ struct SeriesScan {
     last_recv: Option<i64>,
     prev_recv: Option<i64>,
     gaps: Vec<Gap>,
-    streams: Vec<(String, StreamState)>,
+    streams: Vec<StreamState>,
 }
 
 impl SeriesScan {
-    fn stream(&mut self, key: &str, point_ids: bool) -> &mut StreamState {
-        let pos = self.streams.iter().position(|(k, _)| k == key);
-        match pos {
-            Some(i) => &mut self.streams[i].1,
+    fn stream(&mut self, name: &str, point_ids: bool) -> &mut StreamState {
+        let index = match self.streams.iter().position(|s| s.name == name) {
+            Some(index) => index,
             None => {
-                let ids = if self.exact && point_ids {
-                    Some(HashSet::new())
-                } else {
-                    None
-                };
-                self.streams.push((
-                    key.to_string(),
-                    StreamState {
-                        ids,
-                        ..Default::default()
-                    },
-                ));
-                &mut self.streams.last_mut().expect("just pushed").1
+                self.streams.push(StreamState {
+                    name: name.to_owned(),
+                    ids: (self.exact && point_ids).then(HashSet::new),
+                    ..Default::default()
+                });
+                self.streams.len() - 1
             }
-        }
+        };
+        &mut self.streams[index]
     }
 
     fn observe_recv(&mut self, recv: i64, min_gap_ns: i64) {
@@ -587,17 +646,18 @@ impl SeriesScan {
         match kind {
             "depth" => depth_ids(family, st, &parsed, recv),
             "trade" => {
-                chain(st, parsed.trade_id, recv);
-                observe_point_id(st, parsed.trade_id);
+                if let Some(t) = parsed.trade_id {
+                    st.point_id(t, recv);
+                }
             }
             "aggTrade" => {
-                let agg = match parsed.agg_id {
-                    Some(MaybeId::Id(id)) => Some(id),
-                    _ => None,
-                };
-                chain(st, agg, recv);
-                observe_point_id(st, agg);
-                chain2(st, parsed.trade_id, recv);
+                if let Some(MaybeId::Id(a)) = parsed.agg_id {
+                    st.point_id(a, recv);
+                }
+                if let Some(t) = parsed.trade_id {
+                    let step = chain(&mut st.max_second_id, t);
+                    st.count(step, recv);
+                }
             }
             _ => {}
         }
@@ -626,19 +686,19 @@ impl SeriesScan {
             match serde_json::from_str::<BybitBook>(data.get()) {
                 Ok(book) => {
                     if is_delta {
-                        if let (Some(u), Some(prev)) = (book.u, st.last_id)
+                        if let (Some(u), Some(prev)) = (book.u, st.max_id)
                             && u < prev
                         {
                             st.stats.seq_back_events += 1;
                         }
-                        if let (Some(seq), Some(prev)) = (book.seq, st.last_id2)
+                        if let (Some(seq), Some(prev)) = (book.seq, st.max_second_id)
                             && seq < prev
                         {
                             st.stats.seq_back_events += 1;
                         }
                     }
-                    st.last_id = max_opt(st.last_id, book.u);
-                    st.last_id2 = max_opt(st.last_id2, book.seq);
+                    st.max_id = st.max_id.max(book.u);
+                    st.max_second_id = st.max_second_id.max(book.seq);
                 }
                 Err(_) => self.bad_lines += 1,
             }
@@ -685,14 +745,6 @@ impl SeriesScan {
     }
 }
 
-fn max_opt(a: Option<u64>, b: Option<u64>) -> Option<u64> {
-    match (a, b) {
-        (Some(x), Some(y)) => Some(x.max(y)),
-        (x, None) => x,
-        (None, y) => y,
-    }
-}
-
 fn check_time(stats: &mut StreamStats, last: &mut Option<i64>, t: i64) {
     if let Some(prev) = *last
         && t < prev
@@ -702,42 +754,16 @@ fn check_time(stats: &mut StreamStats, last: &mut Option<i64>, t: i64) {
     *last = Some(t);
 }
 
-fn note_break(st: &mut StreamState, recv: i64) {
-    if st.break_times.len() < MAX_BREAK_TIMES {
-        st.break_times.push(recv);
-    }
-}
-
-/// Continuity of a strictly incrementing-by-one venue id (trade ids). The
-/// chain tracks the running maximum, so a reordered or duplicated event
-/// produces at most one backward step and does not poison later checks.
-fn chain(st: &mut StreamState, id: Option<u64>, recv: i64) {
-    chain_field(st, id, recv, false)
-}
-
-/// Secondary id field of the same stream (aggTrade carries `a` and `t`).
-fn chain2(st: &mut StreamState, id: Option<u64>, recv: i64) {
-    chain_field(st, id, recv, true)
-}
-
-fn chain_field(st: &mut StreamState, id: Option<u64>, recv: i64, secondary: bool) {
-    let Some(id) = id else { return };
-    let prev = if secondary { st.last_id2 } else { st.last_id };
-    if let Some(prev) = prev {
-        if id > prev + 1 {
-            st.stats.seq_fwd_events += 1;
-            st.stats.seq_fwd_ids += id - prev - 1;
-            note_break(st, recv);
-        } else if id <= prev {
-            st.stats.seq_back_events += 1;
-        }
-    }
-    let new_max = prev.map_or(id, |p| p.max(id));
-    if secondary {
-        st.last_id2 = Some(new_max);
-    } else {
-        st.last_id = Some(new_max);
-    }
+/// Advance a strictly incrementing-by-one id (trade ids) against its running
+/// max.
+fn chain(max: &mut Option<u64>, id: u64) -> Step {
+    let step = match *max {
+        Some(prev) if id > prev + 1 => Step::Skipped(id - prev - 1),
+        Some(prev) if id <= prev => Step::Stale,
+        _ => Step::InOrder,
+    };
+    *max = (*max).max(Some(id));
+    step
 }
 
 /// Binance depth continuity.
@@ -752,53 +778,20 @@ fn chain_field(st: &mut StreamState, id: Option<u64>, recv: i64, secondary: bool
 /// updates differently, so the copies differ byte-wise and survive dedup).
 fn depth_ids(family: Family, st: &mut StreamState, d: &BinanceData, recv: i64) {
     let Some(u) = d.last_id else { return };
-    if let Some(prev_u) = st.last_id {
-        if u > prev_u {
-            match family {
-                Family::BinanceSpot => {
-                    if let Some(first) = d.first_id
-                        && first > prev_u + 1
-                    {
-                        st.stats.seq_fwd_events += 1;
-                        st.stats.seq_fwd_ids += first - prev_u - 1;
-                        note_break(st, recv);
-                    }
-                }
-                Family::BinanceFutures => {
-                    if let Some(pu) = d.prev_last_id {
-                        if pu > prev_u {
-                            st.stats.seq_fwd_events += 1;
-                            st.stats.seq_fwd_ids += pu - prev_u;
-                            note_break(st, recv);
-                        } else if pu < prev_u {
-                            st.stats.seq_back_events += 1;
-                        }
-                    }
-                }
-                _ => {}
+    let step = match st.max_id {
+        None => Step::InOrder,
+        Some(prev_u) if u <= prev_u => Step::Stale,
+        Some(prev_u) => match (family, d.first_id, d.prev_last_id) {
+            (Family::BinanceSpot, Some(first), _) if first > prev_u + 1 => {
+                Step::Skipped(first - prev_u - 1)
             }
-        } else {
-            st.stats.seq_back_events += 1;
-        }
-    }
-    st.last_id = Some(st.last_id.map_or(u, |prev| prev.max(u)));
-}
-
-/// Track min/max/count of a point-id stream for range accounting.
-fn observe_point_id(st: &mut StreamState, id: Option<u64>) {
-    let Some(id) = id else { return };
-    let stats = &mut st.stats;
-    if stats.id_count == 0 {
-        stats.id_min = id;
-        stats.id_max = id;
-    } else {
-        stats.id_min = stats.id_min.min(id);
-        stats.id_max = stats.id_max.max(id);
-    }
-    stats.id_count += 1;
-    if let Some(set) = &mut st.ids {
-        set.insert(id);
-    }
+            (Family::BinanceFutures, _, Some(pu)) if pu > prev_u => Step::Skipped(pu - prev_u),
+            (Family::BinanceFutures, _, Some(pu)) if pu < prev_u => Step::Stale,
+            _ => Step::InOrder,
+        },
+    };
+    st.count(step, recv);
+    st.max_id = st.max_id.max(Some(u));
 }
 
 fn parse_int(bytes: &[u8]) -> Option<i64> {
@@ -854,7 +847,14 @@ struct SeriesReport {
     first_recv: Option<i64>,
     last_recv: Option<i64>,
     gaps: Vec<Gap>,
-    streams: Vec<(String, StreamStats, Vec<i64>)>,
+    streams: Vec<StreamReport>,
+}
+
+struct StreamReport {
+    name: String,
+    stats: StreamStats,
+    /// Receive times of the first forward breaks, sorted.
+    break_times: Vec<i64>,
 }
 
 impl SeriesReport {
@@ -868,7 +868,8 @@ impl SeriesReport {
             || self
                 .streams
                 .iter()
-                .any(|(_, s, _)| s.seq_fwd_events > 0 || s.net_deficit() > 0 || s.exact_missing > 0)
+                .map(|stream| &stream.stats)
+                .any(|s| s.seq_fwd_events > 0 || s.net_deficit() > 0 || s.exact_missing > 0)
     }
 }
 
@@ -1113,19 +1114,7 @@ fn scan_series(series: &Series, min_gap_ns: i64, exact: bool) -> SeriesReport {
         streams: scan
             .streams
             .into_iter()
-            .map(|(name, mut state)| {
-                let mut stats = state.stats;
-                if let Some(set) = state.ids {
-                    let distinct = set.len() as u64;
-                    if stats.id_count > 0 {
-                        let span = stats.id_max - stats.id_min + 1;
-                        stats.exact_missing = span.saturating_sub(distinct);
-                        stats.exact_dups = stats.id_count.saturating_sub(distinct);
-                    }
-                }
-                state.break_times.sort_unstable();
-                (name, stats, state.break_times)
-            })
+            .map(StreamState::into_report)
             .collect(),
     }
 }
@@ -1339,18 +1328,22 @@ fn write_report(
         }
     }
 
-    let mut streams: Vec<&(String, StreamStats, Vec<i64>)> = report
+    let mut streams: Vec<&StreamReport> = report
         .streams
         .iter()
-        .filter(|(_, s, _)| stream_notable(s))
+        .filter(|stream| stream_notable(&stream.stats))
         .collect();
     if !streams.is_empty() {
-        streams.sort_by(|a, b| a.0.cmp(&b.0));
+        streams.sort_by(|a, b| a.name.cmp(&b.name));
         writeln!(out, "  streams:")?;
-        for (name, s, breaks) in streams {
-            let parts = stream_issues(s, breaks, exact);
-            writeln!(out, "    {name}: {} msgs", grouped(s.messages))?;
-            for part in parts {
+        for stream in streams {
+            let StreamReport {
+                name,
+                stats,
+                break_times,
+            } = stream;
+            writeln!(out, "    {name}: {} msgs", grouped(stats.messages))?;
+            for part in stream_issues(stats, break_times, exact) {
                 writeln!(out, "      {part}")?;
             }
         }
@@ -1488,32 +1481,32 @@ fn write_output(
     let fwd_events: u64 = reports
         .iter()
         .flat_map(|r| &r.streams)
-        .map(|(_, s, _)| s.seq_fwd_events)
+        .map(|stream| stream.stats.seq_fwd_events)
         .sum();
     let fwd_ids: u64 = reports
         .iter()
         .flat_map(|r| &r.streams)
-        .map(|(_, s, _)| s.seq_fwd_ids)
+        .map(|stream| stream.stats.seq_fwd_ids)
         .sum();
     let net_positive: i64 = reports
         .iter()
         .flat_map(|r| &r.streams)
-        .map(|(_, s, _)| s.net_deficit().max(0))
+        .map(|stream| stream.stats.net_deficit().max(0))
         .sum();
     let exact_missing: u64 = reports
         .iter()
         .flat_map(|r| &r.streams)
-        .map(|(_, s, _)| s.exact_missing)
+        .map(|stream| stream.stats.exact_missing)
         .sum();
     let back_events: u64 = reports
         .iter()
         .flat_map(|r| &r.streams)
-        .map(|(_, s, _)| s.seq_back_events)
+        .map(|stream| stream.stats.seq_back_events)
         .sum();
     let time_regressions: u64 = reports
         .iter()
         .flat_map(|r| &r.streams)
-        .map(|(_, s, _)| s.time_regressions)
+        .map(|stream| stream.stats.time_regressions)
         .sum();
     let missing_dates: usize = reports.iter().map(|r| r.missing_dates.len()).sum();
     let bad_lines: u64 = reports.iter().map(|r| r.bad_lines).sum();
@@ -1598,11 +1591,11 @@ mod tests {
         scan_line(&mut scan, Family::BinanceSpot, 3, &msg(130, 121)); // 111..120 skipped
         scan_line(&mut scan, Family::BinanceSpot, 4, &msg(130, 118)); // duplicate window
         scan_line(&mut scan, Family::BinanceSpot, 5, &msg(140, 131)); // contiguous again
-        let stats = &scan.streams[0].1.stats;
+        let stats = &scan.streams[0].stats;
         assert_eq!(stats.seq_fwd_events, 1);
         assert_eq!(stats.seq_fwd_ids, 10);
         assert_eq!(stats.seq_back_events, 1);
-        assert_eq!(scan.streams[0].1.break_times, vec![3]);
+        assert_eq!(scan.streams[0].break_times, vec![3]);
     }
 
     #[test]
@@ -1617,11 +1610,11 @@ mod tests {
         scan_line(&mut scan, Family::BinanceFutures, 1, &msg(100, 150, 160));
         scan_line(&mut scan, Family::BinanceFutures, 2, &msg(160, 400, 410));
         scan_line(&mut scan, Family::BinanceFutures, 3, &msg(430, 500, 520)); // 411..430 lost
-        let stats = &scan.streams[0].1.stats;
+        let stats = &scan.streams[0].stats;
         assert_eq!(stats.seq_fwd_events, 1);
         assert_eq!(stats.seq_fwd_ids, 20);
         assert_eq!(stats.seq_back_events, 0);
-        assert_eq!(scan.streams[0].1.break_times, vec![3]);
+        assert_eq!(scan.streams[0].break_times, vec![3]);
     }
 
     #[test]
@@ -1634,7 +1627,7 @@ mod tests {
         scan_line(&mut scan, Family::BinanceSpot, 3, &msg(13)); // 12 not seen yet
         scan_line(&mut scan, Family::BinanceSpot, 4, &msg(12)); // arrives late
         scan_line(&mut scan, Family::BinanceSpot, 5, &msg(14)); // contiguous vs max
-        let stats = &scan.streams[0].1.stats;
+        let stats = &scan.streams[0].stats;
         assert_eq!(stats.seq_fwd_events, 1);
         assert_eq!(stats.seq_fwd_ids, 1);
         assert_eq!(stats.seq_back_events, 1);
@@ -1660,7 +1653,7 @@ mod tests {
         let mut scan = SeriesScan::default();
         let json = r#"{"stream":"btcusdt@depth@100ms","data":{"e":"depthUpdate","u":5,"a":[["1.0","2.0"]]}}"#;
         scan_line(&mut scan, Family::BinanceSpot, 1, json);
-        let stats = &scan.streams[0].1.stats;
+        let stats = &scan.streams[0].stats;
         assert_eq!(stats.messages, 1);
         assert_eq!(stats.seq_fwd_events, 0);
     }
@@ -1683,7 +1676,7 @@ mod tests {
         scan_line(&mut scan, Family::Bybit, 2, &snapshot(50, 50));
         scan_line(&mut scan, Family::Bybit, 3, &delta(90, 90));
         scan_line(&mut scan, Family::Bybit, 4, &delta(110, 110));
-        let stats = &scan.streams[0].1.stats;
+        let stats = &scan.streams[0].stats;
         // Only the 90 < 100 delta counts; once for `u` and once for `seq`.
         assert_eq!(stats.seq_back_events, 2);
         assert_eq!(stats.time_regressions, 1);
@@ -1696,7 +1689,7 @@ mod tests {
         scan_line(&mut scan, Family::Hyperliquid, 1, json);
         let json = r#"{"channel":"trades","data":[{"time":60}]}"#;
         scan_line(&mut scan, Family::Hyperliquid, 2, json);
-        let stats = &scan.streams[0].1.stats;
+        let stats = &scan.streams[0].stats;
         assert_eq!(stats.time_regressions, 1);
     }
 
@@ -1812,7 +1805,7 @@ mod tests {
         ];
         let mut scan = SeriesScan::default();
         process_lines(&mut scan, Family::BinanceSpot, records, 5_000_000_000, true);
-        let stats = &scan.streams[0].1.stats;
+        let stats = &scan.streams[0].stats;
         assert_eq!(scan.rows, 4);
         assert_eq!(scan.recv_regressions, 0);
         assert!(scan.gaps.is_empty());
