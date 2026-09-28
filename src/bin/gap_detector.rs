@@ -44,7 +44,8 @@ use std::{
 };
 
 use anyhow::{Context as _, Result};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
+use collector::routing::binance_dedup_key;
 use jiff::{Span, Timestamp, civil, tz::TimeZone};
 use serde::Deserialize;
 use serde::de::{self, IgnoredAny, SeqAccess, Visitor};
@@ -58,6 +59,7 @@ const LIVE_FILE_WINDOW: Duration = Duration::from_secs(15 * 60);
 /// Keep at most this many break timestamps per stream.
 const MAX_BREAK_TIMES: usize = 16;
 
+/// Overlapping runs record their copies of one event at most this far apart.
 const OVERLAP_DEDUP_WINDOW_NS: i64 = 5_000_000_000;
 
 #[derive(Parser)]
@@ -80,11 +82,8 @@ struct Args {
     filter: Option<String>,
 
     /// Exchange family to apply to every file instead of guessing from paths.
-    #[arg(
-        long,
-        value_parser = ["binance-spot", "binance-futures", "bybit", "hyperliquid", "generic"]
-    )]
-    exchange: Option<String>,
+    #[arg(long, value_enum)]
+    exchange: Option<Family>,
 
     /// Worker threads (0 = auto: one per CPU, capped at 16).
     #[arg(long, default_value_t = 0)]
@@ -100,7 +99,7 @@ struct Args {
     fail_on_gaps: bool,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, ValueEnum)]
 enum Family {
     BinanceSpot,
     BinanceFutures,
@@ -109,27 +108,17 @@ enum Family {
     Generic,
 }
 
+/// The `--exchange` value, e.g. `binance-spot`.
+impl fmt::Display for Family {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let value = self
+            .to_possible_value()
+            .expect("no Family variant is skipped");
+        f.write_str(value.get_name())
+    }
+}
+
 impl Family {
-    fn label(self) -> &'static str {
-        match self {
-            Family::BinanceSpot => "binance-spot",
-            Family::BinanceFutures => "binance-futures",
-            Family::Bybit => "bybit",
-            Family::Hyperliquid => "hyperliquid",
-            Family::Generic => "generic",
-        }
-    }
-
-    fn from_override(name: &str) -> Family {
-        match name {
-            "binance-spot" => Family::BinanceSpot,
-            "binance-futures" => Family::BinanceFutures,
-            "bybit" => Family::Bybit,
-            "hyperliquid" => Family::Hyperliquid,
-            _ => Family::Generic,
-        }
-    }
-
     /// Guess the family from directory names such as
     /// `raw/binance/futures/um`, `raw/bybit`, `raw/hyperliquid`.
     fn guess(dir: &Path) -> Family {
@@ -315,10 +304,6 @@ fn logical_run_id(run_id: &str) -> &str {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Payload parsing
-// ---------------------------------------------------------------------------
-
 /// A field that is a numeric id on some streams (aggTrade `a`) and a big
 /// nested array on others (depth asks). Deserialises numbers and skips
 /// everything else without materialising it.
@@ -436,10 +421,6 @@ struct HyperliquidTradeItem {
     time: Option<i64>,
 }
 
-// ---------------------------------------------------------------------------
-// Scanning
-// ---------------------------------------------------------------------------
-
 #[derive(Clone, Copy, Default)]
 struct StreamStats {
     messages: u64,
@@ -476,11 +457,14 @@ impl StreamStats {
 
 #[derive(Default)]
 struct StreamState {
+    name: String,
     stats: StreamStats,
-    /// depth: running max `u`; trade: running max `t`; bybit book: max `u`
-    last_id: Option<u64>,
-    /// aggTrade: max `t`; bybit book: max `seq`
-    last_id2: Option<u64>,
+    /// Running max of the stream's id: depth `u`, trade `t`, aggTrade `a`,
+    /// Bybit book `u`.
+    max_id: Option<u64>,
+    /// Running max of a second id on the same stream: aggTrade `t`, Bybit
+    /// book `seq`.
+    max_second_id: Option<u64>,
     last_time: Option<i64>,
     /// Exact id set, only with `--exact` and only for point-id streams.
     ids: Option<HashSet<u64>>,
@@ -488,16 +472,73 @@ struct StreamState {
     break_times: Vec<i64>,
 }
 
+/// How an event moved its stream's id chain. Chains track the running max,
+/// so a reordered or duplicated event costs one backward step instead of
+/// poisoning later checks.
+enum Step {
+    InOrder,
+    /// This many ids the recording never saw.
+    Skipped(u64),
+    /// Nothing new: a late duplicate, a reordered event or a duplicate window.
+    Stale,
+}
+
+impl StreamState {
+    fn count(&mut self, step: Step, recv: i64) {
+        match step {
+            Step::InOrder => {}
+            Step::Skipped(ids) => {
+                self.stats.seq_fwd_events += 1;
+                self.stats.seq_fwd_ids += ids;
+                if self.break_times.len() < MAX_BREAK_TIMES {
+                    self.break_times.push(recv);
+                }
+            }
+            Step::Stale => self.stats.seq_back_events += 1,
+        }
+    }
+
+    /// A point id (trade `t`, aggTrade `a`): chained, and tracked for range
+    /// accounting.
+    fn point_id(&mut self, id: u64, recv: i64) {
+        let step = chain(&mut self.max_id, id);
+        self.count(step, recv);
+        let stats = &mut self.stats;
+        if stats.id_count == 0 {
+            stats.id_min = id;
+            stats.id_max = id;
+        } else {
+            stats.id_min = stats.id_min.min(id);
+            stats.id_max = stats.id_max.max(id);
+        }
+        stats.id_count += 1;
+        if let Some(set) = &mut self.ids {
+            set.insert(id);
+        }
+    }
+
+    fn into_report(mut self) -> StreamReport {
+        if let Some(set) = &self.ids
+            && self.stats.id_count > 0
+        {
+            let distinct = set.len() as u64;
+            let span = self.stats.id_max - self.stats.id_min + 1;
+            self.stats.exact_missing = span.saturating_sub(distinct);
+            self.stats.exact_dups = self.stats.id_count.saturating_sub(distinct);
+        }
+        self.break_times.sort_unstable();
+        StreamReport {
+            name: self.name,
+            stats: self.stats,
+            break_times: self.break_times,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Gap {
     start: i64,
     end: i64,
-}
-
-#[cfg(test)]
-enum LineOutcome {
-    Ok,
-    Bad,
 }
 
 #[derive(Default)]
@@ -510,30 +551,23 @@ struct SeriesScan {
     last_recv: Option<i64>,
     prev_recv: Option<i64>,
     gaps: Vec<Gap>,
-    streams: Vec<(String, StreamState)>,
+    streams: Vec<StreamState>,
 }
 
 impl SeriesScan {
-    fn stream(&mut self, key: &str, point_ids: bool) -> &mut StreamState {
-        let pos = self.streams.iter().position(|(k, _)| k == key);
-        match pos {
-            Some(i) => &mut self.streams[i].1,
+    fn stream(&mut self, name: &str, point_ids: bool) -> &mut StreamState {
+        let index = match self.streams.iter().position(|s| s.name == name) {
+            Some(index) => index,
             None => {
-                let ids = if self.exact && point_ids {
-                    Some(HashSet::new())
-                } else {
-                    None
-                };
-                self.streams.push((
-                    key.to_string(),
-                    StreamState {
-                        ids,
-                        ..Default::default()
-                    },
-                ));
-                &mut self.streams.last_mut().expect("just pushed").1
+                self.streams.push(StreamState {
+                    name: name.to_owned(),
+                    ids: (self.exact && point_ids).then(HashSet::new),
+                    ..Default::default()
+                });
+                self.streams.len() - 1
             }
-        }
+        };
+        &mut self.streams[index]
     }
 
     fn observe_recv(&mut self, recv: i64, min_gap_ns: i64) {
@@ -552,15 +586,6 @@ impl SeriesScan {
         }
         self.prev_recv = Some(recv);
         self.last_recv = Some(recv);
-    }
-
-    #[cfg(test)]
-    fn process_line(&mut self, family: Family, line: &[u8], min_gap_ns: i64) -> LineOutcome {
-        let Some((recv, payload)) = parse_record_line(line) else {
-            return LineOutcome::Bad;
-        };
-        self.process_payload(family, recv, payload, min_gap_ns);
-        LineOutcome::Ok
     }
 
     fn process_payload(&mut self, family: Family, recv: i64, payload: &[u8], min_gap_ns: i64) {
@@ -599,17 +624,18 @@ impl SeriesScan {
         match kind {
             "depth" => depth_ids(family, st, &parsed, recv),
             "trade" => {
-                chain(st, parsed.trade_id, recv);
-                observe_point_id(st, parsed.trade_id);
+                if let Some(t) = parsed.trade_id {
+                    st.point_id(t, recv);
+                }
             }
             "aggTrade" => {
-                let agg = match parsed.agg_id {
-                    Some(MaybeId::Id(id)) => Some(id),
-                    _ => None,
-                };
-                chain(st, agg, recv);
-                observe_point_id(st, agg);
-                chain2(st, parsed.trade_id, recv);
+                if let Some(MaybeId::Id(a)) = parsed.agg_id {
+                    st.point_id(a, recv);
+                }
+                if let Some(t) = parsed.trade_id {
+                    let step = chain(&mut st.max_second_id, t);
+                    st.count(step, recv);
+                }
             }
             _ => {}
         }
@@ -638,19 +664,19 @@ impl SeriesScan {
             match serde_json::from_str::<BybitBook>(data.get()) {
                 Ok(book) => {
                     if is_delta {
-                        if let (Some(u), Some(prev)) = (book.u, st.last_id)
+                        if let (Some(u), Some(prev)) = (book.u, st.max_id)
                             && u < prev
                         {
                             st.stats.seq_back_events += 1;
                         }
-                        if let (Some(seq), Some(prev)) = (book.seq, st.last_id2)
+                        if let (Some(seq), Some(prev)) = (book.seq, st.max_second_id)
                             && seq < prev
                         {
                             st.stats.seq_back_events += 1;
                         }
                     }
-                    st.last_id = max_opt(st.last_id, book.u);
-                    st.last_id2 = max_opt(st.last_id2, book.seq);
+                    st.max_id = st.max_id.max(book.u);
+                    st.max_second_id = st.max_second_id.max(book.seq);
                 }
                 Err(_) => self.bad_lines += 1,
             }
@@ -697,14 +723,6 @@ impl SeriesScan {
     }
 }
 
-fn max_opt(a: Option<u64>, b: Option<u64>) -> Option<u64> {
-    match (a, b) {
-        (Some(x), Some(y)) => Some(x.max(y)),
-        (x, None) => x,
-        (None, y) => y,
-    }
-}
-
 fn check_time(stats: &mut StreamStats, last: &mut Option<i64>, t: i64) {
     if let Some(prev) = *last
         && t < prev
@@ -714,42 +732,16 @@ fn check_time(stats: &mut StreamStats, last: &mut Option<i64>, t: i64) {
     *last = Some(t);
 }
 
-fn note_break(st: &mut StreamState, recv: i64) {
-    if st.break_times.len() < MAX_BREAK_TIMES {
-        st.break_times.push(recv);
-    }
-}
-
-/// Continuity of a strictly incrementing-by-one venue id (trade ids). The
-/// chain tracks the running maximum, so a reordered or duplicated event
-/// produces at most one backward step and does not poison later checks.
-fn chain(st: &mut StreamState, id: Option<u64>, recv: i64) {
-    chain_field(st, id, recv, false)
-}
-
-/// Secondary id field of the same stream (aggTrade carries `a` and `t`).
-fn chain2(st: &mut StreamState, id: Option<u64>, recv: i64) {
-    chain_field(st, id, recv, true)
-}
-
-fn chain_field(st: &mut StreamState, id: Option<u64>, recv: i64, secondary: bool) {
-    let Some(id) = id else { return };
-    let prev = if secondary { st.last_id2 } else { st.last_id };
-    if let Some(prev) = prev {
-        if id > prev + 1 {
-            st.stats.seq_fwd_events += 1;
-            st.stats.seq_fwd_ids += id - prev - 1;
-            note_break(st, recv);
-        } else if id <= prev {
-            st.stats.seq_back_events += 1;
-        }
-    }
-    let new_max = prev.map_or(id, |p| p.max(id));
-    if secondary {
-        st.last_id2 = Some(new_max);
-    } else {
-        st.last_id = Some(new_max);
-    }
+/// Advance a strictly incrementing-by-one id (trade ids) against its running
+/// max.
+fn chain(max: &mut Option<u64>, id: u64) -> Step {
+    let step = match *max {
+        Some(prev) if id > prev + 1 => Step::Skipped(id - prev - 1),
+        Some(prev) if id <= prev => Step::Stale,
+        _ => Step::InOrder,
+    };
+    *max = (*max).max(Some(id));
+    step
 }
 
 /// Binance depth continuity.
@@ -764,53 +756,20 @@ fn chain_field(st: &mut StreamState, id: Option<u64>, recv: i64, secondary: bool
 /// updates differently, so the copies differ byte-wise and survive dedup).
 fn depth_ids(family: Family, st: &mut StreamState, d: &BinanceData, recv: i64) {
     let Some(u) = d.last_id else { return };
-    if let Some(prev_u) = st.last_id {
-        if u > prev_u {
-            match family {
-                Family::BinanceSpot => {
-                    if let Some(first) = d.first_id
-                        && first > prev_u + 1
-                    {
-                        st.stats.seq_fwd_events += 1;
-                        st.stats.seq_fwd_ids += first - prev_u - 1;
-                        note_break(st, recv);
-                    }
-                }
-                Family::BinanceFutures => {
-                    if let Some(pu) = d.prev_last_id {
-                        if pu > prev_u {
-                            st.stats.seq_fwd_events += 1;
-                            st.stats.seq_fwd_ids += pu - prev_u;
-                            note_break(st, recv);
-                        } else if pu < prev_u {
-                            st.stats.seq_back_events += 1;
-                        }
-                    }
-                }
-                _ => {}
+    let step = match st.max_id {
+        None => Step::InOrder,
+        Some(prev_u) if u <= prev_u => Step::Stale,
+        Some(prev_u) => match (family, d.first_id, d.prev_last_id) {
+            (Family::BinanceSpot, Some(first), _) if first > prev_u + 1 => {
+                Step::Skipped(first - prev_u - 1)
             }
-        } else {
-            st.stats.seq_back_events += 1;
-        }
-    }
-    st.last_id = Some(st.last_id.map_or(u, |prev| prev.max(u)));
-}
-
-/// Track min/max/count of a point-id stream for range accounting.
-fn observe_point_id(st: &mut StreamState, id: Option<u64>) {
-    let Some(id) = id else { return };
-    let stats = &mut st.stats;
-    if stats.id_count == 0 {
-        stats.id_min = id;
-        stats.id_max = id;
-    } else {
-        stats.id_min = stats.id_min.min(id);
-        stats.id_max = stats.id_max.max(id);
-    }
-    stats.id_count += 1;
-    if let Some(set) = &mut st.ids {
-        set.insert(id);
-    }
+            (Family::BinanceFutures, _, Some(pu)) if pu > prev_u => Step::Skipped(pu - prev_u),
+            (Family::BinanceFutures, _, Some(pu)) if pu < prev_u => Step::Stale,
+            _ => Step::InOrder,
+        },
+    };
+    st.count(step, recv);
+    st.max_id = st.max_id.max(Some(u));
 }
 
 fn parse_int(bytes: &[u8]) -> Option<i64> {
@@ -831,10 +790,6 @@ fn parse_record_line(line: &[u8]) -> Option<(i64, &[u8])> {
     let payload = &line[space + 1..];
     (payload.first() == Some(&b'{')).then_some((recv, payload))
 }
-
-// ---------------------------------------------------------------------------
-// Reports
-// ---------------------------------------------------------------------------
 
 struct FileReport {
     path: PathBuf,
@@ -866,7 +821,14 @@ struct SeriesReport {
     first_recv: Option<i64>,
     last_recv: Option<i64>,
     gaps: Vec<Gap>,
-    streams: Vec<(String, StreamStats, Vec<i64>)>,
+    streams: Vec<StreamReport>,
+}
+
+struct StreamReport {
+    name: String,
+    stats: StreamStats,
+    /// Receive times of the first forward breaks, sorted.
+    break_times: Vec<i64>,
 }
 
 impl SeriesReport {
@@ -880,7 +842,8 @@ impl SeriesReport {
             || self
                 .streams
                 .iter()
-                .any(|(_, s, _)| s.seq_fwd_events > 0 || s.net_deficit() > 0 || s.exact_missing > 0)
+                .map(|stream| &stream.stats)
+                .any(|s| s.seq_fwd_events > 0 || s.net_deficit() > 0 || s.exact_missing > 0)
     }
 }
 
@@ -953,20 +916,14 @@ where
     FileRead { report, bad_lines }
 }
 
-fn process_lines(
+/// Merge the records of overlapping runs by receive time, dropping each copy
+/// another run recorded within the window while both runs were recording.
+fn merge_overlapping_runs(
     scan: &mut SeriesScan,
     family: Family,
     mut records: Vec<RawLine>,
     min_gap_ns: i64,
-    overlapping_runs: bool,
 ) {
-    if !overlapping_runs {
-        for record in records {
-            scan.process_payload(family, record.recv, &record.payload, min_gap_ns);
-        }
-        return;
-    }
-
     let mut source_ranges: HashMap<usize, (i64, i64)> = HashMap::new();
     for record in &records {
         source_ranges
@@ -1011,33 +968,13 @@ fn process_lines(
     }
 }
 
+/// Spot copies of one event differ only in the per-connection `E` stamp, so
+/// spot uses the collector's own dedup key.
 fn overlap_key(family: Family, payload: &[u8]) -> u128 {
-    if family != Family::BinanceSpot {
-        return xxhash_rust::xxh3::xxh3_128(payload);
+    match family {
+        Family::BinanceSpot => binance_dedup_key(payload),
+        _ => xxhash_rust::xxh3::xxh3_128(payload),
     }
-    let Some((before, after)) = cut_binance_event_time(payload) else {
-        return xxhash_rust::xxh3::xxh3_128(payload);
-    };
-    let mut hasher = xxhash_rust::xxh3::Xxh3Default::new();
-    hasher.update(before);
-    hasher.update(after);
-    hasher.digest128()
-}
-
-fn cut_binance_event_time(payload: &[u8]) -> Option<(&[u8], &[u8])> {
-    const NEEDLE: &[u8] = b"\"E\":";
-    let position = payload
-        .windows(NEEDLE.len())
-        .position(|bytes| bytes == NEEDLE)?;
-    let mut end = position + NEEDLE.len();
-    if end < payload.len() && payload[end] == b'-' {
-        end += 1;
-    }
-    let digits = end;
-    while end < payload.len() && payload[end].is_ascii_digit() {
-        end += 1;
-    }
-    (end != digits).then_some((&payload[..position], &payload[end..]))
 }
 
 /// A first line that neither parses nor looks like text marks the whole file
@@ -1094,7 +1031,7 @@ fn scan_series(series: &Series, min_gap_ns: i64, exact: bool) -> SeriesReport {
                 scan.bad_lines += read.bad_lines;
                 files.push(read.report);
             }
-            process_lines(&mut scan, series.family, records, min_gap_ns, true);
+            merge_overlapping_runs(&mut scan, series.family, records, min_gap_ns);
             if decode_error {
                 scan.prev_recv = None;
             }
@@ -1145,26 +1082,10 @@ fn scan_series(series: &Series, min_gap_ns: i64, exact: bool) -> SeriesReport {
         streams: scan
             .streams
             .into_iter()
-            .map(|(name, mut state)| {
-                let mut stats = state.stats;
-                if let Some(set) = state.ids {
-                    let distinct = set.len() as u64;
-                    if stats.id_count > 0 {
-                        let span = stats.id_max - stats.id_min + 1;
-                        stats.exact_missing = span.saturating_sub(distinct);
-                        stats.exact_dups = stats.id_count.saturating_sub(distinct);
-                    }
-                }
-                state.break_times.sort_unstable();
-                (name, stats, state.break_times)
-            })
+            .map(StreamState::into_report)
             .collect(),
     }
 }
-
-// ---------------------------------------------------------------------------
-// Formatting
-// ---------------------------------------------------------------------------
 
 fn fmt_ts(ns: i64) -> String {
     let zoned = Timestamp::from_nanosecond(i128::from(ns))
@@ -1272,51 +1193,61 @@ fn stream_notable(s: &StreamStats) -> bool {
     s.id_count > 0 || s.seq_fwd_events > 0 || s.seq_back_events > 0 || s.time_regressions > 0
 }
 
-fn print_report(report: &SeriesReport, min_gap_ns: i64, max_reported: usize, exact: bool) {
-    println!("{} ({})", report.key, report.family.label());
+fn write_report(
+    out: &mut impl fmt::Write,
+    report: &SeriesReport,
+    min_gap_ns: i64,
+    max_reported: usize,
+    exact: bool,
+) -> fmt::Result {
+    writeln!(out, "{} ({})", report.key, report.family)?;
     let files: Vec<String> = report
         .files
         .iter()
         .map(|file| file.path.display().to_string())
         .collect();
-    println!("  files: {}", files.join(", "));
+    writeln!(out, "  files: {}", files.join(", "))?;
     for file in &report.files {
         if file.foreign {
-            println!(
+            writeln!(
+                out,
                 "    {}: foreign format (not `<recv_ns> <json>` lines), skipped",
                 file.path.display()
-            );
+            )?;
         }
         if let Some(error) = &file.decode_error {
             if file.live {
-                println!(
+                writeln!(
+                    out,
                     "    {}: unterminated zstd stream after {} rows (file modified recently — still being written?): {error}",
                     file.path.display(),
                     grouped(file.rows)
-                );
+                )?;
             } else {
-                println!(
+                writeln!(
+                    out,
                     "    {}: decode error after {} rows: {error}",
                     file.path.display(),
                     grouped(file.rows)
-                );
+                )?;
             }
         }
     }
     if report.rows == 0 && report.files.iter().all(|f| !f.foreign) {
-        println!("  (no rows decoded)");
+        writeln!(out, "  (no rows decoded)")?;
     }
     if report.rows > 0 {
         let span = match (report.first_recv, report.last_recv) {
             (Some(a), Some(b)) => format!("{} .. {}", fmt_ts(a), fmt_ts(b)),
             _ => String::from("?"),
         };
-        println!(
+        writeln!(
+            out,
             "  rows: {} | recv span: {} | bad lines: {}",
             grouped(report.rows),
             span,
             grouped(report.bad_lines)
-        );
+        )?;
     }
     if !report.missing_dates.is_empty() {
         let dates: Vec<String> = report
@@ -1324,69 +1255,70 @@ fn print_report(report: &SeriesReport, min_gap_ns: i64, max_reported: usize, exa
             .iter()
             .map(ToString::to_string)
             .collect();
-        println!("  MISSING DATES: {}", dates.join(", "));
+        writeln!(out, "  MISSING DATES: {}", dates.join(", "))?;
     }
     if report.recv_regressions > 0 {
-        println!(
+        writeln!(
+            out,
             "  receive time regressions: {} (arrival-vs-dequeue ordering)",
             grouped(report.recv_regressions)
-        );
+        )?;
     }
 
     let threshold = fmt_dur(min_gap_ns);
     if report.gaps.is_empty() {
-        println!("  recv gaps > {threshold}: none");
+        writeln!(out, "  recv gaps > {threshold}: none")?;
     } else {
         let total: i64 = report.gaps.iter().map(|g| g.end - g.start).sum();
-        println!(
+        writeln!(
+            out,
             "  RECV GAPS > {threshold}: {} (total silence {})",
             report.gaps.len(),
             fmt_dur(total)
-        );
+        )?;
         let mut largest: Vec<&Gap> = report.gaps.iter().collect();
         largest.sort_by_key(|g| std::cmp::Reverse(g.end - g.start));
         for gap in largest.iter().take(max_reported) {
-            println!(
+            writeln!(
+                out,
                 "    {} .. {} ({})",
                 fmt_ts(gap.start),
                 fmt_ts(gap.end),
                 fmt_dur(gap.end - gap.start)
-            );
+            )?;
         }
         if report.gaps.len() > max_reported {
-            println!("    ... {} more", report.gaps.len() - max_reported);
+            writeln!(out, "    ... {} more", report.gaps.len() - max_reported)?;
         }
     }
 
-    let mut streams: Vec<&(String, StreamStats, Vec<i64>)> = report
+    let mut streams: Vec<&StreamReport> = report
         .streams
         .iter()
-        .filter(|(_, s, _)| stream_notable(s))
+        .filter(|stream| stream_notable(&stream.stats))
         .collect();
     if !streams.is_empty() {
-        streams.sort_by(|a, b| a.0.cmp(&b.0));
-        println!("  streams:");
-        for (name, s, breaks) in streams {
-            let parts = stream_issues(s, breaks, exact);
-            println!("    {name}: {} msgs", grouped(s.messages));
-            for part in parts {
-                println!("      {part}");
+        streams.sort_by(|a, b| a.name.cmp(&b.name));
+        writeln!(out, "  streams:")?;
+        for stream in streams {
+            let StreamReport {
+                name,
+                stats,
+                break_times,
+            } = stream;
+            writeln!(out, "    {name}: {} msgs", grouped(stats.messages))?;
+            for part in stream_issues(stats, break_times, exact) {
+                writeln!(out, "      {part}")?;
             }
         }
     }
-    println!();
+    writeln!(out)?;
+    Ok(())
 }
-
-// ---------------------------------------------------------------------------
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let min_gap_ns = (args.min_gap.max(0.0) * 1e9) as i64;
-
-    let mut series = discover(&args.paths)?;
-    if let Some(filter) = &args.filter {
-        series.retain(|s| s.key.contains(filter));
-    }
+    let series = select_series(&args)?;
     if series.is_empty() {
         println!(
             "no <symbol>_<YYYYMMDD>.zst files found under: {}",
@@ -1397,12 +1329,6 @@ fn main() -> Result<()> {
                 .join(", ")
         );
         return Ok(());
-    }
-    if let Some(override_name) = &args.exchange {
-        let family = Family::from_override(override_name);
-        for s in &mut series {
-            s.family = family;
-        }
     }
 
     let cpus = std::thread::available_parallelism()
@@ -1421,7 +1347,38 @@ fn main() -> Result<()> {
         args.min_gap,
         if args.exact { ", exact id sets" } else { "" }
     );
+    let reports = scan_all(&series, &args, jobs);
 
+    let mut out = String::new();
+    let with_issues =
+        write_output(&mut out, &reports, &args).expect("formatting into a String cannot fail");
+    print!("{out}");
+    if args.fail_on_gaps && with_issues > 0 {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn min_gap_ns(args: &Args) -> i64 {
+    (args.min_gap.max(0.0) * 1e9) as i64
+}
+
+fn select_series(args: &Args) -> Result<Vec<Series>> {
+    let mut series = discover(&args.paths)?;
+    if let Some(filter) = &args.filter {
+        series.retain(|s| s.key.contains(filter));
+    }
+    if let Some(family) = args.exchange {
+        for s in &mut series {
+            s.family = family;
+        }
+    }
+    Ok(series)
+}
+
+/// Scan every series on `jobs` threads; reports come back sorted by key.
+fn scan_all(series: &[Series], args: &Args, jobs: usize) -> Vec<SeriesReport> {
+    let min_gap_ns = min_gap_ns(args);
     let next = AtomicUsize::new(0);
     let done = AtomicUsize::new(0);
     let results: Mutex<Vec<SeriesReport>> = Mutex::new(Vec::with_capacity(series.len()));
@@ -1451,99 +1408,123 @@ fn main() -> Result<()> {
 
     let mut reports = results.into_inner().expect("results mutex");
     reports.sort_by(|a, b| a.key.cmp(&b.key));
+    reports
+}
 
-    println!();
-    for report in &reports {
-        print_report(report, min_gap_ns, args.max_reported, args.exact);
+/// Everything printed to stdout after the scan; returns the number of series
+/// with issues.
+fn write_output(
+    out: &mut impl fmt::Write,
+    reports: &[SeriesReport],
+    args: &Args,
+) -> Result<usize, fmt::Error> {
+    let min_gap_ns = min_gap_ns(args);
+    let mut totals = Totals::default();
+    writeln!(out)?;
+    for report in reports {
+        write_report(out, report, min_gap_ns, args.max_reported, args.exact)?;
+        totals.add(report);
+    }
+    totals.write(out, args)?;
+    Ok(totals.with_issues)
+}
+
+/// Sums over every series for the SUMMARY block.
+#[derive(Default)]
+struct Totals {
+    series: usize,
+    rows: u64,
+    recv_gaps: usize,
+    gap_series: usize,
+    silence: i64,
+    fwd_events: u64,
+    fwd_ids: u64,
+    net_missing: i64,
+    exact_missing: u64,
+    back_events: u64,
+    time_regressions: u64,
+    missing_dates: usize,
+    decode_errors: usize,
+    bad_lines: u64,
+    foreign_files: usize,
+    with_issues: usize,
+}
+
+impl Totals {
+    fn add(&mut self, report: &SeriesReport) {
+        self.series += 1;
+        self.rows += report.rows;
+        self.recv_gaps += report.gaps.len();
+        self.gap_series += usize::from(!report.gaps.is_empty());
+        self.silence += report.gaps.iter().map(|g| g.end - g.start).sum::<i64>();
+        for s in report.streams.iter().map(|stream| &stream.stats) {
+            self.fwd_events += s.seq_fwd_events;
+            self.fwd_ids += s.seq_fwd_ids;
+            self.net_missing += s.net_deficit().max(0);
+            self.exact_missing += s.exact_missing;
+            self.back_events += s.seq_back_events;
+            self.time_regressions += s.time_regressions;
+        }
+        self.missing_dates += report.missing_dates.len();
+        for file in &report.files {
+            self.decode_errors += usize::from(file.decode_error.is_some());
+            self.foreign_files += usize::from(file.foreign);
+        }
+        self.bad_lines += report.bad_lines;
+        self.with_issues += usize::from(report.has_issues());
     }
 
-    let foreign_files: usize = reports
-        .iter()
-        .flat_map(|r| &r.files)
-        .filter(|f| f.foreign)
-        .count();
-    let decode_errors: usize = reports
-        .iter()
-        .flat_map(|r| &r.files)
-        .filter(|f| f.decode_error.is_some())
-        .count();
-    let recv_gaps: usize = reports.iter().map(|r| r.gaps.len()).sum();
-    let gap_series = reports.iter().filter(|r| !r.gaps.is_empty()).count();
-    let silence_total: i64 = reports
-        .iter()
-        .flat_map(|r| &r.gaps)
-        .map(|g| g.end - g.start)
-        .sum();
-    let fwd_events: u64 = reports
-        .iter()
-        .flat_map(|r| &r.streams)
-        .map(|(_, s, _)| s.seq_fwd_events)
-        .sum();
-    let fwd_ids: u64 = reports
-        .iter()
-        .flat_map(|r| &r.streams)
-        .map(|(_, s, _)| s.seq_fwd_ids)
-        .sum();
-    let net_positive: i64 = reports
-        .iter()
-        .flat_map(|r| &r.streams)
-        .map(|(_, s, _)| s.net_deficit().max(0))
-        .sum();
-    let exact_missing: u64 = reports
-        .iter()
-        .flat_map(|r| &r.streams)
-        .map(|(_, s, _)| s.exact_missing)
-        .sum();
-    let back_events: u64 = reports
-        .iter()
-        .flat_map(|r| &r.streams)
-        .map(|(_, s, _)| s.seq_back_events)
-        .sum();
-    let time_regressions: u64 = reports
-        .iter()
-        .flat_map(|r| &r.streams)
-        .map(|(_, s, _)| s.time_regressions)
-        .sum();
-    let missing_dates: usize = reports.iter().map(|r| r.missing_dates.len()).sum();
-    let bad_lines: u64 = reports.iter().map(|r| r.bad_lines).sum();
-    let rows: u64 = reports.iter().map(|r| r.rows).sum();
-    let with_issues = reports.iter().filter(|r| r.has_issues()).count();
-
-    println!("SUMMARY");
-    println!("  series scanned        : {}", reports.len());
-    println!("  rows decoded          : {}", grouped(rows));
-    println!(
-        "  recv gaps > {}s  : {} across {} series (total silence {})",
-        args.min_gap,
-        recv_gaps,
-        gap_series,
-        fmt_dur(silence_total)
-    );
-    println!(
-        "  forward chain breaks  : {} event(s), {} ids",
-        grouped(fwd_events),
-        grouped(fwd_ids)
-    );
-    if args.exact {
-        println!("  exact missing ids     : {}", grouped(exact_missing));
-    } else {
-        println!(
-            "  net missing ids       : {} (range accounting)",
-            grouped(net_positive as u64)
-        );
+    fn write(&self, out: &mut impl fmt::Write, args: &Args) -> fmt::Result {
+        writeln!(out, "SUMMARY")?;
+        writeln!(out, "  series scanned        : {}", self.series)?;
+        writeln!(out, "  rows decoded          : {}", grouped(self.rows))?;
+        writeln!(
+            out,
+            "  recv gaps > {}s  : {} across {} series (total silence {})",
+            args.min_gap,
+            self.recv_gaps,
+            self.gap_series,
+            fmt_dur(self.silence)
+        )?;
+        writeln!(
+            out,
+            "  forward chain breaks  : {} event(s), {} ids",
+            grouped(self.fwd_events),
+            grouped(self.fwd_ids)
+        )?;
+        if args.exact {
+            writeln!(
+                out,
+                "  exact missing ids     : {}",
+                grouped(self.exact_missing)
+            )?;
+        } else {
+            writeln!(
+                out,
+                "  net missing ids       : {} (range accounting)",
+                grouped(self.net_missing as u64)
+            )?;
+        }
+        writeln!(
+            out,
+            "  dup/reordered events  : {}",
+            grouped(self.back_events)
+        )?;
+        writeln!(
+            out,
+            "  time regressions      : {}",
+            grouped(self.time_regressions)
+        )?;
+        writeln!(out, "  missing dates         : {}", self.missing_dates)?;
+        writeln!(out, "  decode errors         : {}", self.decode_errors)?;
+        writeln!(out, "  bad lines             : {}", grouped(self.bad_lines))?;
+        writeln!(
+            out,
+            "  foreign files         : {} (skipped)",
+            self.foreign_files
+        )?;
+        writeln!(out, "RESULT: issues found in {} series", self.with_issues)
     }
-    println!("  dup/reordered events  : {}", grouped(back_events));
-    println!("  time regressions      : {}", grouped(time_regressions));
-    println!("  missing dates         : {missing_dates}");
-    println!("  decode errors         : {decode_errors}");
-    println!("  bad lines             : {}", grouped(bad_lines));
-    println!("  foreign files         : {foreign_files} (skipped)");
-
-    println!("RESULT: issues found in {with_issues} series");
-    if args.fail_on_gaps && with_issues > 0 {
-        std::process::exit(1);
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1551,11 +1532,7 @@ mod tests {
     use super::*;
 
     fn scan_line(scan: &mut SeriesScan, family: Family, recv: i64, json: &str) {
-        let line = format!("{recv} {json}");
-        assert!(matches!(
-            scan.process_line(family, line.as_bytes(), 5_000_000_000),
-            LineOutcome::Ok
-        ));
+        scan.process_payload(family, recv, json.as_bytes(), 5_000_000_000);
     }
 
     #[test]
@@ -1583,11 +1560,11 @@ mod tests {
         scan_line(&mut scan, Family::BinanceSpot, 3, &msg(130, 121)); // 111..120 skipped
         scan_line(&mut scan, Family::BinanceSpot, 4, &msg(130, 118)); // duplicate window
         scan_line(&mut scan, Family::BinanceSpot, 5, &msg(140, 131)); // contiguous again
-        let stats = &scan.streams[0].1.stats;
+        let stats = &scan.streams[0].stats;
         assert_eq!(stats.seq_fwd_events, 1);
         assert_eq!(stats.seq_fwd_ids, 10);
         assert_eq!(stats.seq_back_events, 1);
-        assert_eq!(scan.streams[0].1.break_times, vec![3]);
+        assert_eq!(scan.streams[0].break_times, vec![3]);
     }
 
     #[test]
@@ -1602,11 +1579,11 @@ mod tests {
         scan_line(&mut scan, Family::BinanceFutures, 1, &msg(100, 150, 160));
         scan_line(&mut scan, Family::BinanceFutures, 2, &msg(160, 400, 410));
         scan_line(&mut scan, Family::BinanceFutures, 3, &msg(430, 500, 520)); // 411..430 lost
-        let stats = &scan.streams[0].1.stats;
+        let stats = &scan.streams[0].stats;
         assert_eq!(stats.seq_fwd_events, 1);
         assert_eq!(stats.seq_fwd_ids, 20);
         assert_eq!(stats.seq_back_events, 0);
-        assert_eq!(scan.streams[0].1.break_times, vec![3]);
+        assert_eq!(scan.streams[0].break_times, vec![3]);
     }
 
     #[test]
@@ -1619,7 +1596,7 @@ mod tests {
         scan_line(&mut scan, Family::BinanceSpot, 3, &msg(13)); // 12 not seen yet
         scan_line(&mut scan, Family::BinanceSpot, 4, &msg(12)); // arrives late
         scan_line(&mut scan, Family::BinanceSpot, 5, &msg(14)); // contiguous vs max
-        let stats = &scan.streams[0].1.stats;
+        let stats = &scan.streams[0].stats;
         assert_eq!(stats.seq_fwd_events, 1);
         assert_eq!(stats.seq_fwd_ids, 1);
         assert_eq!(stats.seq_back_events, 1);
@@ -1645,7 +1622,7 @@ mod tests {
         let mut scan = SeriesScan::default();
         let json = r#"{"stream":"btcusdt@depth@100ms","data":{"e":"depthUpdate","u":5,"a":[["1.0","2.0"]]}}"#;
         scan_line(&mut scan, Family::BinanceSpot, 1, json);
-        let stats = &scan.streams[0].1.stats;
+        let stats = &scan.streams[0].stats;
         assert_eq!(stats.messages, 1);
         assert_eq!(stats.seq_fwd_events, 0);
     }
@@ -1668,7 +1645,7 @@ mod tests {
         scan_line(&mut scan, Family::Bybit, 2, &snapshot(50, 50));
         scan_line(&mut scan, Family::Bybit, 3, &delta(90, 90));
         scan_line(&mut scan, Family::Bybit, 4, &delta(110, 110));
-        let stats = &scan.streams[0].1.stats;
+        let stats = &scan.streams[0].stats;
         // Only the 90 < 100 delta counts; once for `u` and once for `seq`.
         assert_eq!(stats.seq_back_events, 2);
         assert_eq!(stats.time_regressions, 1);
@@ -1681,18 +1658,19 @@ mod tests {
         scan_line(&mut scan, Family::Hyperliquid, 1, json);
         let json = r#"{"channel":"trades","data":[{"time":60}]}"#;
         scan_line(&mut scan, Family::Hyperliquid, 2, json);
-        let stats = &scan.streams[0].1.stats;
+        let stats = &scan.streams[0].stats;
         assert_eq!(stats.time_regressions, 1);
     }
 
     #[test]
-    fn foreign_first_line_is_detected() {
-        let mut scan = SeriesScan::default();
-        let binary: Vec<u8> = vec![0u8, 1, 2, 3, 255, 254, 253, 252];
-        assert!(matches!(
-            scan.process_line(Family::Generic, &binary, 5_000_000_000),
-            LineOutcome::Bad
-        ));
+    fn record_lines_parse_and_a_binary_first_line_is_foreign() {
+        assert_eq!(
+            parse_record_line(b"123 {\"a\":1}"),
+            Some((123, &b"{\"a\":1}"[..]))
+        );
+        assert_eq!(parse_record_line(b"123 [1]"), None);
+        let binary = [0u8, 1, 2, 3, 255, 254, 253, 252];
+        assert_eq!(parse_record_line(&binary), None);
         assert!(is_foreign(&binary));
         assert!(!is_foreign(b"123 {\"a\":1}"));
     }
@@ -1737,25 +1715,6 @@ mod tests {
     }
 
     #[test]
-    fn non_overlapping_records_preserve_recorded_order() {
-        let records = vec![
-            RawLine {
-                recv: 200,
-                payload: b"{}".to_vec(),
-                source: 0,
-            },
-            RawLine {
-                recv: 100,
-                payload: b"{}".to_vec(),
-                source: 0,
-            },
-        ];
-        let mut scan = SeriesScan::default();
-        process_lines(&mut scan, Family::Generic, records, 1_000, false);
-        assert_eq!(scan.recv_regressions, 1);
-    }
-
-    #[test]
     fn overlapping_runs_are_time_merged_and_cross_run_duplicates_are_removed() {
         let ten_old = br#"{"stream":"btcusdt@trade","data":{"e":"trade","E":10,"t":10}}"#.to_vec();
         let ten_new = br#"{"stream":"btcusdt@trade","data":{"e":"trade","E":11,"t":10}}"#.to_vec();
@@ -1796,8 +1755,8 @@ mod tests {
             },
         ];
         let mut scan = SeriesScan::default();
-        process_lines(&mut scan, Family::BinanceSpot, records, 5_000_000_000, true);
-        let stats = &scan.streams[0].1.stats;
+        merge_overlapping_runs(&mut scan, Family::BinanceSpot, records, 5_000_000_000);
+        let stats = &scan.streams[0].stats;
         assert_eq!(scan.rows, 4);
         assert_eq!(scan.recv_regressions, 0);
         assert!(scan.gaps.is_empty());
@@ -1822,7 +1781,7 @@ mod tests {
             raw(20, br#"{"run":"new-end"}"#, 1),
         ];
         let mut scan = SeriesScan::default();
-        process_lines(&mut scan, Family::Generic, records, 100, true);
+        merge_overlapping_runs(&mut scan, Family::Generic, records, 100);
         assert_eq!(scan.rows, 6);
     }
 
@@ -1830,15 +1789,7 @@ mod tests {
     fn legacy_file_streams_in_recorded_order_and_retains_its_path() {
         use std::io::Write;
 
-        let dir = std::env::temp_dir().join(format!(
-            "collector-gap-detector-test-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir_all(&dir).unwrap();
+        let dir = test_dir("legacy");
         let path = dir.join("btcusdt_20260820.zst");
         {
             let file = File::create(&path).unwrap();
@@ -1863,6 +1814,289 @@ mod tests {
         assert_eq!(report.files[0].path, path);
 
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn test_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "collector-gap-{tag}-test-{}-{}",
+            std::process::id(),
+            Timestamp::now().as_nanosecond()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_zst(path: &Path, bytes: &[u8]) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, zstd::encode_all(bytes, 1).unwrap()).unwrap();
+    }
+
+    /// A small recording that exercises every part of the report.
+    fn golden_fixture(dir: &Path) {
+        const DAY_ONE: i64 = 1_787_184_000_000_000_000; // 2026-08-20 00:00 UTC
+        const DAY_THREE: i64 = DAY_ONE + 2 * 86_400 * S;
+        const S: i64 = 1_000_000_000;
+        let lines = |records: &[(i64, String)]| -> Vec<u8> {
+            records
+                .iter()
+                .map(|(recv, json)| format!("{recv} {json}\n"))
+                .collect::<String>()
+                .into_bytes()
+        };
+        let trade = |t: u64, e: u64| {
+            format!(r#"{{"stream":"btcusdt@trade","data":{{"e":"trade","E":{e},"t":{t}}}}}"#)
+        };
+        let depth = |first: u64, last: u64| {
+            format!(
+                r#"{{"stream":"btcusdt@depth@100ms","data":{{"e":"depthUpdate","U":{first},"u":{last},"b":[["1","2"]],"a":[["3","4"]]}}}}"#
+            )
+        };
+        let agg = |a: u64| format!(r#"{{"stream":"btcusdt@aggTrade","data":{{"a":{a}}}}}"#);
+        let spot = dir.join("binance/spot");
+        let mut day_one = lines(&[
+            (DAY_ONE + S, trade(10, 100)),
+            (DAY_ONE + 2 * S, trade(11, 101)),
+            (DAY_ONE + 3 * S, trade(13, 102)),
+            (DAY_ONE + 2 * S + 500, trade(12, 99)),
+            (DAY_ONE + 20 * S, trade(14, 103)),
+            (DAY_ONE + 21 * S, depth(90, 100)),
+            (DAY_ONE + 22 * S, depth(101, 110)),
+            (DAY_ONE + 23 * S, depth(121, 130)),
+            (DAY_ONE + 24 * S, depth(118, 130)),
+            (DAY_ONE + 25 * S, agg(5)),
+            (DAY_ONE + 26 * S, agg(9)),
+            (
+                DAY_ONE + 27 * S,
+                r#"{"stream":"btcusdt@trade","data":{bad}}"#.to_owned(),
+            ),
+        ]);
+        day_one.extend_from_slice(b"garbage line\n");
+        write_zst(&spot.join("btcusdt_20260820.zst"), &day_one);
+        let day_three: Vec<_> = (0..4)
+            .map(|i| (DAY_THREE + i as i64 * S, trade(2_000_000 + i, 200 + i)))
+            .collect();
+        write_zst(&spot.join("btcusdt_20260822.zst"), &lines(&day_three));
+        // Another run's sidecar: two copies stamped with a different `E`.
+        write_zst(
+            &spot.join("btcusdt_20260822_run-b.zst"),
+            &lines(&[
+                (DAY_THREE + S + 300, trade(2_000_001, 900)),
+                (DAY_THREE + 2 * S + 300, trade(2_000_002, 901)),
+                (DAY_THREE + 4 * S, trade(2_000_004, 204)),
+            ]),
+        );
+
+        let futures_depth = |pu: u64, first: u64, last: u64, e: u64| {
+            format!(
+                r#"{{"stream":"ethusdt@depth@0ms","data":{{"e":"depthUpdate","E":{e},"pu":{pu},"U":{first},"u":{last}}}}}"#
+            )
+        };
+        write_zst(
+            &dir.join("binance/futures/um/ethusdt_20260820.zst"),
+            &lines(&[
+                (DAY_ONE + S, futures_depth(100, 150, 160, 1)),
+                (DAY_ONE + 2 * S, futures_depth(160, 400, 410, 2)),
+                (DAY_ONE + 3 * S, futures_depth(430, 500, 520, 3)),
+                (DAY_ONE + 4 * S, futures_depth(500, 510, 515, 2)),
+            ]),
+        );
+
+        let book = |kind: &str, u: u64| {
+            format!(
+                r#"{{"topic":"orderbook.50.BTCUSDT","type":"{kind}","ts":{u},"data":{{"u":{u},"seq":{u}}}}}"#
+            )
+        };
+        write_zst(
+            &dir.join("bybit/btcusdt_20260820.zst"),
+            &lines(&[
+                (DAY_ONE + S, book("delta", 100)),
+                (DAY_ONE + 2 * S, book("snapshot", 50)),
+                (DAY_ONE + 3 * S, book("delta", 90)),
+                (DAY_ONE + 4 * S, book("delta", 110)),
+                (
+                    DAY_ONE + 5 * S,
+                    r#"{"topic":"publicTrade.BTCUSDT","data":[{"T":5},{"T":9}]}"#.to_owned(),
+                ),
+                (
+                    DAY_ONE + 6 * S,
+                    r#"{"topic":"publicTrade.BTCUSDT","data":[{"T":7}]}"#.to_owned(),
+                ),
+                (
+                    DAY_ONE + 7 * S,
+                    r#"{"success":true,"op":"subscribe"}"#.to_owned(),
+                ),
+            ]),
+        );
+
+        write_zst(
+            &dir.join("hyperliquid/btc_20260820.zst"),
+            &lines(&[
+                (
+                    DAY_ONE + S,
+                    r#"{"channel":"trades","data":[{"time":50},{"time":70}]}"#.to_owned(),
+                ),
+                (
+                    DAY_ONE + 2 * S,
+                    r#"{"channel":"trades","data":[{"time":60}]}"#.to_owned(),
+                ),
+                (
+                    DAY_ONE + 3 * S,
+                    r#"{"channel":"l2Book","data":{"coin":"BTC","time":80,"levels":[[],[]]}}"#
+                        .to_owned(),
+                ),
+            ]),
+        );
+
+        let generic = dir.join("generic");
+        write_zst(
+            &generic.join("foreign_20260820.zst"),
+            &(0..=255u8).cycle().take(2048).collect::<Vec<_>>(),
+        );
+        let gappy: Vec<_> = (0..4)
+            .map(|i| (DAY_ONE + i * 90 * S, "{}".to_owned()))
+            .collect();
+        write_zst(&generic.join("gappy_20260820.zst"), &lines(&gappy));
+        let whole = zstd::encode_all(&lines(&gappy)[..], 1).unwrap();
+        let truncated = &whole[..whole.len() - 3];
+        fs::write(generic.join("live_20260820.zst"), truncated).unwrap();
+        let broken = generic.join("broken_20260820.zst");
+        fs::write(&broken, truncated).unwrap();
+        File::options()
+            .write(true)
+            .open(&broken)
+            .unwrap()
+            .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(1_767_225_600))
+            .unwrap();
+    }
+
+    /// stdout for `golden_fixture` with `--max-reported 2`, as printed by the
+    /// gap detector before its report code was restructured.
+    const GOLDEN: &str = r#"
+<dir>/binance/futures/um/ethusdt (binance-futures)
+  files: <dir>/binance/futures/um/ethusdt_20260820.zst
+  rows: 4 | recv span: 2026-08-20 00:00:01.000Z .. 2026-08-20 00:00:04.000Z | bad lines: 0
+  recv gaps > 5.000s: none
+  streams:
+    ethusdt@depth@0ms: 4 msgs
+      1 forward chain break(s), 20 ids
+      breaks at: 2026-08-20 00:00:03.000Z
+      1 duplicate/reordered event(s)
+      1 time regression(s)
+
+<dir>/binance/spot/btcusdt (binance-spot)
+  files: <dir>/binance/spot/btcusdt_20260820.zst, <dir>/binance/spot/btcusdt_20260822.zst, <dir>/binance/spot/btcusdt_20260822_run-b.zst
+  rows: 17 | recv span: 2026-08-20 00:00:01.000Z .. 2026-08-22 00:00:04.000Z | bad lines: 2
+  MISSING DATES: 2026-08-21
+  receive time regressions: 1 (arrival-vs-dequeue ordering)
+  RECV GAPS > 5.000s: 2 (total silence 47h59m50s)
+    2026-08-20 00:00:27.000Z .. 2026-08-22 00:00:00.000Z (47h59m33s)
+    2026-08-20 00:00:02.000Z .. 2026-08-20 00:00:20.000Z (18.000s)
+  streams:
+    btcusdt@aggTrade: 2 msgs
+      ids 5..9: net 3 missing (2 observed)
+      1 forward chain break(s), 3 ids
+      breaks at: 2026-08-20 00:00:26.000Z
+    btcusdt@depth@100ms: 4 msgs
+      1 forward chain break(s), 10 ids
+      breaks at: 2026-08-20 00:00:23.000Z
+      1 duplicate/reordered event(s)
+    btcusdt@trade: 10 msgs
+      ids 10..2,000,004: net 1,999,985 missing (10 observed)
+      2 forward chain break(s), 1,999,986 ids
+      breaks at: 2026-08-20 00:00:03.000Z, 2026-08-22 00:00:00.000Z
+      1 duplicate/reordered event(s)
+      1 time regression(s)
+
+<dir>/bybit/btcusdt (bybit)
+  files: <dir>/bybit/btcusdt_20260820.zst
+  rows: 7 | recv span: 2026-08-20 00:00:01.000Z .. 2026-08-20 00:00:07.000Z | bad lines: 0
+  recv gaps > 5.000s: none
+  streams:
+    orderbook.50.BTCUSDT: 4 msgs
+      2 duplicate/reordered event(s)
+      1 time regression(s)
+    publicTrade.BTCUSDT: 2 msgs
+      1 time regression(s)
+
+<dir>/generic/broken (generic)
+  files: <dir>/generic/broken_20260820.zst
+    <dir>/generic/broken_20260820.zst: decode error after 0 rows: incomplete frame
+  (no rows decoded)
+  recv gaps > 5.000s: none
+
+<dir>/generic/foreign (generic)
+  files: <dir>/generic/foreign_20260820.zst
+    <dir>/generic/foreign_20260820.zst: foreign format (not `<recv_ns> <json>` lines), skipped
+  recv gaps > 5.000s: none
+
+<dir>/generic/gappy (generic)
+  files: <dir>/generic/gappy_20260820.zst
+  rows: 4 | recv span: 2026-08-20 00:00:00.000Z .. 2026-08-20 00:04:30.000Z | bad lines: 0
+  RECV GAPS > 5.000s: 3 (total silence 4m30s)
+    2026-08-20 00:00:00.000Z .. 2026-08-20 00:01:30.000Z (1m30s)
+    2026-08-20 00:01:30.000Z .. 2026-08-20 00:03:00.000Z (1m30s)
+    ... 1 more
+
+<dir>/generic/live (generic)
+  files: <dir>/generic/live_20260820.zst
+    <dir>/generic/live_20260820.zst: unterminated zstd stream after 0 rows (file modified recently — still being written?): incomplete frame
+  (no rows decoded)
+  recv gaps > 5.000s: none
+
+<dir>/hyperliquid/btc (hyperliquid)
+  files: <dir>/hyperliquid/btc_20260820.zst
+  rows: 3 | recv span: 2026-08-20 00:00:01.000Z .. 2026-08-20 00:00:03.000Z | bad lines: 0
+  recv gaps > 5.000s: none
+  streams:
+    trades: 2 msgs
+      1 time regression(s)
+
+SUMMARY
+  series scanned        : 8
+  rows decoded          : 35
+  recv gaps > 5s  : 5 across 2 series (total silence 48h04m20s)
+  forward chain breaks  : 5 event(s), 2,000,019 ids
+  net missing ids       : 1,999,988 (range accounting)
+  dup/reordered events  : 5
+  time regressions      : 5
+  missing dates         : 1
+  decode errors         : 2
+  bad lines             : 2
+  foreign files         : 1 (skipped)
+RESULT: issues found in 5 series
+"#;
+
+    #[test]
+    fn report_text_is_pinned() {
+        let dir = test_dir("golden");
+        golden_fixture(&dir);
+        let root = dir.to_str().unwrap();
+        let args = Args::try_parse_from(["gap_detector", root, "--max-reported", "2"]).unwrap();
+        let reports = scan_all(&select_series(&args).unwrap(), &args, 2);
+        let mut out = String::new();
+        let with_issues = write_output(&mut out, &reports, &args).unwrap();
+        assert_eq!(with_issues, 5);
+        assert_eq!(out.replace(root, "<dir>"), GOLDEN);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `--exchange` values, which are also the family labels in the report.
+    #[test]
+    fn exchange_values_match_the_cli() {
+        let names: Vec<String> = Family::value_variants()
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "binance-spot",
+                "binance-futures",
+                "bybit",
+                "hyperliquid",
+                "generic"
+            ]
+        );
     }
 
     #[test]
