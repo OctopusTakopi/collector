@@ -155,6 +155,8 @@ fn trailer(offset: u64) -> [u8; TRAILER_LEN] {
 /// trailer takes one `pread`; one written without (by an older binary) is
 /// walked.
 fn ends_cleanly(file: &File) -> io::Result<bool> {
+    #[cfg(test)]
+    fault::check(fault::Step::Verify)?;
     let len = file.metadata()?.len();
     if len == 0 {
         return Ok(true);
@@ -249,6 +251,7 @@ fn open_locked(path: &Path) -> io::Result<Option<File>> {
 }
 
 /// Lock the day's file for appending; `None` while another writer holds it.
+/// An error leaves the day's file unusable for now, never the writer.
 fn try_lock_daily(prefix: &Path, date: Date) -> io::Result<Option<File>> {
     #[cfg(test)]
     fault::check(fault::Step::Lock)?;
@@ -256,8 +259,14 @@ fn try_lock_daily(prefix: &Path, date: Date) -> io::Result<Option<File>> {
     let Some(file) = open_locked(&daily)? else {
         return Ok(None);
     };
-    if ends_cleanly(&file)? {
-        return Ok(Some(file));
+    match ends_cleanly(&file) {
+        Ok(true) => return Ok(Some(file)),
+        Ok(false) => {}
+        Err(error) => warn!(
+            path = %daily.display(),
+            %error,
+            "cannot verify the daily file; treating it as unterminated"
+        ),
     }
     // The last writer died mid-frame: set the file aside, readable up to
     // where it stops, and start the day again in a fresh one.
@@ -266,11 +275,13 @@ fn try_lock_daily(prefix: &Path, date: Date) -> io::Result<Option<File>> {
         date,
         format_args!("_unterminated-{}", Timestamp::now().as_nanosecond()),
     );
+    #[cfg(test)]
+    fault::check(fault::Step::SetAside)?;
     fs::rename(&daily, &salvage)?;
     warn!(
         path = %daily.display(),
         salvage = %salvage.display(),
-        "daily file ends mid-frame; moved it aside instead of appending to it"
+        "daily file does not end on a frame boundary; moved it aside instead of appending to it"
     );
     let fresh = open_locked(&daily);
     // The old inode stays locked until the fresh one is.
@@ -345,24 +356,6 @@ fn merge_into_daily(prefix: &Path, date: Date, sidecar: &Path) -> io::Result<Opt
         return Ok(None);
     };
     merge_sidecar(&mut daily, sidecar).map(Some)
-}
-
-/// The day's file, or this run's sidecar while another writer holds it.
-fn open_sink(prefix: &Path, date: Date, run_id: &str) -> io::Result<Sink> {
-    if let Some(daily) = try_lock_daily(prefix, date)? {
-        return Ok(Sink::Daily(ZstdEncoder::new(daily, ZSTD_LEVEL)?));
-    }
-    let path = day_file(prefix, date, format_args!("_{run_id}"));
-    let file = File::options().create_new(true).write(true).open(&path)?;
-    lock_exclusively(&file, &path)?;
-    warn!(
-        path = %path.display(),
-        "daily file busy; writing a run-local sidecar until the incumbent releases it"
-    );
-    Ok(Sink::Sidecar {
-        encoder: ZstdEncoder::new(file, ZSTD_LEVEL)?,
-        path,
-    })
 }
 
 fn reopen_sidecar(path: &Path) -> io::Result<ZstdEncoder> {
@@ -455,18 +448,52 @@ impl RotatingFile {
         quality: QualityReporter,
     ) -> io::Result<Self> {
         let day = Day::containing(timestamp)?;
-        let sink = open_sink(&prefix, day.date, &run_id)?;
-        Ok(Self {
+        let mut file = Self {
             prefix,
             run_id,
             day,
-            sink,
+            sink: Sink::Closed,
             pending_sidecars: Vec::new(),
             batch: BytesMut::with_capacity(ZSTD_BATCH_BYTES),
             degraded: false,
             merge_retry_at: None,
             quality,
+        };
+        file.sink = file.open_sink(day.date)?;
+        Ok(file)
+    }
+
+    /// The day's file, or this run's sidecar while another writer holds it or
+    /// it cannot be used. Fails only if neither can be opened.
+    fn open_sink(&mut self, date: Date) -> io::Result<Sink> {
+        let path = day_file(&self.prefix, date, format_args!("_{}", self.run_id));
+        match try_lock_daily(&self.prefix, date) {
+            Ok(Some(daily)) => return Ok(Sink::Daily(ZstdEncoder::new(daily, ZSTD_LEVEL)?)),
+            Ok(None) => warn!(
+                path = %path.display(),
+                "daily file busy; writing a run-local sidecar until the incumbent releases it"
+            ),
+            Err(error) => self.daily_unusable(date, &error),
+        }
+        let file = File::options().create_new(true).write(true).open(&path)?;
+        lock_exclusively(&file, &path)?;
+        Ok(Sink::Sidecar {
+            encoder: ZstdEncoder::new(file, ZSTD_LEVEL)?,
+            path,
         })
+    }
+
+    /// The day's file could not be locked, verified or set aside: report it,
+    /// and probe it again only after the backoff.
+    fn daily_unusable(&mut self, date: Date, error: &io::Error) {
+        let daily = day_file(&self.prefix, date, format_args!(""));
+        error!(
+            path = %daily.display(),
+            %error,
+            "cannot use the daily file; records go to a run-local sidecar meanwhile"
+        );
+        self.mark_degraded(daily.display().to_string(), error);
+        self.merge_retry_at = Some(Instant::now() + MERGE_RETRY_BACKOFF);
     }
 
     fn write(&mut self, timestamp: Timestamp, data: Bytes) -> io::Result<()> {
@@ -531,7 +558,7 @@ impl RotatingFile {
             daily_or_closed => self.sink = daily_or_closed,
         }
         let day = Day::containing(timestamp)?;
-        let sink = open_sink(&self.prefix, day.date, &self.run_id)?;
+        let sink = self.open_sink(day.date)?;
         self.batch.clear();
         self.sink = sink;
         self.day = day;
@@ -541,12 +568,19 @@ impl RotatingFile {
 
     /// Once the incumbent has released the daily file, append this run's
     /// sidecar to it and delete the sidecar — the only time one is removed.
+    /// Failures are reported and retried after the backoff; only opening an
+    /// encoder on the daily file fails this.
     fn switch_to_daily(&mut self, after: AfterSwitch) -> io::Result<()> {
         let Some(sidecar) = self.sink.sidecar() else {
             return Ok(());
         };
-        let Some(mut daily) = try_lock_daily(&self.prefix, self.day.date)? else {
-            return Ok(());
+        let mut daily = match try_lock_daily(&self.prefix, self.day.date) {
+            Ok(Some(daily)) => daily,
+            Ok(None) => return Ok(()),
+            Err(error) => {
+                self.daily_unusable(self.day.date, &error);
+                return Ok(());
+            }
         };
         let sidecar = sidecar.to_path_buf();
         if let Err(error) = self.finalize() {
@@ -586,8 +620,8 @@ impl RotatingFile {
     /// After a failed append of a finished sidecar: reopen it, so the day's
     /// records keep going there and a later switch retries the append.
     /// Failing that, retry the append through the daily file still locked
-    /// here — not through a fresh lock, which would verify it again — or
-    /// queue the sidecar when releasing.
+    /// here — not through a fresh lock, which would verify it again — and
+    /// queue the sidecar until this run releases that file if it fails again.
     fn resume_or_queue_sidecar(
         &mut self,
         sidecar: PathBuf,
@@ -608,31 +642,18 @@ impl RotatingFile {
                 "failed to resume overlap sidecar after a failed merge"
             ),
         }
-        let merged = match merge_sidecar(&mut daily, &sidecar) {
-            Ok(merge) => {
-                if let Merge::Unterminated = merge {
-                    self.sidecar_unterminated(&sidecar);
-                }
-                Ok(daily)
-            }
+        match merge_sidecar(&mut daily, &sidecar) {
+            Ok(Merge::Appended) => {}
+            Ok(Merge::Unterminated) => self.sidecar_unterminated(&sidecar),
             Err(error) => {
                 self.mark_degraded(sidecar.display().to_string(), &error);
-                Err(error)
-            }
-        };
-        match (merged, after) {
-            (Ok(daily), after) => self.continue_in(daily, after),
-            // The sink stays a sealed sidecar for the next switch to retry.
-            (Err(error), AfterSwitch::Continue) => Err(error),
-            (Err(_), AfterSwitch::Release) => {
                 self.pending_sidecars.push(PendingSidecar {
                     date: self.day.date,
                     path: sidecar,
                 });
-                self.sink = Sink::Closed;
-                Ok(())
             }
         }
+        self.continue_in(daily, after)
     }
 
     fn continue_in(&mut self, daily: File, after: AfterSwitch) -> io::Result<()> {
@@ -645,6 +666,12 @@ impl RotatingFile {
 
     fn merge_pending_sidecars(&mut self) {
         for sidecar in mem::take(&mut self.pending_sidecars) {
+            // This run holds that daily file: the sidecar goes in once the
+            // file is released, at rotation or close.
+            if sidecar.date == self.day.date && matches!(self.sink, Sink::Daily(_)) {
+                self.pending_sidecars.push(sidecar);
+                continue;
+            }
             match merge_into_daily(&self.prefix, sidecar.date, &sidecar.path) {
                 Ok(Some(Merge::Appended)) => {}
                 Ok(Some(Merge::Unterminated)) => self.sidecar_unterminated(&sidecar.path),
@@ -779,14 +806,16 @@ impl Writer {
         let mut first_error = None;
         for (symbol, file) in &mut self.files {
             if let Err(error) = file.switch_to_daily(AfterSwitch::Release) {
-                error!(%symbol, %error, "failed to merge overlap sidecar after switch");
+                error!(%symbol, %error, "failed to switch to the daily file");
                 first_error.get_or_insert(error.into());
             }
+            let finalized = file.finalize();
+            // Released now, the daily file takes the sidecars queued for it.
             file.merge_pending_sidecars();
             if file.holds_sidecars() {
                 info!(%symbol, "closing before switch; leaving overlap sidecar on disk");
             }
-            match file.finalize() {
+            match finalized {
                 Ok(()) if file.degraded => {
                     error!(%symbol, "file closed, but an earlier rotation could not be finalized");
                     first_error.get_or_insert(anyhow::anyhow!(
@@ -813,10 +842,12 @@ mod fault {
     #[derive(Clone, Copy, Debug)]
     pub enum Step {
         Lock,
+        Verify,
+        SetAside,
         Append,
         Resume,
     }
-    const STEPS: usize = 3;
+    const STEPS: usize = 5;
 
     thread_local! {
         static ARMED: Cell<[u32; STEPS]> = const { Cell::new([0; STEPS]) };
@@ -1374,6 +1405,83 @@ mod tests {
         assert_eq!(names(&dir), [DAY_ONE]);
         let text = decoded(dir.join(DAY_ONE));
         for record in [r#"{"n":1}"#, r#"{"n":2}"#, r#"{"n":3}"#] {
+            assert!(text.contains(record), "{record} missing: {text}");
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_queued_sidecar_goes_in_once_the_daily_file_is_released() {
+        let dir = test_dir("merge-queued");
+        let mut incumbent = writer(&dir, "incumbent");
+        put(&mut incumbent, day_one(), br#"{"n":1}"#);
+        let mut challenger = writer(&dir, "challenger");
+        put(&mut challenger, day_one(), br#"{"n":2}"#);
+        incumbent.close().unwrap();
+        fault::arm(fault::Step::Append, 2);
+        fault::arm(fault::Step::Resume, 1);
+
+        put(&mut challenger, day_one(), br#"{"n":3}"#);
+        let file = &challenger.files["btcusdt"];
+        assert!(matches!(file.sink, Sink::Daily(_)));
+        assert_eq!(file.pending_sidecars.len(), 1);
+        put(&mut challenger, day_one(), br#"{"n":4}"#);
+        challenger.close().unwrap_err();
+        assert_eq!(names(&dir), [DAY_ONE]);
+        let text = decoded(dir.join(DAY_ONE));
+        for record in [r#"{"n":1}"#, r#"{"n":2}"#, r#"{"n":3}"#, r#"{"n":4}"#] {
+            assert!(text.contains(record), "{record} missing: {text}");
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_unverifiable_daily_file_is_set_aside() {
+        let dir = test_dir("unverifiable");
+        let daily = dir.join(DAY_ONE);
+        let earlier = zstd::encode_all(&b"earlier"[..], 1).unwrap();
+        fs::write(&daily, &earlier).unwrap();
+        fault::arm(fault::Step::Verify, 1);
+
+        let mut writer = writer(&dir, "restart");
+        put(&mut writer, day_one(), b"later");
+        writer.close().unwrap();
+
+        assert_eq!(decoded(&daily), format!("{DAY_ONE_NS} later\n"));
+        let names = names(&dir);
+        let salvage = names
+            .iter()
+            .find(|name| name.starts_with("btcusdt_20270115_unterminated-"))
+            .unwrap_or_else(|| panic!("the unverified file must be kept aside: {names:?}"));
+        assert_eq!(fs::read(dir.join(salvage)).unwrap(), earlier);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_daily_file_that_cannot_be_set_aside_falls_back_to_a_sidecar() {
+        let dir = test_dir("unmovable");
+        let daily = dir.join(DAY_ONE);
+        let crashed = zstd::encode_all(&b"before-crash"[..], 1).unwrap();
+        fs::write(&daily, &crashed[..crashed.len() - 2]).unwrap();
+        fault::arm(fault::Step::SetAside, 1);
+        let (quality, events) = QualityReporter::test_channel();
+        let mut writer = Writer::new(&dir, "restart", quality);
+
+        put(&mut writer, day_one(), b"during");
+        assert!(matches!(
+            events.try_recv(),
+            Ok(QualityEvent::StorageDegraded { target, .. }) if target == daily.display().to_string()
+        ));
+        assert!(matches!(writer.files["btcusdt"].sink, Sink::Sidecar { .. }));
+        put(&mut writer, day_one(), b"backing-off");
+        assert!(has_sidecar(&dir, "restart"), "no retry before the backoff");
+
+        writer.files.get_mut("btcusdt").unwrap().merge_retry_at = None;
+        put(&mut writer, day_one(), b"after");
+        writer.close().unwrap_err();
+        assert!(!has_sidecar(&dir, "restart"));
+        let text = decoded(&daily);
+        for record in ["during", "backing-off", "after"] {
             assert!(text.contains(record), "{record} missing: {text}");
         }
         fs::remove_dir_all(&dir).unwrap();
