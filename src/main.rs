@@ -1,4 +1,4 @@
-use std::{num::NonZeroUsize, path::PathBuf, time::Duration};
+use std::{io, num::NonZeroUsize, path::PathBuf, time::Duration};
 
 use anyhow::anyhow;
 use clap::{
@@ -106,6 +106,11 @@ async fn main() -> Result<(), anyhow::Error> {
             .init();
     }
 
+    let hangup = Hangup::inherited()?;
+    if hangup == Hangup::Ignored {
+        info!("SIGHUP is ignored (inherited, e.g. nohup); a hangup will not stop the collector");
+    }
+
     let exchange = args.exchange.exchange;
     let connections = args.connections;
     let (readiness, ready_rx) = Readiness::new(exchange.required_sources(connections));
@@ -204,7 +209,7 @@ async fn main() -> Result<(), anyhow::Error> {
     }
 
     let shutdown = select! {
-        result = shutdown_signal() => {
+        result = shutdown_signal(hangup) => {
             let signal = result?;
             info!(signal, "shutdown signal received");
             Shutdown::Signal
@@ -343,19 +348,62 @@ fn first_error<const N: usize>(
     first
 }
 
-async fn shutdown_signal() -> std::io::Result<&'static str> {
+/// What SIGHUP does to the collector.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Hangup {
+    /// Drain and exit. `tmux kill-session` (run_collector.sh cold restart)
+    /// delivers SIGHUP; without a handler it kills the process before
+    /// buffered records are written, leaving every open daily file without
+    /// its zstd footer.
+    Drain,
+    /// Ignored when the process started (`nohup`). A handler would replace
+    /// that `SIG_IGN`, so none is registered.
+    Ignored,
+}
+
+impl Hangup {
+    /// SIGHUP's inherited disposition; call before any handler is registered.
+    fn inherited() -> io::Result<Self> {
+        // SAFETY: an all-zero `sigaction` is a valid value, and with a null
+        // `act` sigaction(2) only stores the current disposition in `old`.
+        let old = unsafe {
+            let mut old: libc::sigaction = std::mem::zeroed();
+            if libc::sigaction(libc::SIGHUP, std::ptr::null(), &mut old) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            old
+        };
+        Ok(Self::from_handler(old.sa_sigaction))
+    }
+
+    fn from_handler(handler: libc::sighandler_t) -> Self {
+        if handler == libc::SIG_IGN {
+            Self::Ignored
+        } else {
+            Self::Drain
+        }
+    }
+}
+
+async fn shutdown_signal(hangup: Hangup) -> io::Result<&'static str> {
     let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())?;
-    // `tmux kill-session` (run_collector.sh cold restart) delivers SIGHUP;
-    // without a handler it kills the process before buffered records are
-    // written, leaving every open daily file without its zstd footer.
-    let mut sighup = signal::unix::signal(signal::unix::SignalKind::hangup())?;
+    let mut sighup = match hangup {
+        Hangup::Drain => Some(signal::unix::signal(signal::unix::SignalKind::hangup())?),
+        Hangup::Ignored => None,
+    };
+    let hangup = async {
+        match &mut sighup {
+            Some(sighup) => sighup.recv().await,
+            None => std::future::pending().await,
+        }
+    };
     select! {
         result = signal::ctrl_c() => {
             result?;
             Ok("SIGINT")
         }
         _ = sigterm.recv() => Ok("SIGTERM"),
-        _ = sighup.recv() => Ok("SIGHUP"),
+        _ = hangup => Ok("SIGHUP"),
     }
 }
 
@@ -377,6 +425,12 @@ mod tests {
             assert_eq!(args.exchange.exchange, exchange);
             assert_eq!(args.connections, NonZeroUsize::MIN);
         }
+    }
+
+    #[test]
+    fn an_inherited_sig_ign_keeps_hangups_ignored() {
+        assert_eq!(Hangup::from_handler(libc::SIG_IGN), Hangup::Ignored);
+        assert_eq!(Hangup::from_handler(libc::SIG_DFL), Hangup::Drain);
     }
 
     #[test]
