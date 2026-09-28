@@ -1,12 +1,9 @@
 use std::{
     borrow::Cow,
     collections::HashMap,
-    fs::File,
+    fs::{File, TryLockError},
     io::{self, Seek, SeekFrom, Write},
-    os::{
-        fd::AsRawFd,
-        unix::fs::{FileExt, MetadataExt},
-    },
+    os::unix::fs::{FileExt, MetadataExt},
     time::{Duration, Instant},
 };
 
@@ -77,16 +74,13 @@ fn encode_symbol(symbol: &str) -> Cow<'_, str> {
     Cow::Owned(encoded)
 }
 
+/// Take the exclusive lock without blocking; `false` if another writer
+/// holds it. On Linux this is `flock(LOCK_EX | LOCK_NB)`.
 fn try_exclusive_lock(file: &File) -> io::Result<bool> {
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if rc == 0 {
-        return Ok(true);
-    }
-    let err = io::Error::last_os_error();
-    if err.kind() == io::ErrorKind::WouldBlock {
-        Ok(false)
-    } else {
-        Err(err)
+    match file.try_lock() {
+        Ok(()) => Ok(true),
+        Err(TryLockError::WouldBlock) => Ok(false),
+        Err(TryLockError::Error(error)) => Err(error),
     }
 }
 
@@ -557,9 +551,7 @@ impl RotatingFile {
                 error.kind(),
                 format!("failed to sync {}: {error}", self.path),
             )
-        })?;
-        let _ = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
-        Ok(())
+        })
     }
 
     pub fn write(&mut self, timestamp: Timestamp, data: bytes::Bytes) -> Result<(), io::Error> {

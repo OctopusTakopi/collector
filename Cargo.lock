@@ -241,7 +241,6 @@ dependencies = [
  "hyper-util",
  "itoa",
  "jiff",
- "libc",
  "reqwest",
  "rustls",
  "serde",
