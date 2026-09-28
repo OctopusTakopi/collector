@@ -1,12 +1,7 @@
-//! Pacing for Binance's REST rate limit.
-//!
-//! Two independent things have to hold. The steady-state request rate must stay
-//! inside the per-IP allowance — that is the window below. And once Binance has
-//! actually banned the IP, nothing may be sent until it lifts, because requests
-//! during a ban are what turn its two minutes into hours and then days. The
-//! window cannot do the second job: it only knows what *this process* has spent,
-//! so it cannot see a ban earned by a previous run or by anything else on the
-//! host.
+//! Pacing for Binance's REST rate limit: a per-minute request window, and a
+//! hard stop while a ban is in force. Requests during a ban are what stretch
+//! its two minutes into days, and the window cannot see a ban earned by a
+//! previous run or another process on the host.
 
 use std::{
     future::Future,
@@ -25,13 +20,9 @@ const WINDOW_NANOS: i64 = 60_000_000_000;
 /// How long to sit out a rate-limit reply whose expiry could not be read.
 const OPAQUE_BAN_BACKOFF_MINUTES: i64 = 2;
 
-/// Extract when a ban lifts from a 418/429 reply.
-///
-/// Binance answers with `Retry-After` in seconds and, for `-1003`, repeats the
-/// expiry as a millisecond epoch in the message: `IP banned until 1785050129644`.
-/// The header is preferred as the more structured of the two. A reply that says
-/// neither still yields a backoff, because "unreadable" must never be treated as
-/// "not banned".
+/// When a ban lifts, from a 418/429 reply: `Retry-After` seconds, else the
+/// millisecond epoch in a `-1003` message (`IP banned until 1785050129644`),
+/// else a fixed backoff, since unreadable must never mean not banned.
 pub fn ban_expiry(retry_after: Option<&str>, body: &[u8], now: Timestamp) -> Option<Timestamp> {
     if let Some(seconds) = retry_after.and_then(|value| value.trim().parse::<i64>().ok())
         && let Ok(span) = Span::new().try_seconds(seconds)
@@ -74,10 +65,8 @@ impl Throttler {
         }
     }
 
-    /// Record a ban observed in a response, so nothing is sent until it lifts.
-    ///
-    /// Keeps the latest expiry seen: a second ban while one is in force is an
-    /// escalation, never a reprieve.
+    /// Records a ban, keeping the latest expiry seen: a second ban while one is
+    /// in force is an escalation, never a reprieve.
     pub fn note_ban(&self, until: Timestamp) {
         let until_nanos = until.as_nanosecond() as i64;
         if self.banned_until.fetch_max(until_nanos, Ordering::Relaxed) < until_nanos {
@@ -88,11 +77,7 @@ impl Throttler {
         }
     }
 
-    /// Execute `fut` unless the IP is banned or the window is already full.
-    ///
-    /// Takes `&self` — all mutation goes through the inner handles, so callers
-    /// can share one `&Throttler` between the request and its own inspection of
-    /// the reply.
+    /// Runs `fut` unless the IP is banned or the window is full.
     pub async fn execute<Fut, T>(&self, fut: Fut) -> Option<T>
     where
         Fut: Future<Output = T>,
@@ -107,14 +92,12 @@ impl Throttler {
             return None;
         }
         {
-            let mut exec_ts_ = self.exec_ts.lock().await;
-            exec_ts_.retain(|ts| *ts > cur_ts - WINDOW_NANOS);
-            // `>=`: at the limit the budget is spent. The previous `>` allowed
-            // one more than asked for, and made a limit of 0 mean "one".
-            if exec_ts_.len() >= self.rate_limit {
+            let mut exec_ts = self.exec_ts.lock().await;
+            exec_ts.retain(|ts| *ts > cur_ts - WINDOW_NANOS);
+            if exec_ts.len() >= self.rate_limit {
                 return None;
             }
-            exec_ts_.push(cur_ts);
+            exec_ts.push(cur_ts);
         }
         Some(fut.await)
     }
@@ -185,7 +168,7 @@ mod tests {
         assert_eq!(throttler.execute(async { 1 }).await, None);
     }
 
-    /// The limit is a ceiling, and zero means none — which is what keeps unit
+    /// The limit is a ceiling, and zero means none, which is what keeps unit
     /// tests from issuing live requests.
     #[tokio::test]
     async fn the_rate_limit_is_a_ceiling() {

@@ -3,13 +3,9 @@ use tracing::info;
 
 pub type BackgroundResult = Result<(), anyhow::Error>;
 
-/// The websocket queue, wrapped so shutdown drains it instead of discarding it.
-///
-/// Aborting the collection task outright would throw away everything already
-/// received but not yet handed to the writer — up to `WS_QUEUE_CAPACITY`
-/// timestamped records, silently, on every planned restart. Instead the signal
-/// stops the connection tasks (dropping their `ws_tx` clones) and lets the
-/// consumer run the queue to empty.
+/// The collection queue, wrapped so shutdown drains it instead of discarding
+/// what was already received: the signal aborts the connection tasks, which
+/// drops their senders, and the consumer runs the queue to empty.
 pub struct Feed<T> {
     rx: Receiver<T>,
     shutdown: watch::Receiver<bool>,
@@ -25,10 +21,8 @@ impl<T> Feed<T> {
         }
     }
 
-    /// The next message, or `None` once the feed is closed and fully drained.
-    ///
-    /// Cancel-safe: both arms are (`mpsc::Receiver::recv` and
-    /// `watch::Receiver::changed`).
+    /// The next message, or `None` once the feed is closed and drained. Fails
+    /// as soon as a background task fails. Cancel-safe.
     pub async fn recv(
         &mut self,
         tasks: &mut JoinSet<BackgroundResult>,

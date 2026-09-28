@@ -1,62 +1,32 @@
-//! Duplicate suppression for redundant websocket connections.
+//! Duplicate suppression for redundant websocket connections: every message
+//! arrives once per healthy connection, and exactly one copy is kept.
 //!
-//! Running the same subscription over several connections is what closes the
-//! gap left by an exchange-initiated disconnect: while one socket is being
-//! re-established, the others keep delivering. The cost is that every message
-//! now arrives once per healthy connection, so exactly one copy has to be kept.
+//! # The payload is the key
 //!
-//! # Why the payload is the key
+//! A venue serialises an event once and fans the same bytes out to every
+//! connection, so the payload identifies the event with no per-venue notion of
+//! a sequence id, even on messages that carry none (Binance `forceOrder`).
+//! That is a measured property of each feed, not a law. Binance spot stamps
+//! `E` per connection (a few percent of events over two days of measurement),
+//! so the Binance worker hashes with `E` cut out ([`Dedup::is_duplicate_key`]);
+//! Binance SBE stamps `eventTime` likewise. To check a new feed, run two
+//! connections for a minute and confirm the row count does not double.
 //!
-//! Every connection receives the *same bytes* for the same market event — the
-//! exchange serialises once and fans out — so the payload itself identifies the
-//! event. That is what makes this work across exchanges: no per-venue knowledge
-//! of which field is the sequence number, and no gap when a venue emits a
-//! message type that carries no id at all (Binance `forceOrder`, for instance).
-//!
-//! That property is a fact about each venue's encoding, not a law, and it must
-//! be measured before trusting it on a new one. It holds for every JSON stream
-//! here with one exception, measured over two days of redundant collection:
-//! Binance **spot** stamps event time `E` per connection at serialisation, so
-//! a few percent of spot events differ between copies only in `E` and a
-//! whole-payload key would record both. The binance market worker therefore
-//! cuts `E` out of the key before calling [`Dedup::is_duplicate_key`]
-//! (Binance futures JSON is unaffected — its copies are byte-identical). It
-//! does *not* hold for Binance's SBE streams either, which stamp `eventTime`
-//! per connection at serialisation and land tens of microseconds apart; the
-//! sister `sbe-collector` has to cut that field out of the key. A venue that
-//! stamps per connection will silently record every copy, so the
-//! check on a new feed is: run two connections for a minute and confirm the
-//! row count does not double.
-//!
-//! Almost every stream makes distinct events distinguishable: depth updates
-//! carry a sequence id, trades a trade id, book tickers an update id. The
-//! residual risk is a stream whose only discriminator is a millisecond
-//! timestamp — Binance `forceOrder`, Hyperliquid `bbo` — where two genuinely
-//! distinct events inside the same millisecond, with every other field equal,
-//! would serialise identically and the second would be dropped as a duplicate.
-//! No content-based filter can separate those, and a sequence-based one cannot
-//! handle `forceOrder` at all. The exposure is small (Binance pushes only the
-//! largest liquidation per symbol in each 1000 ms window) but it is not zero,
-//! and unlike a shed frame the loss is counted as a successful suppression
-//! rather than logged. Weigh that against the gap redundancy removes.
+//! The residual risk is a stream whose only discriminator is a millisecond
+//! timestamp (Binance `forceOrder`, Hyperliquid `bbo`): two distinct events in
+//! one millisecond with every other field equal are indistinguishable, and the
+//! second is counted as a duplicate rather than logged as a loss.
 //!
 //! # Ordering
 //!
-//! Keeping the *first* copy preserves the order of the merged stream. Each
-//! connection delivers events in order, so for events `m` before `n`,
-//! `first(m) = min over connections of arrival(m)` is earlier than
-//! `first(n) = min ... arrival(n)`: every term of the first minimum precedes
-//! the matching term of the second. The recorded timestamp is therefore also
-//! the lowest latency any connection achieved for that event — with the
-//! caveat that the filter sees dequeue order, not arrival order. The
-//! connections share one bounded queue, and once it is full the order in which
-//! senders win a permit is semaphore wake order, so under sustained
-//! backpressure the surviving copy can be the slower connection's.
-//!
-//! The one exception is a connection that comes back from a reconnect *ahead*
-//! of where a lagging peer still is: it can deliver an event whose predecessor
-//! has not arrived on any connection yet. The depth continuity check treats
-//! that as a gap and refetches a snapshot, which is the correct repair.
+//! Keeping the first copy preserves the merged order. Each connection delivers
+//! in order, so for events `m` before `n`, `min_c arrival_c(m)` precedes
+//! `min_c arrival_c(n)` term by term; the recorded copy is also the fastest
+//! one. Two caveats: the filter sees dequeue order, and under sustained
+//! backpressure senders win queue permits in wake order, so the slower copy can
+//! survive; and a connection back from a reconnect *ahead* of a lagging peer
+//! can deliver an event before its predecessor, which the depth continuity
+//! check repairs with a snapshot.
 
 use std::{
     collections::HashSet,
@@ -65,51 +35,32 @@ use std::{
 
 use tracing::{info, warn};
 
-/// How far back duplicates are remembered.
-///
-/// Only has to cover the delivery skew between connections. They share one
-/// queue and one consumer, so in practice that skew is milliseconds; this is
-/// sized for a connection that stalls on a slow TCP path and then catches up.
+/// How far back duplicates are remembered: the delivery skew between
+/// connections, normally milliseconds, with room for one that stalls on a slow
+/// TCP path and then catches up.
 pub const DEDUP_WINDOW: Duration = Duration::from_secs(30);
 
-/// Hard ceiling on remembered keys per generation, so an unexpected message
-/// rate cannot turn the window into unbounded memory.
-///
-/// Reaching it rotates early, which shortens the window below [`DEDUP_WINDOW`]
-/// — `Dedup` logs when that happens, because a window shorter than the skew
-/// between connections lets duplicates through.
-///
-/// Two generations are live at once and `hashbrown` rounds up to a power of two
-/// at a 7/8 load factor, so 500k keys reserve 2^20 buckets of 17 bytes per
-/// generation: about 36 MiB in total, retained once reached.
+/// Ceiling on keys per generation, so an unexpected message rate cannot grow
+/// memory without bound. Reaching it rotates early and shortens the window,
+/// which is logged. Two generations of 500k keys reserve 2^20 buckets of 17
+/// bytes each (`hashbrown`, 7/8 load factor): about 36 MiB, kept once reached.
 pub const DEDUP_MAX_ENTRIES: usize = 500_000;
 
 const REPORT_INTERVAL: Duration = Duration::from_secs(300);
 
-/// How many messages may pass between clock reads.
-///
-/// `Instant::now` per message is affordable but pointless: the window is tens
-/// of seconds and the rotation only has to be approximately on time.
-///
-/// It does mean the window is measured in messages as well as in time. On a
-/// sparse feed a generation can outlive its nominal duration by a wide margin,
-/// which costs memory and widens the window but never lets a duplicate slip —
-/// the guarantee that matters here is the lower bound. It also means the
-/// duplicate-rate report below is driven by traffic, so it falls silent when
-/// the feed does rather than reporting zero.
+/// Messages between clock reads. On a sparse feed a generation can then outlive
+/// its nominal duration, which widens the window but never shortens it; the
+/// duplicate-rate report likewise falls silent with the feed.
 const CLOCK_CHECK_INTERVAL: u32 = 1_024;
 
 /// Drops the second and later copies of a message.
 ///
-/// Keys are held in two generations that rotate on a timer. A lookup checks
-/// both, so anything inserted is remembered for at least [`DEDUP_WINDOW`],
-/// without storing a timestamp per key or ever walking the set to expire it.
-/// The upper bound is softer: nominally twice the window, but longer on a
-/// sparse feed (see [`CLOCK_CHECK_INTERVAL`]) and shorter when
-/// [`DEDUP_MAX_ENTRIES`] forces an early rotation, which is logged.
+/// Keys live in two generations that rotate on a timer and are both checked,
+/// so a key is remembered for at least the window without a timestamp per key
+/// or a sweep to expire it.
 pub struct Dedup {
-    /// `false` for a single connection, where no message can be a duplicate.
-    /// Checked before hashing, so the whole module costs one branch.
+    /// `false` for a single connection, where nothing can be a duplicate;
+    /// checked before hashing.
     enabled: bool,
     current: HashSet<u128>,
     previous: HashSet<u128>,
@@ -159,18 +110,14 @@ impl Dedup {
         }
     }
 
-    /// True if this payload has already been seen inside the window.
-    ///
-    /// A `false` return records the payload, so calling this twice on the same
-    /// bytes reports the second call as a duplicate. Call it once per message,
-    /// on the path that decides whether to keep it.
+    /// True if this payload was already seen inside the window. A `false`
+    /// return records it, so call this once per message.
     pub fn is_duplicate(&mut self, payload: &[u8]) -> bool {
         self.is_duplicate_key(xxhash_rust::xxh3::xxh3_128(payload))
     }
 
-    /// Key-level variant of [`Self::is_duplicate`] for venues whose otherwise
-    /// identical copies differ in a per-connection stamp: the caller hashes
-    /// the payload with that field cut out, so all copies share one key.
+    /// [`Self::is_duplicate`] on a key the caller hashed, for copies that
+    /// differ in a per-connection stamp the caller cuts out.
     pub fn is_duplicate_key(&mut self, key: u128) -> bool {
         if !self.enabled {
             return false;
@@ -183,10 +130,9 @@ impl Dedup {
             self.maintain();
         }
 
-        // 128 bits: at the ceiling above, a collision inside one window has
-        // probability around 2^-85. A 64-bit key would be roughly 2^-21 per
-        // window, which over a year of collection is a coin flip — and a
-        // collision here silently discards a real message.
+        // 128 bits: at the ceiling a collision within one window has
+        // probability ~2^-85; 64 bits would be ~2^-21, a coin flip over a year,
+        // and a collision silently discards a real message.
         if self.previous.contains(&key) || !self.current.insert(key) {
             self.duplicate += 1;
             true
@@ -196,22 +142,17 @@ impl Dedup {
         }
     }
 
-    /// Rotate generations when due, and periodically report the duplicate rate.
-    ///
-    /// The rate is the health signal for redundancy: with `n` connections all
-    /// delivering, it settles near `(n - 1) / n`. A rate drifting toward zero
-    /// means only one connection is actually feeding, and the redundancy that
-    /// was paid for is not there.
+    /// Rotates generations when due and reports the duplicate rate, the health
+    /// signal for redundancy: with `n` connections delivering it settles near
+    /// `(n - 1) / n`, and one drifting toward zero means only one is feeding.
     fn maintain(&mut self) {
         let now = Instant::now();
 
         let full = self.current.len() >= self.max_entries;
         if now >= self.rotate_at || full {
-            // The effective window is now however long it took to fill a
-            // generation, not `self.window`. Any connection whose skew exceeds
-            // that leaks duplicates past the filter, so this must not be
-            // silent — but a ceiling that keeps being hit would log on every
-            // rotation, so restate it at the reporting cadence instead.
+            // The effective window is now however long a generation took to
+            // fill, and skew beyond it leaks duplicates. Restated at the report
+            // cadence rather than on every rotation.
             if full
                 && self
                     .last_ceiling_warning
@@ -228,8 +169,7 @@ impl Dedup {
                 );
                 self.last_ceiling_warning = Some(now);
             }
-            // `clear` keeps the allocation, and the swap hands it to `current`,
-            // so steady-state rotation does not allocate.
+            // `clear` keeps the allocation, so rotation does not allocate.
             self.previous.clear();
             std::mem::swap(&mut self.previous, &mut self.current);
             self.rotate_at = now + self.window;

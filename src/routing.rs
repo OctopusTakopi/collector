@@ -205,21 +205,21 @@ pub(crate) fn hyperliquid_channel(payload: &[u8]) -> Option<&str> {
 }
 
 #[derive(Deserialize)]
-pub struct BybitMessage<'a> {
+pub(crate) struct BybitMessage<'a> {
     #[serde(borrow)]
-    pub topic: Option<&'a str>,
+    pub(crate) topic: Option<&'a str>,
     #[serde(borrow)]
-    pub op: Option<&'a str>,
+    pub(crate) op: Option<&'a str>,
     #[serde(borrow)]
-    pub ret_msg: Option<&'a str>,
+    pub(crate) ret_msg: Option<&'a str>,
     #[serde(borrow)]
-    pub req_id: Option<&'a str>,
-    pub success: Option<bool>,
+    pub(crate) req_id: Option<&'a str>,
+    pub(crate) success: Option<bool>,
 }
 
-pub struct HyperliquidMessage<'a> {
-    pub channel: &'a str,
-    symbol: Option<&'a str>,
+/// The coin a Hyperliquid frame is about.
+pub(crate) struct HyperliquidMessage<'a> {
+    pub(crate) coin: Option<&'a str>,
 }
 
 #[derive(Deserialize)]
@@ -260,11 +260,8 @@ impl<'de> Deserialize<'de> for FirstHyperliquidCoin<'de> {
     }
 }
 
-/// Resolve the symbol from an already-captured `data` payload.
-///
-/// This is the only place unknown channels are interpreted; the fast path in
-/// `visit_map` below defers anything it does not recognise to here, so a new
-/// subscription type only has to be taught to one dispatch.
+/// The coin of a `data` payload captured raw, because it preceded `channel` or
+/// its channel is not one the fast path knows.
 fn hyperliquid_symbol_from_raw<'a>(
     channel: &str,
     data: &'a RawValue,
@@ -278,9 +275,8 @@ fn hyperliquid_symbol_from_raw<'a>(
             let data: HyperliquidCoin<'a> = serde_json::from_str(data.get())?;
             Ok(data.coin)
         }
-        // Route any other channel on a `coin` field if it has one. Payloads that
-        // are not objects at all (the `error` channel carries a bare string) are
-        // simply unroutable, not malformed.
+        // Any other channel routes on a `coin` field if it has one; a payload
+        // that is not an object (`error` carries a string) is unroutable.
         _ => Ok(serde_json::from_str::<HyperliquidCoin<'a>>(data.get())
             .ok()
             .and_then(|data| data.coin)),
@@ -312,11 +308,8 @@ impl<'de> Deserialize<'de> for HyperliquidMessage<'de> {
                 while let Some(key) = map.next_key::<&str>()? {
                     match key {
                         "channel" => channel = Some(map.next_value()?),
-                        // Fast path: with `channel` already seen (the normal wire
-                        // order) the payload is read straight into the shape that
-                        // channel uses, without materialising it. Anything else
-                        // is captured raw and handed to
-                        // `hyperliquid_symbol_from_raw` after the loop.
+                        // With `channel` already seen, the normal wire order,
+                        // read the payload straight into its channel's shape.
                         "data" => match channel {
                             Some("trades") => {
                                 symbol = map.next_value::<FirstHyperliquidCoin<'de>>()?.0
@@ -340,17 +333,11 @@ impl<'de> Deserialize<'de> for HyperliquidMessage<'de> {
                         hyperliquid_symbol_from_raw(channel, data).map_err(A::Error::custom)?;
                 }
 
-                Ok(HyperliquidMessage { channel, symbol })
+                Ok(HyperliquidMessage { coin: symbol })
             }
         }
 
         deserializer.deserialize_map(HyperliquidVisitor)
-    }
-}
-
-impl<'a> HyperliquidMessage<'a> {
-    pub fn symbol(&self) -> Option<&'a str> {
-        self.symbol
     }
 }
 
@@ -474,11 +461,11 @@ mod tests {
     fn hyperliquid_routes_without_materializing_market_data() {
         let trade = br#"{"channel":"trades","data":[{"coin":"BTC","side":"B","px":"1","sz":"2"},{"coin":"BTC","side":"A","px":"3","sz":"4"}]}"#;
         let trade: HyperliquidMessage<'_> = serde_json::from_slice(trade).unwrap();
-        assert_eq!(trade.symbol(), Some("BTC"));
+        assert_eq!(trade.coin, Some("BTC"));
 
         let book = br#"{"channel":"l2Book","data":{"coin":"ETH","time":1,"levels":[[{"px":"1","sz":"2","n":3}],[]]}}"#;
         let book: HyperliquidMessage<'_> = serde_json::from_slice(book).unwrap();
-        assert_eq!(book.symbol(), Some("ETH"));
+        assert_eq!(book.coin, Some("ETH"));
     }
 
     #[test]
@@ -486,7 +473,7 @@ mod tests {
         let raw = br#"{"data":{"coin":"ETH","time":1,"levels":[]},"channel":"l2Book"}"#;
         let message: HyperliquidMessage<'_> = serde_json::from_slice(raw).unwrap();
 
-        assert_eq!(message.symbol(), Some("ETH"));
+        assert_eq!(message.coin, Some("ETH"));
     }
 
     #[test]
@@ -494,7 +481,7 @@ mod tests {
         let raw = br#"{"channel":"error","data":"subscription failed"}"#;
         let message: HyperliquidMessage<'_> = serde_json::from_slice(raw).unwrap();
 
-        assert_eq!(message.symbol(), None);
+        assert_eq!(message.coin, None);
     }
 
     #[test]
@@ -509,7 +496,7 @@ mod tests {
         ] {
             let message: HyperliquidMessage<'_> = serde_json::from_slice(raw).unwrap();
             assert_eq!(
-                message.symbol(),
+                message.coin,
                 Some("SOL"),
                 "{}",
                 String::from_utf8_lossy(raw)

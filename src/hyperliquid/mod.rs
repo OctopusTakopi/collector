@@ -64,7 +64,7 @@ impl Venue for Hyperliquid {
             return Ok(());
         }
         let message: HyperliquidMessage<'_> = serde_json::from_slice(&data)?;
-        let Some(coin) = message.symbol() else {
+        let Some(coin) = message.coin else {
             return Ok(());
         };
         let symbol = self.recorder.symbols.resolve(coin);
