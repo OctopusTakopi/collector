@@ -729,10 +729,65 @@ impl Writer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jiff::SignedDuration;
+
+    /// 2027-01-15 08:00 UTC.
+    const DAY_ONE_NS: i128 = 1_800_000_000_000_000_000;
+    const DAY_ONE: &str = "btcusdt_20270115.zst";
+    const DAY_TWO: &str = "btcusdt_20270116.zst";
+
+    fn day_one() -> Timestamp {
+        Timestamp::from_nanosecond(DAY_ONE_NS).unwrap()
+    }
+
+    fn day_two() -> Timestamp {
+        day_one() + SignedDuration::from_hours(24)
+    }
+
+    fn test_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "collector-{tag}-test-{}-{}",
+            std::process::id(),
+            Timestamp::now().as_nanosecond()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn writer(dir: &Path, run_id: &str) -> Writer {
+        Writer::new(dir, run_id, QualityReporter::disabled())
+    }
+
+    fn put(writer: &mut Writer, recv_time: Timestamp, data: &'static [u8]) {
+        writer
+            .write(recv_time, Symbol::from("btcusdt"), Bytes::from_static(data))
+            .unwrap();
+    }
+
+    fn names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn has_sidecar(dir: &Path, run_id: &str) -> bool {
+        let suffix = format!("_{run_id}.zst");
+        names(dir).iter().any(|name| name.ends_with(&suffix))
+    }
+
+    fn decoded(path: impl AsRef<Path>) -> String {
+        let bytes = zstd::decode_all(fs::read(path).unwrap().as_slice()).unwrap();
+        String::from_utf8(bytes).unwrap()
+    }
 
     fn zstd_frame_count(bytes: &[u8]) -> usize {
-        const MAGIC: &[u8; 4] = &[0x28, 0xB5, 0x2F, 0xFD];
-        bytes.windows(4).filter(|window| *window == MAGIC).count()
+        bytes
+            .windows(4)
+            .filter(|window| *window == ZSTD_MAGIC.to_le_bytes())
+            .count()
     }
 
     /// Every symbol shape the collector actually sees must survive untouched —
@@ -761,8 +816,6 @@ mod tests {
         assert_eq!(encode_symbol("../../etc/passwd"), "..%2F..%2Fetc%2Fpasswd");
     }
 
-    /// Two distinct symbols must never produce the same filename: they each get
-    /// their own zstd encoder, and sharing a file would interleave frames.
     #[test]
     fn encoding_is_injective() {
         let symbols = [
@@ -779,611 +832,256 @@ mod tests {
             .iter()
             .map(|symbol| encode_symbol(symbol).into_owned())
             .collect();
-        let total = encoded.len();
         encoded.sort();
         encoded.dedup();
-        assert_eq!(encoded.len(), total, "collision: {encoded:?}");
+        assert_eq!(encoded.len(), symbols.len(), "collision: {encoded:?}");
     }
 
     #[test]
     fn colliding_symbols_get_separate_files() {
-        let dir = std::env::temp_dir().join(format!(
-            "collector-collision-test-{}-{}",
-            std::process::id(),
-            Timestamp::now().as_nanosecond()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-
-        let mut writer = Writer::new(
-            dir.to_str().unwrap(),
-            "test-run",
-            QualityReporter::disabled(),
-        );
+        let dir = test_dir("collision");
+        let mut writer = writer(&dir, "test-run");
         for symbol in ["purr/usdc", "purr_usdc"] {
             writer
-                .write(
-                    Timestamp::now(),
-                    Symbol::from(symbol),
-                    bytes::Bytes::from_static(b"{}"),
-                )
+                .write(day_one(), Symbol::from(symbol), Bytes::from_static(b"{}"))
                 .unwrap();
         }
         writer.close().unwrap();
 
-        let mut written: Vec<_> = std::fs::read_dir(&dir)
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
-            .collect();
-        written.sort();
-        assert_eq!(written.len(), 2, "{written:?}");
-        assert!(written[0].starts_with("purr%2Fusdc_"), "{written:?}");
-        assert!(written[1].starts_with("purr_usdc_"), "{written:?}");
-
-        for name in &written {
-            let bytes = std::fs::read(dir.join(name)).unwrap();
-            assert!(zstd::decode_all(bytes.as_slice()).is_ok(), "{name}");
-            let stem = name.trim_end_matches(".zst");
-            let date = stem.rsplit_once('_').map(|(_, date)| date).unwrap();
-            assert!(
-                date.len() == 8 && date.bytes().all(|b| b.is_ascii_digit()),
-                "expected daily symbol_YYYYMMDD.zst, got {name}"
-            );
+        let names = names(&dir);
+        assert_eq!(
+            names,
+            ["purr%2Fusdc_20270115.zst", "purr_usdc_20270115.zst"]
+        );
+        for name in &names {
+            assert_eq!(decoded(dir.join(name)), format!("{DAY_ONE_NS} {{}}\n"));
         }
-
-        std::fs::remove_dir_all(&dir).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn writes_a_symbol_containing_a_path_separator() {
-        let dir = std::env::temp_dir().join(format!(
-            "collector-file-test-{}-{}",
-            std::process::id(),
-            Timestamp::now().as_nanosecond()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-
-        let mut writer = Writer::new(
-            dir.to_str().unwrap(),
-            "test-run",
-            QualityReporter::disabled(),
-        );
+        let dir = test_dir("separator");
+        let mut writer = writer(&dir, "test-run");
         writer
             .write(
-                Timestamp::now(),
+                day_one(),
                 Symbol::from("purr/usdc"),
-                bytes::Bytes::from_static(b"{}"),
+                Bytes::from_static(b"{}"),
             )
             .unwrap();
         writer.close().unwrap();
 
-        let written: Vec<_> = std::fs::read_dir(&dir)
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
-            .collect();
-        assert_eq!(written.len(), 1, "{written:?}");
-        assert!(written[0].starts_with("purr%2Fusdc_"), "{written:?}");
-
-        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(names(&dir), ["purr%2Fusdc_20270115.zst"]);
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn same_day_writes_share_one_file() {
-        let dir = std::env::temp_dir().join(format!(
-            "collector-daily-test-{}-{}",
-            std::process::id(),
-            Timestamp::now().as_nanosecond()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let mut writer = Writer::new(
-            dir.to_str().unwrap(),
-            "daily-run",
-            QualityReporter::disabled(),
-        );
-        let first = Timestamp::from_nanosecond(1_800_000_000_000_000_000).unwrap();
-        let later_same_day = first
-            .checked_add(jiff::Span::new().try_hours(3).unwrap())
-            .unwrap();
-        for recv_time in [first, later_same_day] {
-            writer
-                .write(
-                    recv_time,
-                    Symbol::from("btcusdt"),
-                    bytes::Bytes::from_static(b"{}"),
-                )
-                .unwrap();
-        }
+        let dir = test_dir("daily");
+        let mut writer = writer(&dir, "daily-run");
+        let later_same_day = day_one() + SignedDuration::from_hours(3);
+        put(&mut writer, day_one(), b"{}");
+        put(&mut writer, later_same_day, b"{}");
         writer.close().unwrap();
 
-        let paths: Vec<_> = std::fs::read_dir(&dir)
-            .unwrap()
-            .map(|entry| entry.unwrap().path())
-            .collect();
-        assert_eq!(paths.len(), 1, "{paths:?}");
-        assert!(zstd::decode_all(std::fs::read(&paths[0]).unwrap().as_slice()).is_ok());
-        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(names(&dir), [DAY_ONE]);
+        assert_eq!(
+            decoded(dir.join(DAY_ONE)),
+            format!(
+                "{DAY_ONE_NS} {{}}\n{} {{}}\n",
+                later_same_day.as_nanosecond()
+            )
+        );
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn date_boundary_opens_a_new_daily_file() {
-        let dir = std::env::temp_dir().join(format!(
-            "collector-day-boundary-test-{}-{}",
-            std::process::id(),
-            Timestamp::now().as_nanosecond()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let mut writer = Writer::new(
-            dir.to_str().unwrap(),
-            "boundary-run",
-            QualityReporter::disabled(),
-        );
-        let before = Timestamp::from_nanosecond(1_800_000_000_000_000_000).unwrap();
-        let after = Timestamp::from_nanosecond(1_800_086_400_000_000_000).unwrap();
-        for recv_time in [before, after] {
-            writer
-                .write(
-                    recv_time,
-                    Symbol::from("btcusdt"),
-                    bytes::Bytes::from_static(b"{}"),
-                )
-                .unwrap();
-        }
+        let dir = test_dir("day-boundary");
+        let mut writer = writer(&dir, "boundary-run");
+        put(&mut writer, day_one(), b"{}");
+        put(&mut writer, day_two(), b"{}");
         writer.close().unwrap();
 
-        let mut names: Vec<_> = std::fs::read_dir(&dir)
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
-            .collect();
-        names.sort();
-        assert_eq!(names.len(), 2, "{names:?}");
-        assert_ne!(names[0], names[1]);
-        for name in &names {
-            assert!(zstd::decode_all(std::fs::read(dir.join(name)).unwrap().as_slice()).is_ok());
+        assert_eq!(names(&dir), [DAY_ONE, DAY_TWO]);
+        for name in [DAY_ONE, DAY_TWO] {
+            assert_eq!(decoded(dir.join(name)).lines().count(), 1, "{name}");
         }
-        std::fs::remove_dir_all(&dir).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn busy_daily_file_falls_back_to_run_sidecar() {
-        let dir = std::env::temp_dir().join(format!(
-            "collector-sidecar-test-{}-{}",
-            std::process::id(),
-            Timestamp::now().as_nanosecond()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let now = Timestamp::now();
-        let mut incumbent = Writer::new(
-            dir.to_str().unwrap(),
-            "incumbent",
-            QualityReporter::disabled(),
-        );
-        incumbent
-            .write(
-                now,
-                Symbol::from("btcusdt"),
-                bytes::Bytes::from_static(b"{\"n\":1}"),
-            )
-            .unwrap();
-
-        let mut challenger = Writer::new(
-            dir.to_str().unwrap(),
-            "challenger",
-            QualityReporter::disabled(),
-        );
-        challenger
-            .write(
-                now,
-                Symbol::from("btcusdt"),
-                bytes::Bytes::from_static(b"{\"n\":2}"),
-            )
-            .unwrap();
+        let dir = test_dir("sidecar");
+        let mut incumbent = writer(&dir, "incumbent");
+        put(&mut incumbent, day_one(), br#"{"n":1}"#);
+        let mut challenger = writer(&dir, "challenger");
+        put(&mut challenger, day_one(), br#"{"n":2}"#);
         assert!(
-            challenger.files[&Symbol::from("btcusdt")]
-                .sink
-                .sidecar()
-                .is_some(),
+            matches!(challenger.files["btcusdt"].sink, Sink::Sidecar { .. }),
             "challenger must use a sidecar while the daily file is locked"
         );
 
         incumbent.close().unwrap();
-        challenger
-            .write(
-                now,
-                Symbol::from("btcusdt"),
-                bytes::Bytes::from_static(b"{\"n\":3}"),
-            )
-            .unwrap();
+        put(&mut challenger, day_one(), br#"{"n":3}"#);
         assert!(
-            challenger.files[&Symbol::from("btcusdt")]
-                .sink
-                .sidecar()
-                .is_none(),
-            "after the incumbent exits, writes must reclaim the canonical daily file"
+            matches!(challenger.files["btcusdt"].sink, Sink::Daily(_)),
+            "after the incumbent exits, writes must reclaim the daily file"
         );
         challenger.close().unwrap();
 
-        let mut names: Vec<_> = std::fs::read_dir(&dir)
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
-            .collect();
-        names.sort();
-        assert!(
-            names.iter().all(|n| !n.contains("_challenger.zst")),
-            "overlap sidecar must be removed after a successful handover: {names:?}"
+        assert_eq!(
+            names(&dir),
+            [DAY_ONE],
+            "the sidecar must be merged and removed"
         );
-        assert_eq!(names.len(), 1, "{names:?}");
-        assert!(
-            names[0].starts_with("btcusdt_") && names[0].ends_with(".zst"),
-            "canonical daily file must exist: {names:?}"
-        );
-        let decoded =
-            zstd::decode_all(std::fs::read(dir.join(&names[0])).unwrap().as_slice()).unwrap();
-        let text = String::from_utf8_lossy(&decoded);
-        assert!(text.contains("{\"n\":1}"), "{text}");
-        assert!(
-            text.contains("{\"n\":2}"),
-            "sidecar overlap missing from daily file: {text}"
-        );
-        assert!(text.contains("{\"n\":3}"), "{text}");
-        std::fs::remove_dir_all(&dir).unwrap();
+        let text = decoded(dir.join(DAY_ONE));
+        for record in [r#"{"n":1}"#, r#"{"n":2}"#, r#"{"n":3}"#] {
+            assert!(text.contains(record), "{record} missing: {text}");
+        }
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn close_merges_sidecar_without_another_write() {
-        let dir = std::env::temp_dir().join(format!(
-            "collector-close-merge-test-{}-{}",
-            std::process::id(),
-            Timestamp::now().as_nanosecond()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let now = Timestamp::now();
-        let mut incumbent = Writer::new(
-            dir.to_str().unwrap(),
-            "incumbent",
-            QualityReporter::disabled(),
-        );
-        incumbent
-            .write(
-                now,
-                Symbol::from("btcusdt"),
-                bytes::Bytes::from_static(b"{\"n\":1}"),
-            )
-            .unwrap();
-        let mut challenger = Writer::new(
-            dir.to_str().unwrap(),
-            "challenger",
-            QualityReporter::disabled(),
-        );
-        challenger
-            .write(
-                now,
-                Symbol::from("btcusdt"),
-                bytes::Bytes::from_static(b"{\"n\":2}"),
-            )
-            .unwrap();
+        let dir = test_dir("close-merge");
+        let mut incumbent = writer(&dir, "incumbent");
+        put(&mut incumbent, day_one(), br#"{"n":1}"#);
+        let mut challenger = writer(&dir, "challenger");
+        put(&mut challenger, day_one(), br#"{"n":2}"#);
         incumbent.close().unwrap();
         assert!(
-            std::fs::read_dir(&dir).unwrap().any(|entry| {
-                entry
-                    .unwrap()
-                    .file_name()
-                    .to_string_lossy()
-                    .contains("_challenger.zst")
-            }),
+            has_sidecar(&dir, "challenger"),
             "incumbent close must not steal a live overlap sidecar"
         );
         challenger.close().unwrap();
 
-        let mut names: Vec<_> = std::fs::read_dir(&dir)
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
-            .collect();
-        names.sort();
-        assert!(
-            names.iter().all(|n| !n.contains("_challenger.zst")),
-            "close must merge and remove the overlap sidecar: {names:?}"
-        );
-        assert_eq!(names.len(), 1, "{names:?}");
-        let merged_bytes = std::fs::read(dir.join(&names[0])).unwrap();
         assert_eq!(
-            zstd_frame_count(&merged_bytes),
+            names(&dir),
+            [DAY_ONE],
+            "close must merge and remove the sidecar"
+        );
+        let merged = fs::read(dir.join(DAY_ONE)).unwrap();
+        assert_eq!(
+            zstd_frame_count(&merged),
             2,
             "close should not append an empty extra zstd frame"
         );
-        let decoded = zstd::decode_all(merged_bytes.as_slice()).unwrap();
-        let text = String::from_utf8_lossy(&decoded);
-        assert!(text.contains("{\"n\":1}"), "{text}");
+        let text = decoded(dir.join(DAY_ONE));
+        assert!(text.contains(r#"{"n":1}"#), "{text}");
         assert!(
-            text.contains("{\"n\":2}"),
-            "sidecar overlap missing from daily file: {text}"
+            text.contains(r#"{"n":2}"#),
+            "sidecar records missing: {text}"
         );
-        std::fs::remove_dir_all(&dir).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn close_leaves_sidecar_when_daily_file_is_still_locked() {
-        let dir = std::env::temp_dir().join(format!(
-            "collector-close-leave-sidecar-test-{}-{}",
-            std::process::id(),
-            Timestamp::now().as_nanosecond()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let now = Timestamp::now();
-        let mut incumbent = Writer::new(
-            dir.to_str().unwrap(),
-            "incumbent",
-            QualityReporter::disabled(),
-        );
-        incumbent
-            .write(
-                now,
-                Symbol::from("btcusdt"),
-                bytes::Bytes::from_static(b"{\"n\":1}"),
-            )
-            .unwrap();
-        let mut challenger = Writer::new(
-            dir.to_str().unwrap(),
-            "challenger",
-            QualityReporter::disabled(),
-        );
-        challenger
-            .write(
-                now,
-                Symbol::from("btcusdt"),
-                bytes::Bytes::from_static(b"{\"n\":2}"),
-            )
-            .unwrap();
+        let dir = test_dir("close-leave-sidecar");
+        let mut incumbent = writer(&dir, "incumbent");
+        put(&mut incumbent, day_one(), br#"{"n":1}"#);
+        let mut challenger = writer(&dir, "challenger");
+        put(&mut challenger, day_one(), br#"{"n":2}"#);
         challenger.close().unwrap();
+
+        let sidecar = dir.join("btcusdt_20270115_challenger.zst");
         assert!(
-            std::fs::read_dir(&dir).unwrap().any(|entry| {
-                entry
-                    .unwrap()
-                    .file_name()
-                    .to_string_lossy()
-                    .contains("_challenger.zst")
-            }),
-            "challenger must leave its sidecar when the incumbent still holds the daily file"
+            decoded(&sidecar).contains(r#"{"n":2}"#),
+            "challenger must leave a complete sidecar while the incumbent holds the daily file"
         );
         incumbent.close().unwrap();
-        std::fs::remove_dir_all(&dir).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn midnight_reclaim_merges_sidecar_after_incumbent_exits() {
-        let dir = std::env::temp_dir().join(format!(
-            "collector-midnight-merge-test-{}-{}",
-            std::process::id(),
-            Timestamp::now().as_nanosecond()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let before = Timestamp::from_nanosecond(1_800_000_000_000_000_000).unwrap();
-        let after = Timestamp::from_nanosecond(1_800_086_400_000_000_000).unwrap();
-        let mut incumbent = Writer::new(
-            dir.to_str().unwrap(),
-            "incumbent",
-            QualityReporter::disabled(),
-        );
-        incumbent
-            .write(
-                before,
-                Symbol::from("btcusdt"),
-                bytes::Bytes::from_static(b"{\"n\":1}"),
-            )
-            .unwrap();
-        let mut challenger = Writer::new(
-            dir.to_str().unwrap(),
-            "challenger",
-            QualityReporter::disabled(),
-        );
-        challenger
-            .write(
-                before,
-                Symbol::from("btcusdt"),
-                bytes::Bytes::from_static(b"{\"n\":2}"),
-            )
-            .unwrap();
+        let dir = test_dir("midnight-merge");
+        let mut incumbent = writer(&dir, "incumbent");
+        put(&mut incumbent, day_one(), br#"{"n":1}"#);
+        let mut challenger = writer(&dir, "challenger");
+        put(&mut challenger, day_one(), br#"{"n":2}"#);
         incumbent.close().unwrap();
-        challenger
-            .write(
-                after,
-                Symbol::from("btcusdt"),
-                bytes::Bytes::from_static(b"{\"n\":3}"),
-            )
-            .unwrap();
+        put(&mut challenger, day_two(), br#"{"n":3}"#);
         challenger.close().unwrap();
 
-        let mut names: Vec<_> = std::fs::read_dir(&dir)
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
-            .collect();
-        names.sort();
-        assert!(
-            names.iter().all(|n| !n.contains("_challenger.zst")),
-            "midnight rotation must merge yesterday's sidecar: {names:?}"
-        );
-        assert_eq!(names.len(), 2, "{names:?}");
-        let day_one_bytes = std::fs::read(dir.join(&names[0])).unwrap();
         assert_eq!(
-            zstd_frame_count(&day_one_bytes),
+            names(&dir),
+            [DAY_ONE, DAY_TWO],
+            "midnight rotation must merge yesterday's sidecar"
+        );
+        assert_eq!(
+            zstd_frame_count(&fs::read(dir.join(DAY_ONE)).unwrap()),
             2,
             "yesterday should be incumbent frame + sidecar frame, not an extra empty frame"
         );
-        let day_one = String::from_utf8_lossy(&zstd::decode_all(day_one_bytes.as_slice()).unwrap())
-            .into_owned();
-        let day_two = String::from_utf8_lossy(
-            &zstd::decode_all(std::fs::read(dir.join(&names[1])).unwrap().as_slice()).unwrap(),
-        )
-        .into_owned();
-        assert!(day_one.contains("{\"n\":1}"), "{day_one}");
+        let day_one = decoded(dir.join(DAY_ONE));
+        assert!(day_one.contains(r#"{"n":1}"#), "{day_one}");
         assert!(
-            day_one.contains("{\"n\":2}"),
-            "sidecar overlap missing: {day_one}"
+            day_one.contains(r#"{"n":2}"#),
+            "sidecar records missing: {day_one}"
         );
-        assert!(day_two.contains("{\"n\":3}"), "{day_two}");
-        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(decoded(dir.join(DAY_TWO)).contains(r#"{"n":3}"#));
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn midnight_keeps_sidecar_while_incumbent_lock_is_held() {
-        let dir = std::env::temp_dir().join(format!(
-            "collector-midnight-lock-test-{}-{}",
-            std::process::id(),
-            Timestamp::now().as_nanosecond()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let before = Timestamp::from_nanosecond(1_800_000_000_000_000_000).unwrap();
-        let after = Timestamp::from_nanosecond(1_800_086_400_000_000_000).unwrap();
-        let mut incumbent = Writer::new(
-            dir.to_str().unwrap(),
-            "incumbent",
-            QualityReporter::disabled(),
-        );
-        incumbent
-            .write(
-                before,
-                Symbol::from("btcusdt"),
-                bytes::Bytes::from_static(b"{\"n\":1}"),
-            )
-            .unwrap();
-        let mut challenger = Writer::new(
-            dir.to_str().unwrap(),
-            "challenger",
-            QualityReporter::disabled(),
-        );
-        challenger
-            .write(
-                before,
-                Symbol::from("btcusdt"),
-                bytes::Bytes::from_static(b"{\"n\":2}"),
-            )
-            .unwrap();
-        challenger
-            .write(
-                after,
-                Symbol::from("btcusdt"),
-                bytes::Bytes::from_static(b"{\"n\":3}"),
-            )
-            .unwrap();
-        let btc = Symbol::from("btcusdt");
+        let dir = test_dir("midnight-lock");
+        let mut incumbent = writer(&dir, "incumbent");
+        put(&mut incumbent, day_one(), br#"{"n":1}"#);
+        let mut challenger = writer(&dir, "challenger");
+        put(&mut challenger, day_one(), br#"{"n":2}"#);
+        put(&mut challenger, day_two(), br#"{"n":3}"#);
+        assert_eq!(challenger.files["btcusdt"].pending_sidecars.len(), 1);
         assert!(
-            !challenger.files[&btc].pending_sidecars.is_empty()
-                || std::fs::read_dir(&dir).unwrap().any(|entry| entry
-                    .unwrap()
-                    .file_name()
-                    .into_string()
-                    .unwrap()
-                    .contains("_challenger.zst")),
-            "overlap sidecar must remain until the incumbent releases yesterday's lock"
+            has_sidecar(&dir, "challenger"),
+            "the sidecar must remain until the incumbent releases yesterday's lock"
         );
 
         incumbent.close().unwrap();
         challenger.close().unwrap();
 
-        let mut names: Vec<_> = std::fs::read_dir(&dir)
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
-            .collect();
-        names.sort();
-        assert!(
-            names.iter().all(|n| !n.contains("_challenger.zst")),
-            "close must merge the leftover midnight sidecar: {names:?}"
+        assert_eq!(
+            names(&dir),
+            [DAY_ONE, DAY_TWO],
+            "close must merge the leftover midnight sidecar"
         );
-        assert_eq!(names.len(), 2, "{names:?}");
-        let day_one = String::from_utf8_lossy(
-            &zstd::decode_all(std::fs::read(dir.join(&names[0])).unwrap().as_slice()).unwrap(),
-        )
-        .into_owned();
-        let day_two = String::from_utf8_lossy(
-            &zstd::decode_all(std::fs::read(dir.join(&names[1])).unwrap().as_slice()).unwrap(),
-        )
-        .into_owned();
-        assert!(day_one.contains("{\"n\":1}"), "{day_one}");
+        let day_one = decoded(dir.join(DAY_ONE));
+        assert!(day_one.contains(r#"{"n":1}"#), "{day_one}");
         assert!(
-            day_one.contains("{\"n\":2}"),
-            "sidecar overlap missing: {day_one}"
+            day_one.contains(r#"{"n":2}"#),
+            "sidecar records missing: {day_one}"
         );
-        assert!(day_two.contains("{\"n\":3}"), "{day_two}");
-        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(decoded(dir.join(DAY_TWO)).contains(r#"{"n":3}"#));
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn duplicate_run_id_cannot_share_a_sidecar() {
-        let dir = std::env::temp_dir().join(format!(
-            "collector-sidecar-exclusive-test-{}-{}",
-            std::process::id(),
-            Timestamp::now().as_nanosecond()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let now = Timestamp::now();
-        let mut incumbent = Writer::new(
-            dir.to_str().unwrap(),
-            "incumbent",
-            QualityReporter::disabled(),
-        );
-        incumbent
+        let dir = test_dir("sidecar-exclusive");
+        let mut incumbent = writer(&dir, "incumbent");
+        put(&mut incumbent, day_one(), br#"{"n":1}"#);
+        let mut first = writer(&dir, "same-run");
+        put(&mut first, day_one(), br#"{"n":2}"#);
+        let mut second = writer(&dir, "same-run");
+        let error = second
             .write(
-                now,
+                day_one(),
                 Symbol::from("btcusdt"),
-                bytes::Bytes::from_static(b"{\"n\":1}"),
-            )
-            .unwrap();
-        let mut first = Writer::new(
-            dir.to_str().unwrap(),
-            "same-run",
-            QualityReporter::disabled(),
-        );
-        first
-            .write(
-                now,
-                Symbol::from("btcusdt"),
-                bytes::Bytes::from_static(b"{\"n\":2}"),
-            )
-            .unwrap();
-        let mut second = Writer::new(
-            dir.to_str().unwrap(),
-            "same-run",
-            QualityReporter::disabled(),
-        );
-        let err = second
-            .write(
-                now,
-                Symbol::from("btcusdt"),
-                bytes::Bytes::from_static(b"{\"n\":3}"),
+                Bytes::from_static(br#"{"n":3}"#),
             )
             .unwrap_err();
         assert!(
-            err.to_string().contains("already exists")
-                || err
-                    .downcast_ref::<std::io::Error>()
-                    .is_some_and(|e| e.kind() == std::io::ErrorKind::AlreadyExists),
-            "second writer with the same run id must not share the sidecar: {err}"
+            error
+                .downcast_ref::<io::Error>()
+                .is_some_and(|error| error.kind() == io::ErrorKind::AlreadyExists),
+            "a second writer with the same run id must not share the sidecar: {error}"
         );
-        first.close().ok();
-        incumbent.close().ok();
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    fn test_dir(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "collector-{tag}-test-{}-{}",
-            std::process::id(),
-            Timestamp::now().as_nanosecond()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
-    fn put(writer: &mut Writer, recv_time: Timestamp, data: &'static [u8]) {
-        writer
-            .write(
-                recv_time,
-                Symbol::from("btcusdt"),
-                bytes::Bytes::from_static(data),
-            )
-            .unwrap();
-    }
-
-    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
-        haystack.windows(needle.len()).any(|w| w == needle)
+        first.close().unwrap();
+        incumbent.close().unwrap();
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -1391,7 +1089,7 @@ mod tests {
         let dir = test_dir("frame-walk");
         let path = dir.join("walk.zst");
         let check = |bytes: &[u8]| {
-            std::fs::write(&path, bytes).unwrap();
+            fs::write(&path, bytes).unwrap();
             ends_on_frame_boundary(&File::open(&path).unwrap()).unwrap()
         };
         let mut streamed = zstd::stream::write::Encoder::new(Vec::new(), 1).unwrap();
@@ -1410,83 +1108,52 @@ mod tests {
         let mut garbage = whole.clone();
         garbage.extend_from_slice(b"not zstd");
         assert!(!check(&garbage));
-        std::fs::remove_dir_all(&dir).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn unterminated_daily_file_is_set_aside_not_appended_to() {
         let dir = test_dir("unterminated");
-        let now = Timestamp::from_nanosecond(1_800_000_000_000_000_000).unwrap();
-        let canonical = dir.join("btcusdt_20270115.zst");
+        let daily = dir.join(DAY_ONE);
         let crashed = zstd::encode_all(&b"before-crash"[..], 1).unwrap();
-        std::fs::write(&canonical, &crashed[..crashed.len() - 2]).unwrap();
+        let crashed = &crashed[..crashed.len() - 2];
+        fs::write(&daily, crashed).unwrap();
 
-        let mut writer = Writer::new(
-            dir.to_str().unwrap(),
-            "restart",
-            QualityReporter::disabled(),
-        );
-        put(&mut writer, now, b"after-restart");
+        let mut writer = writer(&dir, "restart");
+        put(&mut writer, day_one(), b"after-restart");
         writer.close().unwrap();
 
-        let fresh = zstd::decode_all(std::fs::read(&canonical).unwrap().as_slice()).unwrap();
-        assert!(contains(&fresh, b"after-restart"));
-        let names: Vec<_> = std::fs::read_dir(&dir)
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
-            .collect();
+        assert_eq!(decoded(&daily), format!("{DAY_ONE_NS} after-restart\n"));
+        let names = names(&dir);
         let salvage = names
             .iter()
             .find(|name| name.starts_with("btcusdt_20270115_unterminated-"))
             .unwrap_or_else(|| panic!("damaged file must be kept aside: {names:?}"));
-        assert_eq!(
-            std::fs::read(dir.join(salvage)).unwrap(),
-            &crashed[..crashed.len() - 2]
-        );
-        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(fs::read(dir.join(salvage)).unwrap(), crashed);
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn late_record_does_not_switch_into_yesterdays_file() {
         let dir = test_dir("late-record");
-        let before = Timestamp::from_nanosecond(1_800_000_000_000_000_000).unwrap();
-        let after = Timestamp::from_nanosecond(1_800_086_400_000_000_000).unwrap();
-        let mut incumbent = Writer::new(
-            dir.to_str().unwrap(),
-            "incumbent",
-            QualityReporter::disabled(),
-        );
-        put(&mut incumbent, before, b"incumbent-day-one");
-        put(&mut incumbent, after, b"incumbent-day-two");
-        let mut challenger = Writer::new(
-            dir.to_str().unwrap(),
-            "challenger",
-            QualityReporter::disabled(),
-        );
-        put(&mut challenger, after, b"sidecar-day-two");
+        let mut incumbent = writer(&dir, "incumbent");
+        put(&mut incumbent, day_one(), b"incumbent-day-one");
+        put(&mut incumbent, day_two(), b"incumbent-day-two");
+        let mut challenger = writer(&dir, "challenger");
+        put(&mut challenger, day_two(), b"sidecar-day-two");
         incumbent.close().unwrap();
         // Stamped before midnight, delivered after the incumbent let go.
-        put(&mut challenger, before, b"late");
+        put(&mut challenger, day_one(), b"late");
         challenger.close().unwrap();
 
-        let day_one = zstd::decode_all(
-            std::fs::read(dir.join("btcusdt_20270115.zst"))
-                .unwrap()
-                .as_slice(),
-        )
-        .unwrap();
-        let day_two = zstd::decode_all(
-            std::fs::read(dir.join("btcusdt_20270116.zst"))
-                .unwrap()
-                .as_slice(),
-        )
-        .unwrap();
-        assert!(!contains(&day_one, b"sidecar-day-two"));
-        assert!(!contains(&day_one, b"late"));
-        for payload in [&b"incumbent-day-two"[..], b"sidecar-day-two", b"late"] {
-            assert!(contains(&day_two, payload), "day two missing {payload:?}");
+        let day_one = decoded(dir.join(DAY_ONE));
+        assert!(!day_one.contains("sidecar-day-two"), "{day_one}");
+        assert!(!day_one.contains("late"), "{day_one}");
+        let day_two = decoded(dir.join(DAY_TWO));
+        for payload in ["incumbent-day-two", "sidecar-day-two", "late"] {
+            assert!(day_two.contains(payload), "day two missing {payload}");
         }
-        std::fs::remove_dir_all(&dir).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     /// fsync(2) on /dev/null fails with EINVAL, standing in for a disk error.
@@ -1495,40 +1162,30 @@ mod tests {
     fn failed_fsync_is_reported_and_fails_close() {
         let dir = test_dir("fsync");
         let (quality, events) = QualityReporter::test_channel();
-        let mut writer = Writer::new(dir.to_str().unwrap(), "fsync", quality);
-        put(
-            &mut writer,
-            Timestamp::from_nanosecond(1_800_000_000_000_000_000).unwrap(),
-            b"a",
-        );
+        let mut writer = Writer::new(&dir, "fsync", quality);
+        put(&mut writer, day_one(), b"a");
         let dev_null = File::options().write(true).open("/dev/null").unwrap();
         writer.files.get_mut("btcusdt").unwrap().sink =
             Sink::Daily(ZstdEncoder::new(dev_null, ZSTD_LEVEL).unwrap());
-        put(
-            &mut writer,
-            Timestamp::from_nanosecond(1_800_086_400_000_000_000).unwrap(),
-            b"b",
-        );
+        put(&mut writer, day_two(), b"b");
+
         assert!(
-            matches!(events.try_recv(), Ok(QualityEvent::StorageDegraded { error, .. }) if error.contains("failed to sync")),
+            matches!(
+                events.try_recv(),
+                Ok(QualityEvent::StorageDegraded { error, .. }) if error.contains("failed to sync")
+            ),
             "a failed fsync must be reported"
         );
         assert!(
             writer.close().is_err(),
             "close must not report a clean exit"
         );
-        std::fs::remove_dir_all(&dir).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn rollback_append_restores_prior_length() {
-        use std::io::Write;
-        let dir = std::env::temp_dir().join(format!(
-            "collector-rollback-test-{}-{}",
-            std::process::id(),
-            Timestamp::now().as_nanosecond()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = test_dir("rollback");
         let path = dir.join("dst");
         let mut file = File::options()
             .create(true)
@@ -1542,7 +1199,7 @@ mod tests {
         file.write_all(b"junk").unwrap();
         rollback_append(&mut file, start).unwrap();
         drop(file);
-        assert_eq!(std::fs::read(&path).unwrap(), b"keep");
-        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"keep");
+        fs::remove_dir_all(&dir).unwrap();
     }
 }
