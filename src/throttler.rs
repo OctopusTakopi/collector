@@ -1,7 +1,7 @@
-//! Pacing for Binance's REST rate limit: a per-minute request window, and a
+//! Pacing for a venue's REST rate limit: a per-minute request window, and a
 //! hard stop while a ban is in force. Requests during a ban are what stretch
-//! its two minutes into days, and the window cannot see a ban earned by a
-//! previous run or another process on the host.
+//! Binance's two minutes into days, and the window cannot see a ban earned by
+//! a previous run or another process on the host.
 
 use std::{
     future::Future,
@@ -20,7 +20,7 @@ const WINDOW_NANOS: i64 = 60_000_000_000;
 /// How long to sit out a rate-limit reply whose expiry could not be read.
 const OPAQUE_BAN_BACKOFF_MINUTES: i64 = 2;
 
-/// When a ban lifts, from a 418/429 reply: `Retry-After` seconds, else the
+/// When a Binance ban lifts, from a 418/429 reply: `Retry-After` seconds, else the
 /// millisecond epoch in a `-1003` message (`IP banned until 1785050129644`),
 /// else a fixed backoff, since unreadable must never mean not banned.
 pub fn ban_expiry(retry_after: Option<&str>, body: &[u8], now: Timestamp) -> Option<Timestamp> {
@@ -50,6 +50,7 @@ pub fn ban_expiry(retry_after: Option<&str>, body: &[u8], now: Timestamp) -> Opt
 
 #[derive(Clone)]
 pub struct Throttler {
+    venue: &'static str,
     exec_ts: Arc<Mutex<Vec<i64>>>,
     /// When an observed ban lifts, in epoch nanoseconds; 0 when not banned.
     banned_until: Arc<AtomicI64>,
@@ -57,8 +58,9 @@ pub struct Throttler {
 }
 
 impl Throttler {
-    pub fn new(rate_limit: usize) -> Self {
+    pub fn new(venue: &'static str, rate_limit: usize) -> Self {
         Self {
+            venue,
             exec_ts: Default::default(),
             banned_until: Arc::new(AtomicI64::new(0)),
             rate_limit,
@@ -71,8 +73,9 @@ impl Throttler {
         let until_nanos = until.as_nanosecond() as i64;
         if self.banned_until.fetch_max(until_nanos, Ordering::Relaxed) < until_nanos {
             error!(
+                venue = self.venue,
                 until = %until,
-                "Binance banned this IP; no further REST requests until it lifts"
+                "the venue banned this IP; no further REST requests until it lifts"
             );
         }
     }
@@ -86,6 +89,7 @@ impl Throttler {
         let banned_until = self.banned_until.load(Ordering::Relaxed);
         if banned_until > cur_ts {
             warn!(
+                venue = self.venue,
                 remaining_secs = (banned_until - cur_ts) / 1_000_000_000,
                 "skipping request: this IP is still banned"
             );
@@ -143,7 +147,7 @@ mod tests {
     /// Once a ban is recorded, nothing is sent until it lifts.
     #[tokio::test]
     async fn a_recorded_ban_stops_every_request() {
-        let throttler = Throttler::new(100);
+        let throttler = Throttler::new("test", 100);
         assert_eq!(throttler.execute(async { 1 }).await, Some(1));
 
         let until = Timestamp::now().checked_add(Span::new().hours(24)).unwrap();
@@ -159,7 +163,7 @@ mod tests {
     /// A second ban while one is in force is an escalation, not a reprieve.
     #[tokio::test]
     async fn a_ban_is_never_shortened() {
-        let throttler = Throttler::new(100);
+        let throttler = Throttler::new("test", 100);
         let now = Timestamp::now();
 
         throttler.note_ban(now.checked_add(Span::new().hours(24)).unwrap());
@@ -172,11 +176,11 @@ mod tests {
     /// tests from issuing live requests.
     #[tokio::test]
     async fn the_rate_limit_is_a_ceiling() {
-        let throttler = Throttler::new(2);
+        let throttler = Throttler::new("test", 2);
         assert_eq!(throttler.execute(async { 1 }).await, Some(1));
         assert_eq!(throttler.execute(async { 2 }).await, Some(2));
         assert_eq!(throttler.execute(async { 3 }).await, None);
 
-        assert_eq!(Throttler::new(0).execute(async { 1 }).await, None);
+        assert_eq!(Throttler::new("test", 0).execute(async { 1 }).await, None);
     }
 }

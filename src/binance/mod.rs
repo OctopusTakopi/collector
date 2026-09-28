@@ -10,16 +10,16 @@ use std::{collections::HashMap, future::Future, sync::Arc, time::Duration};
 use bytes::Bytes;
 use jiff::Timestamp;
 use rustls::ClientConfig;
-use tokio::{sync::mpsc::Sender, task::JoinSet};
-use tracing::{error, warn};
+use tokio::task::JoinSet;
+use tracing::warn;
 
 use crate::{
     collection::{self, Context, Recorder, Venue},
     error::ConnectorError,
-    file::WriteRecord,
     quality::{QualityEvent, QualityReporter},
     routing::{self, BinanceEvent},
     session::Slot,
+    snapshot::{Depth, Snapshots},
     symbol::Symbol,
     throttler::{self, Throttler},
 };
@@ -109,17 +109,6 @@ fn is_public(stream: &str) -> bool {
     matches!(kind, "trade" | "bookTicker" | "rpiDepth") || kind.starts_with("depth")
 }
 
-/// Spacing between snapshot requests. The throttler's window only knows what
-/// this process spent, so a burst per round would let restarts inside a minute
-/// stack bursts; spaced, a restart costs one snapshot.
-const SNAPSHOT_PACE: Duration = Duration::from_secs(2);
-
-/// Delay before the first snapshot, so a crash-looping collector spends no
-/// request weight.
-const SNAPSHOT_START_DELAY: Duration = Duration::from_secs(5);
-
-const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(60 * 60);
-
 /// Snapshots per minute. An IP may spend 2,400 weight a minute and a
 /// depth-1000 snapshot weighs 20, so at most 120; the rest is margin for
 /// connection requests.
@@ -140,15 +129,7 @@ pub(crate) async fn collect(
     tls: Arc<ClientConfig>,
 ) -> anyhow::Result<()> {
     let mut recorder = Recorder::new(cx.writer_tx.clone(), symbols, cx.connections);
-    let snapshots = Snapshots {
-        endpoint,
-        client: reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(30))
-            .build()?,
-        throttler: Throttler::new(SNAPSHOT_RATE_LIMIT),
-        writer_tx: cx.writer_tx.clone(),
-    };
+    let snapshots = Snapshots::new(endpoint, SNAPSHOT_RATE_LIMIT, cx.writer_tx.clone())?;
     let mut tasks = JoinSet::new();
     // Snapshots seed and repair the depth stream. A worker without one (USD-M's
     // `/market` half) would only spend weight its sibling already spends.
@@ -199,7 +180,7 @@ struct Binance {
     recorder: Recorder,
     /// Highest depth update id seen per symbol.
     prev_u: HashMap<Symbol, i64>,
-    snapshots: Snapshots,
+    snapshots: Snapshots<Endpoint>,
     /// Snapshots fetched to repair a depth gap.
     recoveries: JoinSet<()>,
     quality: QualityReporter,
@@ -291,103 +272,53 @@ impl Binance {
             source: format!("{}/{symbol}", self.endpoint.label),
             detail: format!("depth continuity break after update {after}"),
         });
-        while self.recoveries.try_join_next().is_some() {}
-        let snapshots = self.snapshots.clone();
-        let symbol = Symbol::clone(symbol);
-        self.recoveries.spawn(async move {
-            let _ = snapshots.take(symbol).await;
-        });
+        self.snapshots.repair(&mut self.recoveries, symbol);
     }
 }
 
-/// Depth snapshots over REST.
-#[derive(Clone)]
-struct Snapshots {
-    endpoint: &'static Endpoint,
-    client: reqwest::Client,
-    throttler: Throttler,
-    writer_tx: Sender<WriteRecord>,
-}
+impl Depth for Endpoint {
+    fn label(&self) -> &'static str {
+        self.label
+    }
 
-impl Snapshots {
-    /// Snapshots every symbol once per [`SNAPSHOT_INTERVAL`], paced. Returns
-    /// once the writer is gone.
-    async fn periodically(self, symbols: Vec<Symbol>) {
-        tokio::time::sleep(SNAPSHOT_START_DELAY).await;
-        let mut round = tokio::time::interval(SNAPSHOT_INTERVAL);
-        let mut pacer = tokio::time::interval(SNAPSHOT_PACE);
-        // A round that overruns its spacing must not then fire the backlog.
-        pacer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            round.tick().await;
-            for symbol in &symbols {
-                pacer.tick().await;
-                if self.take(Symbol::clone(symbol)).await.is_err() {
-                    return;
+    fn fetch(
+        &self,
+        client: reqwest::Client,
+        throttler: Throttler,
+        symbol: Symbol,
+    ) -> impl Future<Output = anyhow::Result<Bytes>> + Send + use<> {
+        let (label, depth_url) = (self.label, self.depth_url);
+        async move {
+            let response = client
+                .get(format!("{depth_url}{}&limit=1000", symbol.to_uppercase()))
+                .header("Accept", "application/json")
+                .send()
+                .await?;
+            let status = response.status();
+            let retry_after = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+            let body = response.bytes().await?;
+            if !status.is_success() {
+                // 418 is a ban and 429 the warning before one; recording it
+                // gates every later request, not just this one.
+                if matches!(status.as_u16(), 418 | 429)
+                    && let Some(until) =
+                        throttler::ban_expiry(retry_after.as_deref(), &body, Timestamp::now())
+                {
+                    throttler.note_ban(until);
                 }
+                // The Binance error code is what tells a bad symbol from a ban.
+                let preview = &body[..body.len().min(1024)];
+                anyhow::bail!(
+                    "{label} depth snapshot returned {status}: {}",
+                    String::from_utf8_lossy(preview)
+                );
             }
+            Ok(body)
         }
-    }
-
-    /// Fetches one snapshot and queues it. Fails only once the writer is gone.
-    async fn take(&self, symbol: Symbol) -> Result<(), ConnectorError> {
-        match self.throttler.execute(self.fetch(&symbol)).await {
-            Some(Ok(data)) => self
-                .writer_tx
-                .send(WriteRecord {
-                    recv_time: Timestamp::now(),
-                    symbol,
-                    data,
-                })
-                .await
-                .map_err(|_| ConnectorError::WriterClosed),
-            Some(Err(error)) => {
-                error!(%symbol, %error, "failed to fetch depth snapshot");
-                Ok(())
-            }
-            None => {
-                warn!(%symbol, "depth snapshot fetch rate-limited, skipping");
-                Ok(())
-            }
-        }
-    }
-
-    async fn fetch(&self, symbol: &str) -> anyhow::Result<Bytes> {
-        let response = self
-            .client
-            .get(format!(
-                "{}{}&limit=1000",
-                self.endpoint.depth_url,
-                symbol.to_uppercase()
-            ))
-            .header("Accept", "application/json")
-            .send()
-            .await?;
-        let status = response.status();
-        let retry_after = response
-            .headers()
-            .get(reqwest::header::RETRY_AFTER)
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_owned);
-        let body = response.bytes().await?;
-        if !status.is_success() {
-            // 418 is a ban and 429 the warning before one; recording it gates
-            // every later request, not just this one.
-            if matches!(status.as_u16(), 418 | 429)
-                && let Some(until) =
-                    throttler::ban_expiry(retry_after.as_deref(), &body, Timestamp::now())
-            {
-                self.throttler.note_ban(until);
-            }
-            // The Binance error code is what tells a bad symbol from a ban.
-            let preview = &body[..body.len().min(1024)];
-            anyhow::bail!(
-                "{} depth snapshot returned {status}: {}",
-                self.endpoint.label,
-                String::from_utf8_lossy(preview)
-            );
-        }
-        Ok(body)
     }
 }
 
@@ -398,6 +329,7 @@ mod tests {
     use tokio::sync::mpsc::{Receiver, channel};
 
     use super::*;
+    use crate::file::WriteRecord;
 
     static TEST_SPOT: Endpoint = Endpoint {
         label: "test-spot",
@@ -432,13 +364,8 @@ mod tests {
                 NonZeroUsize::new(connections).unwrap(),
             ),
             prev_u: HashMap::new(),
-            snapshots: Snapshots {
-                endpoint,
-                client: reqwest::Client::new(),
-                // No budget: a gap must never issue a live request from a test.
-                throttler: Throttler::new(0),
-                writer_tx,
-            },
+            // No budget: a gap must never issue a live request from a test.
+            snapshots: Snapshots::new(endpoint, 0, writer_tx).unwrap(),
             recoveries: JoinSet::new(),
             quality: QualityReporter::disabled(),
         };

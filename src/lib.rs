@@ -14,6 +14,7 @@ pub mod quality;
 pub mod readiness;
 pub mod routing;
 mod session;
+mod snapshot;
 pub mod symbol;
 mod throttler;
 mod ws;
