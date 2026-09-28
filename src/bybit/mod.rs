@@ -91,7 +91,11 @@ async fn handle(
         let symbol = symbols.resolve(symbol_raw);
 
         writer_tx
-            .send((recv_time, symbol, data))
+            .send(WriteRecord {
+                recv_time,
+                symbol,
+                data,
+            })
             .await
             .map_err(|_| ConnectorError::WriterClosed)?;
     }
@@ -209,7 +213,11 @@ mod tests {
         .await
         .unwrap();
 
-        let (_, symbol, written) = writer_rx.try_recv().unwrap();
+        let WriteRecord {
+            symbol,
+            data: written,
+            ..
+        } = writer_rx.try_recv().unwrap();
         assert_eq!(symbol.as_ref(), "btcusdt");
         assert_eq!(written, data);
     }
@@ -279,7 +287,7 @@ mod tests {
             .unwrap();
         }
 
-        let (_, _, written) = writer_rx.try_recv().unwrap();
+        let WriteRecord { data: written, .. } = writer_rx.try_recv().unwrap();
         assert_eq!(written, trade);
         assert!(writer_rx.try_recv().is_err(), "the copy is dropped");
         // Both connections need resubscribing, so both must have been told.

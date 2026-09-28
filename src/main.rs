@@ -260,7 +260,11 @@ async fn main() -> Result<(), anyhow::Error> {
             let mut writer_ready = false;
             let result = loop {
                 match writer_rx.blocking_recv() {
-                    Some((recv_time, symbol, data)) => {
+                    Some(file::WriteRecord {
+                        recv_time,
+                        symbol,
+                        data,
+                    }) => {
                         if let Err(error) = writer.write(recv_time, symbol, data) {
                             break Err(error);
                         }

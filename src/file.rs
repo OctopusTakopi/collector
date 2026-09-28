@@ -18,7 +18,12 @@ use zstd::stream::write::Encoder as ZstdEncoder;
 use crate::quality::{QualityEvent, QualityReporter};
 use crate::symbol::Symbol;
 
-pub type WriteRecord = (Timestamp, Symbol, bytes::Bytes);
+/// One received frame on its way to the writer thread.
+pub struct WriteRecord {
+    pub recv_time: Timestamp,
+    pub symbol: Symbol,
+    pub data: bytes::Bytes,
+}
 
 const SYNC_ATTEMPTS: u32 = 3;
 /// Uncompressed bytes accumulated before they are handed to zstd. Matches the

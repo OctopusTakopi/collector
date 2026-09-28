@@ -131,6 +131,50 @@ fn json_i64(hay: &[u8], key: &[u8]) -> Option<i64> {
     Some(if negative { -value } else { value })
 }
 
+/// Dedup key for a Binance combined-stream frame.
+///
+/// Binance spot stamps the event time `E` per connection at serialisation, so
+/// the two connections' copies of one event land tens of microseconds apart
+/// differing only in `E`, and a whole-payload key records both (measured over
+/// two days of redundant collection: a few percent of spot trades). Cutting
+/// `E` out of the key restores suppression. That cannot merge two distinct
+/// events: every Binance market event carries an id that is unique per event
+/// (`u`, `t`, `a`) outside `E`. Futures copies are byte-identical, so for
+/// them this changes nothing.
+///
+/// Depth copies that were coalesced *differently* still differ beyond `E` and
+/// stay recorded; payload-keyed dedup deliberately does not interpret ids.
+pub fn binance_dedup_key(payload: &[u8]) -> u128 {
+    let Some((pre, rest)) = cut_event_time(payload) else {
+        return xxhash_rust::xxh3::xxh3_128(payload);
+    };
+    let mut hasher = xxhash_rust::xxh3::Xxh3Default::new();
+    hasher.update(pre);
+    hasher.update(rest);
+    hasher.digest128()
+}
+
+/// Split `payload` around its first `"E":<integer>` field, the per-connection
+/// stamp; anything else leaves the payload untouched. A quoted `"E":` cannot
+/// occur inside a JSON string value (quotes there are escaped), so a byte
+/// scan finds exactly the key.
+fn cut_event_time(payload: &[u8]) -> Option<(&[u8], &[u8])> {
+    const NEEDLE: &[u8] = b"\"E\":";
+    let pos = payload.windows(NEEDLE.len()).position(|w| w == NEEDLE)?;
+    let mut end = pos + NEEDLE.len();
+    if end < payload.len() && payload[end] == b'-' {
+        end += 1;
+    }
+    let digits = end;
+    while end < payload.len() && payload[end].is_ascii_digit() {
+        end += 1;
+    }
+    if end == digits {
+        return None;
+    }
+    Some((&payload[..pos], &payload[end..]))
+}
+
 #[derive(Deserialize)]
 pub struct BybitMessage<'a> {
     #[serde(borrow)]
@@ -425,5 +469,35 @@ mod tests {
                 String::from_utf8_lossy(raw)
             );
         }
+    }
+
+    /// The two connections' copies of a spot event differ only in the
+    /// per-connection `E` stamp, so the key must not see `E` at all.
+    #[test]
+    fn dedup_key_ignores_the_per_connection_event_time() {
+        let a = br#"{"stream":"btcusdt@trade","data":{"e":"trade","E":1785671271715,"s":"BTCUSDT","t":6551542138,"p":"63160.00000000","q":"0.12952000","T":1785671271715,"m":false,"M":true}}"#;
+        let b = br#"{"stream":"btcusdt@trade","data":{"e":"trade","E":1785671271716,"s":"BTCUSDT","t":6551542138,"p":"63160.00000000","q":"0.12952000","T":1785671271715,"m":false,"M":true}}"#;
+        assert_eq!(binance_dedup_key(a), binance_dedup_key(b));
+        assert_ne!(
+            binance_dedup_key(a),
+            xxhash_rust::xxh3::xxh3_128(a),
+            "the stamp must actually be cut out"
+        );
+    }
+
+    /// The cut must not merge distinct events: ids outside `E` still separate
+    /// them.
+    #[test]
+    fn dedup_key_keeps_distinct_events_apart() {
+        let a = br#"{"stream":"btcusdt@trade","data":{"e":"trade","E":1,"t":10}}"#;
+        let b = br#"{"stream":"btcusdt@trade","data":{"e":"trade","E":1,"t":11}}"#;
+        assert_ne!(binance_dedup_key(a), binance_dedup_key(b));
+    }
+
+    /// Frames without `E` (spot bookTicker) hash exactly as the plain payload.
+    #[test]
+    fn dedup_key_without_event_time_is_the_plain_hash() {
+        let frame = br#"{"stream":"btcusdt@bookTicker","data":{"u":1,"s":"BTCUSDT","b":"1","B":"1","a":"2","A":"1"}}"#;
+        assert_eq!(binance_dedup_key(frame), xxhash_rust::xxh3::xxh3_128(frame));
     }
 }
