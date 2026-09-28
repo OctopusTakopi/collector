@@ -3,14 +3,14 @@ use std::{
     collections::HashMap,
     fmt::{self, Write as _},
     fs::{self, File, TryLockError},
-    io::{self, Seek, SeekFrom, Write},
+    io::{self, Read, Seek, SeekFrom, Write},
     mem,
     os::unix::fs::{FileExt, MetadataExt},
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use jiff::{Timestamp, civil::Date, tz::TimeZone};
 use tracing::{error, info, warn};
 
@@ -270,8 +270,9 @@ fn try_lock_daily(prefix: &Path, date: Date) -> io::Result<Option<File>> {
             "cannot verify the daily file; treating it as unterminated"
         ),
     }
-    // The last writer died mid-frame: set the file aside, readable up to
-    // where it stops, and start the day again in a fresh one.
+    // The last writer died mid-frame, or the end cannot be checked: set the
+    // file aside, readable up to where it stops, and start the day again in a
+    // fresh one.
     let salvage = day_file(
         prefix,
         date,
@@ -331,6 +332,46 @@ fn seal(file: &mut File, name: &Path) -> Result<(), FinalizeError> {
     // clean, so a retry could succeed with the data lost.
     file.sync_all()
         .map_err(|error| FinalizeError::Unsynced(failed("sync", error)))
+}
+
+/// How much of `batch`, which holds whole records, an unfinished `sidecar`
+/// already holds: through the batch's first copy of the last complete record
+/// the sidecar decodes to. `None` if that record is not in the batch.
+fn persisted_prefix(sidecar: &Path, batch: &[u8]) -> io::Result<Option<usize>> {
+    let Some(last) = last_record(sidecar)? else {
+        return Ok(None);
+    };
+    let mut end = 0;
+    Ok(batch
+        .split_inclusive(|&byte| byte == b'\n')
+        .find_map(|record| {
+            end += record.len();
+            (record == last).then_some(end)
+        }))
+}
+
+/// The last complete record in a file that may end mid-frame, read up to the
+/// truncation.
+fn last_record(path: &Path) -> io::Result<Option<Vec<u8>>> {
+    let mut decoder = zstd::stream::read::Decoder::new(File::open(path)?)?;
+    let mut chunk = vec![0; ZSTD_BATCH_BYTES];
+    let (mut last, mut partial) = (Vec::new(), Vec::new());
+    loop {
+        let read = match decoder.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(error) => return Err(error),
+        };
+        for piece in chunk[..read].split_inclusive(|&byte| byte == b'\n') {
+            partial.extend_from_slice(piece);
+            if piece.ends_with(b"\n") {
+                mem::swap(&mut last, &mut partial);
+                partial.clear();
+            }
+        }
+    }
+    Ok((!last.is_empty()).then_some(last))
 }
 
 /// What became of a finished sidecar.
@@ -672,6 +713,7 @@ impl RotatingFile {
                 // An unfinished frame must never be appended.
                 warn!(path = %sidecar.display(), "leaving unfinished overlap sidecar on disk");
                 // Records the sidecar did not take go to the daily file.
+                self.skip_persisted(&sidecar);
                 let after = if self.batch.is_empty() {
                     after
                 } else {
@@ -792,6 +834,14 @@ impl RotatingFile {
     }
 
     fn flush_batch(&mut self) -> io::Result<()> {
+        self.write_batch()?;
+        self.batch.clear();
+        Ok(())
+    }
+
+    /// Hand the batch to the encoder and flush it into the file, so that only
+    /// the batch in hand can be partly written when a later step fails.
+    fn write_batch(&mut self) -> io::Result<()> {
         if self.batch.is_empty() {
             return Ok(());
         }
@@ -799,15 +849,39 @@ impl RotatingFile {
             return Err(no_open_file(&self.prefix));
         };
         encoder.write_all(&self.batch)?;
-        self.batch.clear();
-        Ok(())
+        encoder.flush()
+    }
+
+    /// Drop from the batch the records an unfinished sidecar already holds.
+    /// When that cannot be told, the whole batch is rewritten: a duplicate
+    /// over a gap.
+    fn skip_persisted(&mut self, sidecar: &Path) {
+        if self.batch.is_empty() {
+            return;
+        }
+        let unknown = match persisted_prefix(sidecar, &self.batch) {
+            Ok(Some(persisted)) => {
+                self.batch.advance(persisted);
+                return;
+            }
+            Ok(None) => "its last record is not in the batch".to_owned(),
+            Err(error) => format!("it cannot be decoded: {error}"),
+        };
+        let error = format!(
+            "rewriting all {} batched bytes after the unfinished overlap sidecar; \
+             some may be recorded twice, as {unknown}",
+            self.batch.len()
+        );
+        warn!(path = %sidecar.display(), "{error}");
+        self.mark_degraded(sidecar.display().to_string(), error);
     }
 
     /// Flush the batch, finish the open zstd frame, end the file with its
     /// trailer and fsync it. A finished sidecar stays the sink until it is
-    /// appended.
+    /// appended. The batch is kept until its frame is finished, for
+    /// [`Self::skip_persisted`].
     fn finalize(&mut self) -> Result<(), FinalizeError> {
-        self.flush_batch().map_err(FinalizeError::Unfinished)?;
+        self.write_batch().map_err(FinalizeError::Unfinished)?;
         let encoder = match mem::replace(&mut self.sink, Sink::Closed) {
             Sink::Daily(encoder) => encoder,
             Sink::Sidecar { encoder, path } => {
@@ -830,6 +904,7 @@ impl RotatingFile {
                 ),
             ))
         })?;
+        self.batch.clear();
         seal(&mut file, &self.prefix)
     }
 
@@ -1656,6 +1731,69 @@ mod tests {
         assert!(has_sidecar(&dir, "challenger"), "it must never be appended");
         let text = decoded(dir.join(DAY_ONE));
         assert!(text.contains(r#"{"n":3}"#), "{text}");
+        assert!(
+            !text.contains(r#"{"n":2}"#),
+            "the record the sidecar already holds must not be rewritten: {text}"
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A sidecar that ends mid-frame after `persisted` of `batch`: earlier
+    /// records in whole flushed blocks, then a torn block.
+    fn torn_sidecar(path: &Path, earlier: &[u8], batch: &[u8], persisted: usize) {
+        let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 1).unwrap();
+        encoder.write_all(earlier).unwrap();
+        encoder.flush().unwrap();
+        encoder.write_all(&batch[..persisted]).unwrap();
+        encoder.flush().unwrap();
+        let flushed = encoder.get_ref().len();
+        encoder.write_all(&batch[persisted..]).unwrap();
+        encoder.flush().unwrap();
+        let mut bytes = encoder.finish().unwrap();
+        // Part of the unflushed block's header only.
+        bytes.truncate(flushed + 2);
+        fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn only_records_an_unfinished_sidecar_lacks_are_rewritten() {
+        let dir = test_dir("persisted");
+        let path = dir.join("torn.zst");
+        let earlier = b"1 {\"n\":1}\n2 {\"n\":2}\n".as_slice();
+        let batch = b"3 {\"n\":3}\n4 {\"n\":4}\n5 {\"n\":5}\n".as_slice();
+        const RECORD: usize = 10;
+        let mut file = RotatingFile::new(
+            day_one(),
+            dir.join("btcusdt"),
+            "run".to_owned(),
+            QualityReporter::disabled(),
+        )
+        .unwrap();
+        let mut rewrite = |path: &Path| {
+            file.batch = BytesMut::from(batch);
+            file.skip_persisted(path);
+            file.batch.to_vec()
+        };
+
+        for (persisted, kept) in [
+            (2 * RECORD, 2 * RECORD),
+            // A block boundary inside a record: that record is rewritten.
+            (RECORD + 5, RECORD),
+            (0, 0),
+        ] {
+            torn_sidecar(&path, earlier, batch, persisted);
+            assert_eq!(
+                rewrite(&path),
+                &batch[kept..],
+                "{persisted} bytes persisted"
+            );
+        }
+        assert_eq!(persisted_prefix(&path, batch).unwrap(), None);
+
+        fs::write(&path, b"not zstd at all").unwrap();
+        assert!(persisted_prefix(&path, batch).is_err());
+        assert_eq!(rewrite(&path), batch, "an undecodable sidecar rewrites all");
+        drop(file);
         fs::remove_dir_all(&dir).unwrap();
     }
 
