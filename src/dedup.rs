@@ -35,10 +35,10 @@
 //! distinct events inside the same millisecond, with every other field equal,
 //! would serialise identically and the second would be dropped as a duplicate.
 //! No content-based filter can separate those, and a sequence-based one cannot
-//! handle `forceOrder` at all. The exposure is small (Binance pushes at most
-//! one `forceOrder` per symbol per second) but it is not zero, and unlike a
-//! shed frame the loss is counted as a successful suppression rather than
-//! logged. Weigh that against the gap redundancy removes.
+//! handle `forceOrder` at all. The exposure is small (Binance pushes only the
+//! largest liquidation per symbol in each 1000 ms window) but it is not zero,
+//! and unlike a shed frame the loss is counted as a successful suppression
+//! rather than logged. Weigh that against the gap redundancy removes.
 //!
 //! # Ordering
 //!

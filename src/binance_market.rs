@@ -90,8 +90,10 @@ fn max_session_age(connection: usize) -> Duration {
 /// decision rather than a local failure.
 const SETTLED: Duration = Duration::from_secs(30);
 
-/// The event Binance pushes ten minutes before it closes a connection:
-/// `{"e":"serverShutdown","E":...}`, as JSON in a websocket text frame.
+/// The event Binance pushes before it closes a connection:
+/// `{"e":"serverShutdown","E":...}`, as JSON in a websocket text frame. The
+/// lead time is unspecified — the documented ten minutes was withdrawn on
+/// 2026-06-09 in favour of "reconnect as soon as possible".
 const SERVER_SHUTDOWN: &str = "serverShutdown";
 
 /// Longest frame worth testing for the shutdown announcement.
@@ -397,7 +399,7 @@ where
 /// Read one websocket session to its end, delivering market data into `ws_tx`.
 ///
 /// The decision to replace a session does not end it. On a shutdown
-/// announcement — which Binance sends ten minutes ahead — or at `max_age`, it
+/// announcement — which comes with an unspecified lead time — or at `max_age`, it
 /// reports [`Event::Relieve`] and *keeps reading*, so the replacement's
 /// handshake happens while this socket is still delivering. The session stops
 /// when `retire` fires, when the venue closes the socket, or when it falls
@@ -895,10 +897,10 @@ pub async fn run_collection(
         .timeout(Duration::from_secs(30))
         .build()?;
     // Depth snapshots exist to seed/repair the DEPTH stream; a worker
-    // whose stream set carries no depth (e.g. the market-path
-    // forceOrder split) must not duplicate the REST snapshot loop —
-    // the legacy worker already snapshots the same symbols, and a
-    // second loop only burns request budget (review finding).
+    // whose stream set carries no depth (e.g. USD-M's `/market` half)
+    // must not duplicate the REST snapshot loop — the `/public` worker
+    // already snapshots the same symbols, and a second loop only burns
+    // request budget.
     let collects_depth = streams.iter().any(|s| s.contains("@depth"));
     if collects_depth {
         let writer_tx = writer_tx.clone();
@@ -1077,12 +1079,13 @@ pub async fn keep_connection(
                     );
                 });
                 // A planned handover on a healthy session is not a failure, and
-                // the ten minutes of notice exist so the replacement can be
-                // opened at once. A short-lived one still pays the backoff — a
-                // venue rolling its pool can announce a shutdown seconds after
-                // the handshake, and answering each one immediately would spend
-                // this IP's connection budget in a burst. That costs the
-                // recording nothing, since the old session delivers throughout.
+                // with no promised lead time the replacement has to be opened at
+                // once. A short-lived one still pays the backoff — a venue
+                // rolling its pool can announce a shutdown seconds after the
+                // handshake, and answering each one immediately would spend this
+                // IP's connection budget in a burst. The old session delivers
+                // until the venue actually cuts it; a cut inside the backoff is
+                // a hole only when no redundant connection is running.
                 back_off(&mut error_count, Some(lifetime)).await;
             }
             // Clean disconnect (ws_tx dropped) — exit. Dropping `lingering`
@@ -1214,11 +1217,13 @@ mod tests {
         }
     }
 
+    /// Payload as served since the 2026-06-30 CM-UM integration: `o` carries
+    /// `ps` (pair) and `st` (1 = USD-M, 2 = COIN-M).
     #[tokio::test]
     async fn routes_force_order_by_stream_symbol() {
         let (writer_tx, mut writer_rx) = channel(1);
         let mut harness = Harness::new("BTCUSDT");
-        let raw = br#"{"stream":"btcusdt@forceOrder","data":{"e":"forceOrder","E":1591154240950,"o":{"s":"BTCUSDT","S":"SELL","o":"LIMIT","f":"IOC","q":"0.014","p":"9910","ap":"9910","X":"FILLED","l":"0.014","z":"0.014","T":1591154240949}}}"#;
+        let raw = br#"{"stream":"btcusdt@forceOrder","data":{"e":"forceOrder","E":1790900158064,"o":{"s":"BTCUSDT","S":"BUY","o":"LIMIT","f":"IOC","q":"0.025","p":"85224.70","ap":"84896.00","X":"FILLED","l":"0.025","z":"0.025","T":1790900157118,"ps":"BTCUSDT","st":1}}}"#;
 
         harness.feed(&FUTURES, &writer_tx, raw).await.unwrap();
 
@@ -1554,7 +1559,7 @@ mod tests {
     /// The announcement is what makes a gap-free handover possible. Acting on
     /// it must not end the session: it has to keep delivering while the
     /// replacement is brought up, which is the entire point of Binance warning
-    /// ten minutes ahead of the disconnect.
+    /// ahead of the disconnect.
     #[tokio::test]
     async fn a_shutdown_announcement_asks_for_a_replacement_and_keeps_delivering() {
         let mut harness = SessionHarness::start(NEVER);

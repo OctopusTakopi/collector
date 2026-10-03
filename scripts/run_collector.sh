@@ -61,9 +61,17 @@ for MAP in "${MAPPINGS[@]}"; do
     tmux send-keys -t "$SESSION_NAME:$EXCH" "$CMD" C-m
 done
 
-tmux kill-window -t "$SESSION_NAME:init"
+# The collectors are live by now, so a tidy-up that fails must not turn a
+# successful deployment into a non-zero exit under `set -e`.
+tmux kill-window -t "$SESSION_NAME:init" || true
 
 echo "Collection started in tmux session: $SESSION_NAME"
 echo "Attach with: tmux attach-session -t $SESSION_NAME"
 
-tmux attach-session -t "$SESSION_NAME"
+# Attach only when there is somewhere to attach to. Over `ssh host
+# ./run_collector.sh`, or from inside a tmux pane, attach exits non-zero, and
+# `set -e` would report the launch as failed — a retry would then kill the
+# session it just started.
+if [ -z "${TMUX:-}" ] && [ -t 0 ] && [ -t 1 ]; then
+    tmux attach-session -t "$SESSION_NAME"
+fi

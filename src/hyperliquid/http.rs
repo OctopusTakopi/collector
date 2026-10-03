@@ -9,7 +9,7 @@ use anyhow::Error;
 use fastwebsockets::OpCode;
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
-use serde_json::value::RawValue;
+use serde_json::{Value, value::RawValue};
 use tokio::{select, sync::mpsc::Sender, time::timeout};
 use tracing::{debug, error, info, warn};
 
@@ -30,17 +30,33 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 /// this is multiplied by the connection count — see [`subscribe_pace`].
 const SUBSCRIBE_PACE: Duration = Duration::from_millis(35);
 
+/// A `{type, coin}` market-data subscription, the shape the collector records.
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
-struct Subscription {
+pub struct Subscription {
     #[serde(rename = "type")]
-    kind: String,
-    coin: String,
+    pub kind: String,
+    pub coin: String,
+}
+
+impl From<Subscription> for Value {
+    fn from(subscription: Subscription) -> Value {
+        serde_json::to_value(subscription).expect("a subscription serialises")
+    }
 }
 
 #[derive(Serialize)]
 struct SubscribeRequest<'a> {
     method: &'static str,
-    subscription: &'a Subscription,
+    subscription: &'a Value,
+}
+
+/// The `subscribe` frame for one subscription object.
+fn subscribe_frame(subscription: &Value) -> Vec<u8> {
+    serde_json::to_vec(&SubscribeRequest {
+        method: "subscribe",
+        subscription,
+    })
+    .expect("a JSON value serialises")
 }
 
 #[derive(Deserialize)]
@@ -54,21 +70,56 @@ struct Envelope<'a> {
 #[derive(Deserialize)]
 struct SubscriptionResponse {
     method: String,
-    subscription: Subscription,
+    subscription: Value,
 }
 
-struct SubscriptionReadiness {
-    expected: HashSet<Subscription>,
-    successful: HashSet<Subscription>,
+/// Tracks whether one connection has every subscription acknowledged and has
+/// delivered at least one market frame.
+///
+/// Subscriptions are compared as JSON objects: Hyperliquid echoes the
+/// subscription back in the acknowledgement, so anything it accepts — `{type,
+/// coin}`, `{type, user}`, `{type, user, dex}` — can be matched without
+/// per-kind knowledge. See [`acknowledges`] for what counts as a match.
+struct SubscriptionReadiness<'a> {
+    expected: &'a [Value],
+    /// Channels the subscriptions push market data on.
+    channels: HashSet<&'a str>,
+    acknowledged: Vec<bool>,
     market_delivered: bool,
     rejected: bool,
 }
 
-impl SubscriptionReadiness {
-    fn new(subscriptions: &[Subscription]) -> Self {
+/// Whether the acknowledgement `echo` answers the subscription `sent`: every
+/// field sent comes back unchanged. Hyperliquid fills in the defaults it was
+/// not sent — `{"type":"l2Book","coin":"BTC"}` is echoed with
+/// `"nSigFigs":null,"mantissa":null,"fast":false` — so extra fields are not a
+/// mismatch. Addresses must be cased the same on both sides.
+fn acknowledges(echo: &Value, sent: &Value) -> bool {
+    match (echo.as_object(), sent.as_object()) {
+        (Some(echo), Some(sent)) => sent.iter().all(|(key, value)| echo.get(key) == Some(value)),
+        _ => echo == sent,
+    }
+}
+
+impl<'a> SubscriptionReadiness<'a> {
+    fn new(expected: &'a [Value]) -> Self {
+        let channels = expected
+            .iter()
+            .filter_map(|subscription| subscription.get("type")?.as_str())
+            .flat_map(|kind| {
+                // The channel is named after the subscription type except here.
+                let alias = match kind {
+                    "userEvents" => Some("user"),
+                    "activeAssetCtx" => Some("activeSpotAssetCtx"),
+                    _ => None,
+                };
+                std::iter::once(kind).chain(alias)
+            })
+            .collect();
         Self {
-            expected: subscriptions.iter().cloned().collect(),
-            successful: HashSet::new(),
+            expected,
+            channels,
+            acknowledged: vec![false; expected.len()],
             market_delivered: false,
             rejected: false,
         }
@@ -86,9 +137,15 @@ impl SubscriptionReadiness {
                 if let Some(data) = envelope.data
                     && let Ok(response) = serde_json::from_str::<SubscriptionResponse>(data.get())
                     && response.method == "subscribe"
-                    && self.expected.contains(&response.subscription)
+                    && let Some(index) =
+                        self.expected
+                            .iter()
+                            .zip(&self.acknowledged)
+                            .position(|(sent, &acked)| {
+                                !acked && acknowledges(&response.subscription, sent)
+                            })
                 {
-                    self.successful.insert(response.subscription);
+                    self.acknowledged[index] = true;
                 }
                 false
             }
@@ -99,10 +156,7 @@ impl SubscriptionReadiness {
                 self.rejected = true;
                 false
             }
-            channel => self
-                .expected
-                .iter()
-                .any(|subscription| subscription.kind == channel),
+            channel => self.channels.contains(channel),
         }
     }
 
@@ -111,7 +165,7 @@ impl SubscriptionReadiness {
     }
 
     fn ready(&self) -> bool {
-        !self.rejected && self.market_delivered && self.successful.len() == self.expected.len()
+        !self.rejected && self.market_delivered && self.acknowledged.iter().all(|&acked| acked)
     }
 }
 
@@ -133,12 +187,12 @@ fn subscribe_pace(connections: usize) -> Duration {
 /// the socket unread for ~35 s, skewing every receive timestamp in that window
 /// and letting the kernel buffer back up. Running them here means data is being
 /// read from the very first frame.
-async fn control_loop(sender: FrameSender, subscriptions: Vec<Subscription>, connections: usize) {
+async fn control_loop(sender: FrameSender, subscriptions: &[Value], connections: usize) {
     let mut ping_interval = tokio::time::interval(PING_INTERVAL);
     ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut pacer = tokio::time::interval(subscribe_pace(connections));
     pacer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut to_send = subscriptions.into_iter();
+    let mut to_send = subscriptions.iter();
 
     loop {
         select! {
@@ -151,15 +205,8 @@ async fn control_loop(sender: FrameSender, subscriptions: Vec<Subscription>, con
                 let Some(subscription) = to_send.next() else {
                     continue;
                 };
-                debug!(kind = %subscription.kind, coin = %subscription.coin, "sending subscription");
-                let request = SubscribeRequest {
-                    method: "subscribe",
-                    subscription: &subscription,
-                };
-                let Ok(text) = serde_json::to_vec(&request) else {
-                    return;
-                };
-                if sender.text(text).await.is_err() {
+                debug!(%subscription, "sending subscription");
+                if sender.text(subscribe_frame(subscription)).await.is_err() {
                     return;
                 }
             }
@@ -169,7 +216,7 @@ async fn control_loop(sender: FrameSender, subscriptions: Vec<Subscription>, con
 
 async fn connect(
     url: &str,
-    subscriptions: Vec<Subscription>,
+    subscriptions: &[Value],
     connection: usize,
     connections: usize,
     ws_tx: Sender<(Timestamp, bytes::Bytes)>,
@@ -181,7 +228,7 @@ async fn connect(
     let mut overflow =
         Overflow::with_reporter(format!("hyperliquid/connection-{connection}"), quality);
 
-    let mut subscription_readiness = SubscriptionReadiness::new(&subscriptions);
+    let mut subscription_readiness = SubscriptionReadiness::new(subscriptions);
     let control = control_loop(sender.clone(), subscriptions, connections);
     tokio::pin!(control);
     let mut liveness = None;
@@ -260,25 +307,29 @@ async fn connect(
     }
 }
 
-pub async fn keep_connection(
-    subscription_types: Vec<String>,
-    symbol_list: Vec<String>,
+/// Hyperliquid's public websocket endpoint.
+pub const MAINNET_WS_URL: &str = "wss://api.hyperliquid.xyz/ws";
+
+/// Keep one connection to `url` alive forever, reconnecting with backoff.
+///
+/// `subscriptions` are raw subscription objects (`{"type": "trades", "coin":
+/// "BTC"}`, `{"type": "userFills", "user": "0x…"}`, …), sent paced for
+/// `connections` sockets sharing one IP budget. Every text frame is delivered
+/// to `ws_tx` with its receive time; control frames, pings and the idle
+/// timeout are handled here. A [`readiness::SourceLease`](crate::readiness::SourceLease)
+/// named `hyperliquid/connection-{connection}` is held while every
+/// subscription is acknowledged and market data is flowing.
+///
+/// Returns only when `ws_tx`'s receiver is dropped.
+pub async fn run_connection(
+    url: &str,
+    subscriptions: Vec<Value>,
     connection: usize,
     connections: usize,
     ws_tx: Sender<(Timestamp, bytes::Bytes)>,
     quality: QualityReporter,
     readiness: Readiness,
 ) {
-    let subscriptions: Vec<Subscription> = symbol_list
-        .iter()
-        .flat_map(|symbol| {
-            subscription_types.iter().map(move |sub_type| Subscription {
-                kind: sub_type.clone(),
-                coin: symbol.clone(),
-            })
-        })
-        .collect();
-
     info!(
         subscriptions = subscriptions.len(),
         connection,
@@ -290,8 +341,8 @@ pub async fn keep_connection(
     loop {
         let connect_time = Instant::now();
         if let Err(error) = connect(
-            "wss://api.hyperliquid.xyz/ws",
-            subscriptions.clone(),
+            url,
+            &subscriptions,
             connection,
             connections,
             ws_tx.clone(),
@@ -324,15 +375,50 @@ pub async fn keep_connection(
     }
 }
 
+/// [`run_connection`] on mainnet for the collector's `{type, coin}` product
+/// of `subscription_types` × `symbol_list`.
+pub async fn keep_connection(
+    subscription_types: Vec<String>,
+    symbol_list: Vec<String>,
+    connection: usize,
+    connections: usize,
+    ws_tx: Sender<(Timestamp, bytes::Bytes)>,
+    quality: QualityReporter,
+    readiness: Readiness,
+) {
+    let subscriptions = symbol_list
+        .iter()
+        .flat_map(|symbol| {
+            subscription_types.iter().map(move |sub_type| {
+                Value::from(Subscription {
+                    kind: sub_type.clone(),
+                    coin: symbol.clone(),
+                })
+            })
+        })
+        .collect();
+
+    run_connection(
+        MAINNET_WS_URL,
+        subscriptions,
+        connection,
+        connections,
+        ws_tx,
+        quality,
+        readiness,
+    )
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn subscription(kind: &str, coin: &str) -> Subscription {
-        Subscription {
+    fn subscription(kind: &str, coin: &str) -> Value {
+        Value::from(Subscription {
             kind: kind.to_string(),
             coin: coin.to_string(),
-        }
+        })
     }
 
     #[test]
@@ -351,6 +437,33 @@ mod tests {
             br#"{"channel":"subscriptionResponse","data":{"method":"subscribe","subscription":{"type":"l2Book","coin":"BTC"}}}"#
         ));
         assert!(state.ready());
+    }
+
+    /// Acknowledgement shapes as served on mainnet (checked live 2026-10-03).
+    #[test]
+    fn an_ack_with_defaulted_fields_counts() {
+        let subscriptions = [
+            subscription("l2Book", "BTC"),
+            serde_json::json!({"type": "l2Book", "coin": "BTC", "nSigFigs": 5}),
+        ];
+        let mut state = SubscriptionReadiness::new(&subscriptions);
+        state.observe(
+            br#"{"channel":"subscriptionResponse","data":{"method":"subscribe","subscription":{"type":"l2Book","coin":"BTC","nSigFigs":null,"mantissa":null,"fast":false}}}"#,
+        );
+        state.market_sent(true);
+        assert!(!state.ready());
+
+        state.observe(
+            br#"{"channel":"subscriptionResponse","data":{"method":"subscribe","subscription":{"type":"l2Book","coin":"BTC","nSigFigs":5,"mantissa":null,"fast":false}}}"#,
+        );
+        assert!(state.ready());
+    }
+
+    #[test]
+    fn user_events_deliver_on_the_user_channel() {
+        let subscriptions = [serde_json::json!({"type": "userEvents", "user": "0xabc"})];
+        let mut state = SubscriptionReadiness::new(&subscriptions);
+        assert!(state.observe(br#"{"channel":"user","data":{"fills":[]}}"#));
     }
 
     #[test]

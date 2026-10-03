@@ -1,4 +1,4 @@
-pub use http::keep_connection;
+pub use http::{MAINNET_WS_URL, Subscription, keep_connection, run_connection};
 mod http;
 
 use std::{

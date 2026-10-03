@@ -308,6 +308,24 @@ mod tests {
         );
     }
 
+    /// COIN-M depth since the CM-UM integration: `T` and `ps` sit among the
+    /// ids, and `st` trails the book arrays.
+    #[test]
+    fn binance_route_reads_coin_m_depth_header() {
+        let raw = br#"{"stream":"btcusd_perp@depth@0ms","data":{"e":"depthUpdate","E":1791026681837,"T":1791026681811,"s":"BTCUSD_PERP","ps":"BTCUSD","U":11726048432971,"u":11726048432978,"pu":11726048432171,"b":[["76119.9","1521"]],"a":[],"st":2}}"#;
+
+        assert_eq!(
+            parse_binance_route(raw),
+            Some(BinanceRoute {
+                symbol: "btcusd_perp",
+                event: Some("depthUpdate"),
+                u: Some(11726048432978),
+                first_update_id: Some(11726048432971),
+                pu: Some(11726048432171),
+            })
+        );
+    }
+
     #[test]
     fn binance_route_scan_stops_before_book_arrays() {
         let mut raw = br#"{"stream":"btcusdt@depth","data":{"e":"depthUpdate","E":1,"s":"BTCUSDT","U":2,"u":3,"pu":1,"b":["#

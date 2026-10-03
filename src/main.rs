@@ -8,40 +8,28 @@ use tokio::{
 };
 use tracing::{error, info};
 
-use crate::file::Writer;
-use crate::quality::QualityEvent;
-
-mod binance;
-mod binance_market;
-mod binancefuturescm;
-mod binancefuturesum;
-mod bybit;
-mod dedup;
-mod error;
-mod feed;
-mod file;
-mod handover;
-mod hyperliquid;
-mod quality;
-mod readiness;
-mod routing;
-mod symbol;
-mod throttler;
-mod ws;
+use collector::file::{self, Writer};
+use collector::quality::{self, QualityEvent};
+use collector::{
+    binance, binancefuturescm, binancefuturesum, bybit, handover, hyperliquid, readiness,
+};
 
 const WRITER_QUEUE_CAPACITY: usize = 65_536;
-/// Per connection: the queue is shared by all of them, so redundancy does not
-/// shrink the burst each one can absorb.
-const WS_QUEUE_CAPACITY: usize = 16_384;
-/// Redundant connections are opened this far apart.
-///
-/// Simultaneous handshakes are what a venue's connection rate limit notices,
-/// and connections opened together are the ones most likely to be recycled
-/// together — which is exactly the correlation redundancy is meant to avoid.
-const CONNECT_STAGGER: Duration = Duration::from_secs(5);
 /// How long the collection task is given to hand its already-received messages
 /// to the writer before it is aborted outright.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+/// Hoisted out of the exchange match because readiness, created first, needs to
+/// know how many endpoint workers these streams split into.
+const USDM_STREAMS: &[&str] = &[
+    "$symbol@trade",
+    // One row per taker order per price level (`f`..`l` trade ids): the
+    // taker-side grouping `@trade` does not carry.
+    "$symbol@aggTrade",
+    "$symbol@bookTicker",
+    "$symbol@depth@0ms",
+    "$symbol@forceOrder",
+    // "$symbol@markPrice@1s"
+];
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -79,14 +67,35 @@ struct Args {
 async fn main() -> Result<(), anyhow::Error> {
     let args = Args::parse();
 
-    tracing_subscriber::fmt::init();
+    // Logs go to the tmux pane. Once tmux is gone every write fails (EIO), and
+    // by default tracing-subscriber reports that with `eprintln!` — which
+    // panics on the same dead terminal, and `panic = "abort"` then kills the
+    // process mid-shutdown with nothing flushed. Drop failed log lines instead.
+    // Otherwise as `fmt::init()`: `RUST_LOG` targets, `INFO` by default.
+    {
+        use tracing_subscriber::{
+            filter::{LevelFilter, Targets},
+            layer::SubscriberExt,
+            util::SubscriberInitExt,
+        };
+        let targets = std::env::var("RUST_LOG")
+            .ok()
+            .and_then(|spec| spec.parse::<Targets>().ok())
+            .unwrap_or_else(|| Targets::new().with_default(LevelFilter::INFO));
+        tracing_subscriber::fmt()
+            .log_internal_errors(false)
+            .with_max_level(LevelFilter::TRACE)
+            .finish()
+            .with(targets)
+            .init();
+    }
 
     let connections = usize::from(args.connections);
     let required_sources = if matches!(
         args.exchange.as_str(),
         "binancefutures" | "binancefuturesum"
     ) {
-        connections.saturating_mul(2)
+        connections.saturating_mul(binancefuturesum::endpoint_groups(USDM_STREAMS))
     } else {
         connections
     };
@@ -131,16 +140,10 @@ async fn main() -> Result<(), anyhow::Error> {
 
     let mut handle = match args.exchange.as_str() {
         "binancefutures" | "binancefuturesum" => {
-            let streams = [
-                "$symbol@trade",
-                "$symbol@bookTicker",
-                "$symbol@depth@0ms",
-                "$symbol@forceOrder",
-                // "$symbol@@markPrice@1s"
-            ]
-            .iter()
-            .map(|stream| stream.to_string())
-            .collect();
+            let streams = USDM_STREAMS
+                .iter()
+                .map(|stream| stream.to_string())
+                .collect();
 
             tokio::spawn(binancefuturesum::run_collection(
                 streams,
@@ -155,12 +158,15 @@ async fn main() -> Result<(), anyhow::Error> {
         "binancefuturescm" => {
             let streams = [
                 "$symbol@trade",
+                "$symbol@aggTrade",
                 "$symbol@bookTicker",
-                // COIN-M only offers 100ms/250ms/500ms depth; @0ms is USD-M only
-                // and gets the whole connection rejected.
-                "$symbol@depth@100ms",
+                // COIN-M documents only 100ms/250ms/500ms depth. Since the
+                // 2026-06-30 CM-UM integration `@0ms` is accepted and keeps an
+                // unbroken `pu` chain (checked live 2026-10-03); before it,
+                // `@0ms` got the whole connection rejected.
+                "$symbol@depth@0ms",
                 "$symbol@forceOrder",
-                // "$symbol@@markPrice@1s"
+                // "$symbol@markPrice@1s"
             ]
             .iter()
             .map(|stream| stream.to_string())
@@ -177,10 +183,18 @@ async fn main() -> Result<(), anyhow::Error> {
             ))
         }
         "binance" | "binancespot" => {
-            let streams = ["$symbol@trade", "$symbol@bookTicker", "$symbol@depth@100ms"]
-                .iter()
-                .map(|stream| stream.to_string())
-                .collect();
+            let streams = [
+                "$symbol@trade",
+                "$symbol@aggTrade",
+                "$symbol@bookTicker",
+                "$symbol@depth@100ms",
+                // Block trades carry their own id sequence, separate from
+                // `@trade`'s.
+                "$symbol@blockTrade",
+            ]
+            .iter()
+            .map(|stream| stream.to_string())
+            .collect();
 
             tokio::spawn(binance::run_collection(
                 streams,
@@ -446,12 +460,17 @@ async fn shutdown_signal() -> std::io::Result<&'static str> {
     #[cfg(unix)]
     {
         let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())?;
+        // `tmux kill-session` (run_collector.sh cold restart) delivers SIGHUP;
+        // without a handler it kills the process before buffered records are
+        // written, leaving every open daily file without its zstd footer.
+        let mut sighup = signal::unix::signal(signal::unix::SignalKind::hangup())?;
         select! {
             result = signal::ctrl_c() => {
                 result?;
                 Ok("SIGINT")
             }
             _ = sigterm.recv() => Ok("SIGTERM"),
+            _ = sighup.recv() => Ok("SIGHUP"),
         }
     }
 

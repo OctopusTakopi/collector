@@ -36,6 +36,9 @@ What we added on top of the original process:
 * `flock` on the daily file. During overlap the new process writes a sidecar
   (`<symbol>_<date>_<run-id>.zst`) and appends that frame into the daily file
   once it holds the lock. If it dies before the switch, the sidecar stays.
+* A daily file left mid-frame by a crash is never appended to, since a decoder
+  cannot step past a truncated frame: the next writer moves it aside to
+  `<symbol>_<date>_unterminated-<ns>.zst` and starts the day in a fresh file.
 * A `_quality_<run-id>.jsonl` next to the data when frames are dropped or the
   writer cannot fsync.
 * `gap_detector`, which scans a directory tree for recv-time holes and venue
@@ -57,13 +60,15 @@ Exchanges:
 |---|---|
 | `binance` / `binancespot` | spot, depth at 100ms |
 | `binancefutures` / `binancefuturesum` | USD-M, depth at 0ms |
-| `binancefuturescm` | COIN-M, depth at 100ms (`@0ms` is rejected) |
+| `binancefuturescm` | COIN-M, depth at 0ms (undocumented, accepted since the 2026-06-30 CM-UM integration) |
 | `bybit` | linear public topics |
 | `hyperliquid` | symbols are uppercase (`BTC`, not `btcusdt`) |
 
-Same streams as upstream for the most part. Futures also subscribe to
-`forceOrder`; Bybit also takes liquidations and `orderbook.200` instead of
-`.500`.
+Same streams as upstream for the most part. All Binance markets also
+subscribe to `aggTrade`, which groups fills by taker order; spot adds
+`blockTrade` and futures add `forceOrder`. USD-M serves `aggTrade` and
+`forceOrder` on `/market`, book and trade streams on `/public`. Bybit also
+takes liquidations and `orderbook.200` instead of `.500`.
 
 ## Checking files
 

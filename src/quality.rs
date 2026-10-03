@@ -73,7 +73,7 @@ impl QualityReporter {
         }
     }
 
-    #[cfg(test)]
+    /// A reporter that drops every event (no quality log).
     pub fn disabled() -> Self {
         Self { tx: None }
     }
