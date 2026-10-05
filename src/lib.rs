@@ -2,7 +2,9 @@
 //! depends on it.
 
 mod binance;
+mod books;
 mod bybit;
+mod coinbase;
 pub mod collection;
 mod dedup;
 mod error;
@@ -10,6 +12,8 @@ mod feed;
 pub mod file;
 pub mod handover;
 mod hyperliquid;
+mod kraken_futures;
+mod kraken_spot;
 pub mod quality;
 pub mod readiness;
 pub mod routing;

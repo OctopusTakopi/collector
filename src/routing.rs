@@ -198,6 +198,102 @@ fn cut_event_time(payload: &[u8]) -> Option<(&[u8], &[u8])> {
     Some((&payload[..pos], &payload[end..]))
 }
 
+/// A Coinbase Exchange feed message's type and product, and the product's
+/// `sequence` where the message carries one (`match`, `ticker`, `heartbeat`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub struct CoinbaseRoute<'a> {
+    #[serde(rename = "type", borrow)]
+    pub kind: &'a str,
+    #[serde(borrow)]
+    pub product_id: Option<&'a str>,
+    pub sequence: Option<i64>,
+}
+
+/// A Coinbase feed message's `type`, which the venue puts first.
+pub(crate) fn coinbase_kind(payload: &[u8]) -> Option<&str> {
+    json_unescaped_string(&payload[..payload.len().min(64)], b"\"type\":\"")
+}
+
+/// Routes a Coinbase feed message. Scans the head of the message, where the
+/// venue puts these fields, so a multi-megabyte book snapshot is never walked;
+/// falls back to serde when the layout is unusual.
+pub fn coinbase_route(payload: &[u8]) -> Result<CoinbaseRoute<'_>, serde_json::Error> {
+    const HEAD: usize = 512;
+    let head = &payload[..HEAD.min(payload.len())];
+    if let Some(kind) = json_unescaped_string(head, b"\"type\":\"")
+        && let Some(product_id) = json_unescaped_string(head, b"\"product_id\":\"")
+    {
+        return Ok(CoinbaseRoute {
+            kind,
+            product_id: Some(product_id),
+            sequence: json_i64(head, b"\"sequence\":"),
+        });
+    }
+    serde_json::from_slice(payload)
+}
+
+/// Dedup key for a Coinbase message keyed by its product's `sequence`:
+/// trades and tickers, whose copies from two connections can differ elsewhere
+/// (a ticker's `volume_24h` and `volume_30d`, checked live 2026-10-05). `None`
+/// for any other message, which is keyed by its payload.
+pub fn coinbase_sequence_key(route: &CoinbaseRoute<'_>) -> Option<u128> {
+    let class = match route.kind {
+        // A `last_match` repeats a trade some connection may already have
+        // sent as a `match`.
+        "match" | "last_match" => b'm',
+        "ticker" => b't',
+        _ => return None,
+    };
+    let (product, sequence) = (route.product_id?, route.sequence?);
+    let mut hasher = xxhash_rust::xxh3::Xxh3Default::new();
+    hasher.update(&[class]);
+    hasher.update(product.as_bytes());
+    hasher.update(&sequence.to_le_bytes());
+    Some(hasher.digest128())
+}
+
+/// The `channel` of a Kraken spot (websocket v2) message, which the venue puts
+/// first; answers to requests (`{"method":...}`) have none.
+pub(crate) fn kraken_channel(payload: &[u8]) -> Option<&str> {
+    json_unescaped_string(&payload[..payload.len().min(32)], b"\"channel\":\"")
+}
+
+/// Whether a Kraken spot message is a snapshot: its `type`, right after the
+/// channel.
+pub(crate) fn kraken_snapshot(payload: &[u8]) -> bool {
+    json_unescaped_string(&payload[..payload.len().min(48)], b"\"type\":\"") == Some("snapshot")
+}
+
+/// The pair a Kraken spot message is about: its first `symbol`, at the head
+/// of `data` in every channel, so a book snapshot is never walked.
+pub fn kraken_symbol(payload: &[u8]) -> Option<&str> {
+    json_unescaped_string(&payload[..payload.len().min(128)], b"\"symbol\":\"")
+}
+
+/// The `product_id` of a Kraken Futures message, within its first fields in
+/// every feed.
+pub fn kraken_futures_product(payload: &[u8]) -> Option<&str> {
+    json_unescaped_string(&payload[..payload.len().min(128)], b"\"product_id\":\"")
+}
+
+/// A Kraken Futures book message's product and `seq`, and whether it is the
+/// snapshot that restarts the chain; `None` for any other feed.
+pub(crate) fn kraken_futures_book(payload: &[u8]) -> Option<(&str, i64, bool)> {
+    let snapshot = if payload.starts_with(br#"{"feed":"book_snapshot""#) {
+        true
+    } else if payload.starts_with(br#"{"feed":"book""#) {
+        false
+    } else {
+        return None;
+    };
+    let head = &payload[..payload.len().min(160)];
+    Some((
+        kraken_futures_product(head)?,
+        json_i64(head, b"\"seq\":")?,
+        snapshot,
+    ))
+}
+
 /// The `channel` of a Hyperliquid frame, found by scanning rather than
 /// parsing; the venue puts it first.
 pub(crate) fn hyperliquid_channel(payload: &[u8]) -> Option<&str> {
@@ -454,6 +550,111 @@ mod tests {
     #[test]
     fn binance_control_message_without_stream_is_ignored() {
         assert_eq!(binance_route(br#"{"result":null,"id":1}"#).unwrap(), None);
+    }
+
+    /// Message layouts as served on 2026-10-05.
+    #[test]
+    fn coinbase_messages_route_on_type_product_and_sequence() {
+        fn route(raw: &[u8]) -> CoinbaseRoute<'_> {
+            coinbase_route(raw).unwrap()
+        }
+        let ticker = br#"{"type":"ticker","sequence":137270364111,"product_id":"BTC-USD","price":"86125.09","volume_24h":"4021.87"}"#;
+        assert_eq!(
+            route(ticker),
+            CoinbaseRoute {
+                kind: "ticker",
+                product_id: Some("BTC-USD"),
+                sequence: Some(137270364111),
+            }
+        );
+        let matched = br#"{"type":"match","trade_id":1102560090,"maker_order_id":"ddc1e417-15aa-489e-92ad-eb286169748a","taker_order_id":"995766dc-a994-4337-ae9c-795900b48d7f","side":"sell","size":"0.00002031","price":"86125.1","product_id":"BTC-USD","sequence":137270364525,"time":"2026-10-05T12:17:56.266162Z"}"#;
+        assert_eq!(route(matched).sequence, Some(137270364525));
+        let update = br#"{"type":"l2update","product_id":"ETH-USD","changes":[["buy","2716.3","0.5"]],"time":"2026-10-05T12:17:56.020423Z"}"#;
+        assert_eq!(
+            route(update),
+            CoinbaseRoute {
+                kind: "l2update",
+                product_id: Some("ETH-USD"),
+                sequence: None,
+            }
+        );
+    }
+
+    /// A snapshot's book arrays are not walked, however long.
+    #[test]
+    fn a_coinbase_snapshot_routes_from_its_head() {
+        let mut raw = br#"{"type":"snapshot","product_id":"BTC-USD","asks":["#.to_vec();
+        for _ in 0..40_000 {
+            raw.extend_from_slice(br#"["86125.10","0.13458813"],"#);
+        }
+        raw.extend_from_slice(br#"["1","1"]],"bids":[]}"#);
+        let route = coinbase_route(&raw).unwrap();
+        assert_eq!(
+            (route.kind, route.product_id),
+            ("snapshot", Some("BTC-USD"))
+        );
+    }
+
+    #[test]
+    fn a_coinbase_message_with_an_unusual_layout_falls_back_to_serde() {
+        let raw = format!(
+            r#"{{"pad":"{}","product_id":"BTC-USD","sequence":5,"type":"heartbeat"}}"#,
+            "x".repeat(600)
+        );
+        assert_eq!(
+            coinbase_route(raw.as_bytes()).unwrap(),
+            CoinbaseRoute {
+                kind: "heartbeat",
+                product_id: Some("BTC-USD"),
+                sequence: Some(5),
+            }
+        );
+        // Control messages name no product.
+        assert_eq!(
+            coinbase_route(br#"{"type":"subscriptions","channels":[]}"#)
+                .unwrap()
+                .product_id,
+            None
+        );
+    }
+
+    /// Layouts as served on 2026-10-05.
+    #[test]
+    fn kraken_spot_messages_route_on_channel_and_symbol() {
+        let book = br#"{"channel":"book","type":"update","data":[{"symbol":"BTC/USD","bids":[{"price":86100.0,"qty":0.5}],"asks":[],"checksum":3129212817,"timestamp":"2026-10-05T12:17:56.551146Z"}]}"#;
+        assert_eq!(kraken_channel(book), Some("book"));
+        assert_eq!(kraken_symbol(book), Some("BTC/USD"));
+        let ticker = br#"{"channel":"ticker","type":"snapshot","data":[{"symbol":"ETH/USD","bid":2716.03,"bid_qty":0.38996494,"ask":2716.04}]}"#;
+        assert_eq!(kraken_symbol(ticker), Some("ETH/USD"));
+        assert!(kraken_snapshot(ticker));
+        assert!(!kraken_snapshot(book));
+        for control in [
+            br#"{"channel":"heartbeat"}"#.as_slice(),
+            br#"{"method":"pong","time_in":"2026-10-05T12:18:06.683913Z","time_out":"2026-10-05T12:18:06.683928Z"}"#,
+            br#"{"error":"Currency pair not supported XDG/USD","method":"subscribe","req_id":7,"success":false,"symbol":"XDG/USD"}"#,
+        ] {
+            assert_ne!(kraken_channel(control), Some("book"));
+        }
+        assert_eq!(kraken_channel(br#"{"method":"pong"}"#), None);
+    }
+
+    #[test]
+    fn kraken_futures_messages_route_on_product_and_book_seq() {
+        let delta = br#"{"feed":"book","product_id":"PF_XBTUSD","side":"sell","seq":210276307,"price":86452.0,"qty":0.0028,"timestamp":1791203430554}"#;
+        assert_eq!(
+            kraken_futures_book(delta),
+            Some(("PF_XBTUSD", 210276307, false))
+        );
+        let snapshot = br#"{"feed":"book_snapshot","product_id":"PF_ETHUSD","timestamp":1791202675592,"seq":83132213,"tickSize":null,"bids":[{"price":2716.4,"qty":1.215}],"asks":[]}"#;
+        assert_eq!(
+            kraken_futures_book(snapshot),
+            Some(("PF_ETHUSD", 83132213, true))
+        );
+        let trade = br#"{"product_id":"PF_XBTUSD","feed":"trade","uid":"f3a03bd2","side":"buy","type":"fill","time":1791202676588,"qty":0.0202,"price":86120.0,"seq":995981}"#;
+        assert_eq!(kraken_futures_book(trade), None);
+        assert_eq!(kraken_futures_product(trade), Some("PF_XBTUSD"));
+        let ticker = br#"{"time":1791203430427,"product_id":"PF_XBTUSD","funding_rate":0.462044140725,"feed":"ticker","bid":85993.0}"#;
+        assert_eq!(kraken_futures_product(ticker), Some("PF_XBTUSD"));
     }
 
     #[test]

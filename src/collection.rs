@@ -18,15 +18,15 @@ use tokio::{
 use tracing::error;
 
 use crate::{
-    binance, bybit,
+    binance, bybit, coinbase,
     dedup::Dedup,
     error::ConnectorError,
     feed::{BackgroundResult, Feed},
     file::WriteRecord,
-    hyperliquid,
+    hyperliquid, kraken_futures, kraken_spot,
     quality::QualityReporter,
     readiness::Readiness,
-    session::Slot,
+    session::{Frame, Slot},
     symbol::{Symbol, SymbolCache},
     ws,
 };
@@ -51,6 +51,14 @@ pub enum Exchange {
     BinanceFuturesCm,
     Bybit,
     Hyperliquid,
+    /// Coinbase Exchange spot.
+    Coinbase,
+    /// Kraken spot, websocket v2; pairs as Kraken names them (`BTC/USD`).
+    #[value(name = "krakenspot")]
+    KrakenSpot,
+    /// Kraken Futures perpetuals (`PF_XBTUSD`).
+    #[value(name = "krakenfutures")]
+    KrakenFutures,
 }
 
 impl Exchange {
@@ -97,6 +105,10 @@ impl Exchange {
                 "allLiquidation.$symbol",
             ],
             Self::Hyperliquid => &["trades", "l2Book", "bbo"],
+            // `level2`, the unbatched book, needs an API key.
+            Self::Coinbase => &[coinbase::BOOK, "matches", "ticker", "heartbeat"],
+            Self::KrakenSpot => &["book", "trade", "ticker"],
+            Self::KrakenFutures => &[kraken_futures::BOOK, "trade", "ticker"],
         }
     }
 
@@ -130,6 +142,9 @@ impl Exchange {
                 .collect(),
             Self::Bybit => vec![Worker::Bybit(self.streams())],
             Self::Hyperliquid => vec![Worker::Hyperliquid(self.streams())],
+            Self::Coinbase => vec![Worker::Coinbase(self.streams())],
+            Self::KrakenSpot => vec![Worker::KrakenSpot(self.streams())],
+            Self::KrakenFutures => vec![Worker::KrakenFutures(self.streams())],
         }
     }
 }
@@ -139,6 +154,9 @@ enum Worker {
     Binance(&'static binance::Endpoint, Vec<&'static str>),
     Bybit(&'static [&'static str]),
     Hyperliquid(&'static [&'static str]),
+    Coinbase(&'static [&'static str]),
+    KrakenSpot(&'static [&'static str]),
+    KrakenFutures(&'static [&'static str]),
 }
 
 impl Worker {
@@ -154,6 +172,9 @@ impl Worker {
             }
             Self::Bybit(topics) => bybit::collect(topics, symbols, cx, tls).await,
             Self::Hyperliquid(kinds) => hyperliquid::collect(kinds, symbols, cx, tls).await,
+            Self::Coinbase(channels) => coinbase::collect(channels, symbols, cx, tls).await,
+            Self::KrakenSpot(channels) => kraken_spot::collect(channels, symbols, cx, tls).await,
+            Self::KrakenFutures(feeds) => kraken_futures::collect(feeds, symbols, cx, tls).await,
         }
     }
 }
@@ -177,11 +198,7 @@ pub(crate) trait Venue {
     fn keep_connection(&self, slot: Slot) -> impl Future<Output = ()> + Send + 'static;
 
     /// Records one frame from any connection; the queue's only consumer.
-    fn handle(
-        &mut self,
-        recv_time: Timestamp,
-        data: Bytes,
-    ) -> impl Future<Output = Result<(), ConnectorError>> + Send;
+    fn handle(&mut self, frame: Frame) -> impl Future<Output = Result<(), ConnectorError>> + Send;
 }
 
 /// Consumer state every venue shares: duplicate suppression across redundant
@@ -254,8 +271,8 @@ pub(crate) async fn run<V: Venue>(
     drop(tx);
 
     let mut feed = Feed::new(rx, cx.shutdown);
-    while let Some((recv_time, data)) = feed.recv(&mut tasks).await? {
-        match venue.handle(recv_time, data).await {
+    while let Some(frame) = feed.recv(&mut tasks).await? {
+        match venue.handle(frame).await {
             Ok(()) => {}
             Err(ConnectorError::WriterClosed) => return Err(ConnectorError::WriterClosed.into()),
             Err(error) => error!(endpoint = venue.label(), %error, "could not record a frame"),
@@ -286,6 +303,9 @@ mod tests {
             Exchange::BinanceFuturesCm,
             Exchange::Bybit,
             Exchange::Hyperliquid,
+            Exchange::Coinbase,
+            Exchange::KrakenSpot,
+            Exchange::KrakenFutures,
         ] {
             assert_eq!(exchange.required_sources(connections(3)), 3, "{exchange:?}");
         }
@@ -302,6 +322,9 @@ mod tests {
             ("binancefuturescm", Exchange::BinanceFuturesCm),
             ("bybit", Exchange::Bybit),
             ("hyperliquid", Exchange::Hyperliquid),
+            ("coinbase", Exchange::Coinbase),
+            ("krakenspot", Exchange::KrakenSpot),
+            ("krakenfutures", Exchange::KrakenFutures),
         ] {
             assert_eq!(Exchange::from_str(name, false), Ok(exchange), "{name}");
         }

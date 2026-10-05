@@ -36,8 +36,26 @@ pub(crate) const QUEUE_FULL_GRACE: Duration = Duration::from_secs(1);
 
 const OVERFLOW_REPORT_INTERVAL: Duration = Duration::from_secs(5);
 
-/// A frame on the collection queue, stamped when it was read.
-pub(crate) type Frame = (Timestamp, Bytes);
+/// A market frame on the collection queue: the connection slot that read it,
+/// when, and its bytes.
+#[derive(Debug)]
+pub(crate) struct Frame {
+    pub(crate) connection: usize,
+    pub(crate) recv_time: Timestamp,
+    pub(crate) data: Bytes,
+}
+
+#[cfg(test)]
+impl Frame {
+    /// `data` as read now on `connection`.
+    pub(crate) fn on(connection: usize, data: impl Into<Bytes>) -> Self {
+        Self {
+            connection,
+            recv_time: Timestamp::now(),
+            data: data.into(),
+        }
+    }
+}
 
 /// What the collection hands each connection slot.
 pub(crate) struct Slot {
@@ -205,7 +223,11 @@ impl Producer {
     /// Waiting on every frame would throttle reads to one per grace period and
     /// leave the venue's ping stuck behind market data in the kernel buffer.
     pub(crate) async fn send(&mut self, payload: Bytes) -> Delivery {
-        let frame = (Timestamp::now(), payload);
+        let frame = Frame {
+            connection: self.overflow.source.connection,
+            recv_time: Timestamp::now(),
+            data: payload,
+        };
         match self.tx.try_reserve() {
             Ok(permit) => {
                 permit.send(frame);
@@ -402,7 +424,9 @@ pub(crate) async fn keep_subscribed<P, C>(
             End::Stopped(()) => Lost::WriterStopped,
             End::Lost(lost) => lost,
         };
-        // Withdraw the lease and release the socket before waiting.
+        // End the session before waiting: its protocol (a venue may report the
+        // end from its drop), its lease, and the socket.
+        drop(protocol);
         drop(producer);
         drop(conn);
         let lifetime = opened.elapsed();
@@ -637,8 +661,9 @@ pub(crate) mod tests {
         harness.send("market").await;
         harness.send("#other").await;
 
-        let (_, payload) = harness.rx.recv().await.unwrap();
-        assert_eq!(&payload[..], b"market");
+        let frame = harness.rx.recv().await.unwrap();
+        assert_eq!(&frame.data[..], b"market");
+        assert_eq!(frame.connection, TEST_SOURCE.connection);
         assert!(harness.ready_after_ping().await);
         assert!(harness.rx.try_recv().is_err(), "control frames stay out");
 

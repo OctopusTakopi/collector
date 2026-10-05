@@ -548,7 +548,7 @@ mod tests {
         ));
         harness.send_market_data().await;
 
-        let (_, first) = harness.data.recv().await.unwrap();
+        let first = harness.data.recv().await.unwrap().data;
         assert!(
             !routing::contains(&first, b"serverShutdown"),
             "the announcement must not reach the writer"

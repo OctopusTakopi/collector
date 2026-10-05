@@ -18,7 +18,7 @@ use crate::{
     error::ConnectorError,
     quality::{QualityEvent, QualityReporter},
     routing::{BybitBookUpdate, BybitMessage},
-    session::Slot,
+    session::{Frame, Slot},
     snapshot::{Depth, Snapshots},
     symbol::Symbol,
     throttler::Throttler,
@@ -102,7 +102,10 @@ impl Venue for Bybit {
         connection::keep_connection(Arc::clone(&self.groups), slot)
     }
 
-    async fn handle(&mut self, recv_time: Timestamp, data: Bytes) -> Result<(), ConnectorError> {
+    async fn handle(&mut self, frame: Frame) -> Result<(), ConnectorError> {
+        let Frame {
+            recv_time, data, ..
+        } = frame;
         // Before parsing: with N connections, N-1 of every N frames are copies.
         if self.recorder.dedup.is_duplicate(&data) {
             return Ok(());
@@ -275,7 +278,7 @@ mod tests {
 
     impl Bybit {
         async fn feed(&mut self, data: Bytes) -> Result<(), ConnectorError> {
-            self.handle(Timestamp::now(), data).await
+            self.handle(Frame::on(0, data)).await
         }
 
         async fn feed_full_book(&mut self, ids: impl IntoIterator<Item = u64>) {

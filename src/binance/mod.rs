@@ -18,7 +18,7 @@ use crate::{
     error::ConnectorError,
     quality::{QualityEvent, QualityReporter},
     routing::{self, BinanceEvent},
-    session::Slot,
+    session::{Frame, Slot},
     snapshot::{Depth, Snapshots},
     symbol::Symbol,
     throttler::{self, Throttler},
@@ -201,7 +201,10 @@ impl Venue for Binance {
         session::keep_connection(self.endpoint, self.url.clone(), slot)
     }
 
-    async fn handle(&mut self, recv_time: Timestamp, data: Bytes) -> Result<(), ConnectorError> {
+    async fn handle(&mut self, frame: Frame) -> Result<(), ConnectorError> {
+        let Frame {
+            recv_time, data, ..
+        } = frame;
         // Before reading ids: a second copy of a depth update carries the `pu`
         // of the update before it, which no longer matches once the first copy
         // advanced the mark, so every duplicate would read as a gap.
@@ -380,7 +383,7 @@ mod tests {
 
     impl Binance {
         async fn feed(&mut self, raw: &'static [u8]) -> Result<(), ConnectorError> {
-            self.handle(Timestamp::now(), Bytes::from_static(raw)).await
+            self.handle(Frame::on(0, Bytes::from_static(raw))).await
         }
     }
 

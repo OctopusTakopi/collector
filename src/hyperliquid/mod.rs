@@ -4,8 +4,6 @@ mod connection;
 
 use std::{future::Future, sync::Arc, time::Duration};
 
-use bytes::Bytes;
-use jiff::Timestamp;
 use rustls::ClientConfig;
 use tokio::task::JoinSet;
 
@@ -13,7 +11,7 @@ use crate::{
     collection::{self, Context, Recorder, Venue},
     error::ConnectorError,
     routing::HyperliquidMessage,
-    session::Slot,
+    session::{Frame, Slot},
 };
 
 /// Websocket subscriptions Hyperliquid allows per IP, across all connections.
@@ -59,7 +57,10 @@ impl Venue for Hyperliquid {
         connection::keep_connection(Arc::clone(&self.subscriptions), self.pace, slot)
     }
 
-    async fn handle(&mut self, recv_time: Timestamp, data: Bytes) -> Result<(), ConnectorError> {
+    async fn handle(&mut self, frame: Frame) -> Result<(), ConnectorError> {
+        let Frame {
+            recv_time, data, ..
+        } = frame;
         if self.recorder.dedup.is_duplicate(&data) {
             return Ok(());
         }
@@ -76,6 +77,7 @@ impl Venue for Hyperliquid {
 mod tests {
     use std::num::NonZeroUsize;
 
+    use bytes::Bytes;
     use tokio::sync::mpsc::{Receiver, channel};
 
     use super::*;
@@ -101,7 +103,7 @@ mod tests {
         );
 
         hyperliquid
-            .handle(Timestamp::now(), data.clone())
+            .handle(Frame::on(0, data.clone()))
             .await
             .unwrap();
 
@@ -122,11 +124,11 @@ mod tests {
         );
 
         hyperliquid
-            .handle(Timestamp::now(), trade.clone())
+            .handle(Frame::on(0, trade.clone()))
             .await
             .unwrap();
         hyperliquid
-            .handle(Timestamp::now(), trade.clone())
+            .handle(Frame::on(0, trade.clone()))
             .await
             .unwrap();
 
