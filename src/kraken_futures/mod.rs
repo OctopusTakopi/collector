@@ -91,7 +91,7 @@ impl Venue for KrakenFutures {
             (Some((_, seq, snapshot)), Some(index)) => {
                 self.book(frame.connection, index, seq, snapshot, frame.recv_time)
             }
-            (None, Some(index)) if routing::contains(&frame.data, br#""feed":"ticker""#) => {
+            (None, Some(index)) if routing::kraken_futures_feed(&frame.data) == Some("ticker") => {
                 self.books.leads(frame.connection, index)
                     && !self.recorder.dedup.is_duplicate(&frame.data)
             }

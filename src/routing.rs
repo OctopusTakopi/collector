@@ -276,6 +276,12 @@ pub fn kraken_futures_product(payload: &[u8]) -> Option<&str> {
     json_unescaped_string(&payload[..payload.len().min(128)], b"\"product_id\":\"")
 }
 
+/// The `feed` of a Kraken Futures message. A ticker names it after its
+/// funding fields, 278 to 302 bytes in (2026-10-05).
+pub(crate) fn kraken_futures_feed(payload: &[u8]) -> Option<&str> {
+    json_unescaped_string(&payload[..payload.len().min(512)], b"\"feed\":\"")
+}
+
 /// A Kraken Futures book message's product and `seq`, and whether it is the
 /// snapshot that restarts the chain; `None` for any other feed.
 pub(crate) fn kraken_futures_book(payload: &[u8]) -> Option<(&str, i64, bool)> {
@@ -653,8 +659,11 @@ mod tests {
         let trade = br#"{"product_id":"PF_XBTUSD","feed":"trade","uid":"f3a03bd2","side":"buy","type":"fill","time":1791202676588,"qty":0.0202,"price":86120.0,"seq":995981}"#;
         assert_eq!(kraken_futures_book(trade), None);
         assert_eq!(kraken_futures_product(trade), Some("PF_XBTUSD"));
-        let ticker = br#"{"time":1791203430427,"product_id":"PF_XBTUSD","funding_rate":0.462044140725,"feed":"ticker","bid":85993.0}"#;
+        assert_eq!(kraken_futures_feed(trade), Some("trade"));
+        let ticker = br#"{"time":1791204461715,"product_id":"PF_XBTUSD","funding_rate":0.462044140725,"funding_rate_prediction":0.32861499669002864,"relative_funding_rate":5.3608125e-6,"relative_funding_rate_prediction":3.827166666667e-6,"next_funding_rate_time":1791205200000,"leverage":"100x","premium":-0.0,"feed":"ticker","bid":85884.0,"ask":85888.0,"bid_size":0.028,"ask_size":0.1918,"volume":5495.0364,"dtm":0,"index":85888.1,"last":85888.0,"change":0.87,"suspended":false,"tag":"perpetual","pair":"XBT:USD","openInterest":2135.6829,"markPrice":85891.15455643082,"maturityTime":0,"post_only":false,"volumeQuote":472012710.4708,"open":85146.0,"high":86990.0,"low":85078.0}"#;
         assert_eq!(kraken_futures_product(ticker), Some("PF_XBTUSD"));
+        assert_eq!(kraken_futures_book(ticker), None);
+        assert_eq!(kraken_futures_feed(ticker), Some("ticker"));
     }
 
     #[test]
