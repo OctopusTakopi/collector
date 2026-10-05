@@ -12,7 +12,34 @@ MAPPINGS=(
     "binancefutures:binance/futures/um"
     "bybit:bybit"
     "hyperliquid:hyperliquid"
+    "coinbase:coinbase"
+    "krakenspot:kraken/spot"
+    "krakenfutures:kraken/futures"
 )
+
+# The symbol an exchange is given for $2, a lowercase coin, as that exchange
+# spells it; nothing for a coin the exchange does not list.
+symbol_for() {
+    local exchange="$1" coin="$2"
+    case "$exchange" in
+        hyperliquid) echo "${coin^^}" ;;
+        coinbase)
+            # Coinbase does not list TRX.
+            if [ "$coin" != "trx" ]; then
+                echo "${coin^^}-USD"
+            fi
+            ;;
+        krakenspot) echo "${coin^^}/USD" ;;
+        krakenfutures)
+            # Kraken Futures names bitcoin XBT.
+            if [ "$coin" == "btc" ]; then
+                coin="xbt"
+            fi
+            echo "PF_${coin^^}USD"
+            ;;
+        *) echo "${coin}usdt" ;;
+    esac
+}
 
 SESSION_NAME="json_collector"
 # Session names this script has created in the past.
@@ -43,15 +70,13 @@ for MAP in "${MAPPINGS[@]}"; do
 
     mkdir -p "$TARGET_DIR"
 
-    # Build the symbols list for this exchange
+    # Build the symbols list for this exchange, in its own spelling
     SYMBOLS_LIST=""
     for COIN in "${COINS[@]}"; do
-        if [ "$EXCH" == "hyperliquid" ]; then
-            S=$(echo "$COIN" | tr '[:lower:]' '[:upper:]')
-        else
-            S="${COIN}usdt"
+        S=$(symbol_for "$EXCH" "$COIN")
+        if [ -n "$S" ]; then
+            SYMBOLS_LIST+="$S "
         fi
-        SYMBOLS_LIST+="$S "
     done
 
     # Create one window per exchange and run the command once
