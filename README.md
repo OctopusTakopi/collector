@@ -48,7 +48,8 @@ What we added on top of the original process:
   sequence breaks.
 
 `scripts/run_collector.sh` is a first-start helper. It kills the existing tmux
-session, so it is the wrong tool for a rolling upgrade. The SIGHUP that
+session, so it is the wrong tool for a rolling upgrade; use
+`scripts/rolling_update_collector.sh` (see ROLLING_UPDATE.md). The SIGHUP that
 `tmux kill-session` sends drains and closes the files like SIGTERM, unless
 SIGHUP was already ignored when the collector started (e.g. under `nohup`).
 

@@ -37,3 +37,21 @@ intentionally favors no gaps over no duplicates.
 The first upgrade from a binary without UDS support is necessarily a normal
 stop/start. Existing deployment scripts that stop the old tmux session must be
 updated separately before they can exercise this handover path.
+
+## On the collector host
+
+`scripts/rolling_update_collector.sh <new-binary>` does the above for every
+collector running as `COLLECTOR_EXE` (default `/home/ec2-user/collector`), one
+at a time. It installs the binary over that path (the old one stays as
+`<exe>.prev`), starts each replacement with the incumbent's own arguments and
+working directory in a new window of the incumbent's tmux session (so it shares
+the environment `run_collector.sh` set up there), waits for the handover in the
+quality log, and closes the old pane. It never signals a collector: a
+replacement that cannot take over gives up by itself after 180 s, and if none
+was switched the previous binary is put back. Each replacement's output also
+goes to `~/logs/<exe>.<window>.log`. `--dry-run` shows the plan;
+`rolling_update_collector.sh <exe>.prev` rolls back.
+
+Never run `tmux capture-pane` on the collector host. Its tmux (AlmaLinux 10's
+`next-3.4`) crashes on it, and every collector running in it stops. Read the
+log files, or attach.
