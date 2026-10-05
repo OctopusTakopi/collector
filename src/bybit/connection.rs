@@ -17,8 +17,10 @@ use crate::{
 
 const URL: &str = "wss://stream.bybit.com/v5/public/linear";
 const PING_INTERVAL: Duration = Duration::from_secs(20);
-/// Bybit drops a socket after 20 s without a client ping, and a subscribed
-/// symbol's market data arrives far more often than this.
+/// Bybit answers every ping with a pong, and a subscribed symbol's market data
+/// arrives far more often still, so a minute without any frame is a dead
+/// socket. Bybit itself cuts a connection only after 10 minutes with neither
+/// ping-pong nor data (docs, 2026-10-06).
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Paces subscribe requests so a long symbol list cannot trip the request
 /// rate limit.
