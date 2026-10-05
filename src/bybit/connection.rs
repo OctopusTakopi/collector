@@ -17,11 +17,12 @@ use crate::{
 
 const URL: &str = "wss://stream.bybit.com/v5/public/linear";
 const PING_INTERVAL: Duration = Duration::from_secs(20);
-/// Bybit answers every ping with a pong, and a subscribed symbol's market data
-/// arrives far more often still, so a minute without any frame is a dead
-/// socket. Bybit itself cuts a connection only after 10 minutes with neither
-/// ping-pong nor data (docs, 2026-10-06).
-const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Bybit answers every ping with a pong, so a live socket delivers a frame at
+/// least every [`PING_INTERVAL`] even with no market data; just past that, it
+/// is dead. On 2026-10-05 both connections went silent at once and stayed
+/// open, and the timeout was the whole hole. Bybit itself cuts a connection
+/// only after 10 minutes with neither ping-pong nor data (docs, 2026-10-06).
+const IDLE_TIMEOUT: Duration = Duration::from_secs(25);
 /// Paces subscribe requests so a long symbol list cannot trip the request
 /// rate limit.
 const SUBSCRIBE_PACE: Duration = Duration::from_millis(10);
