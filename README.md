@@ -69,6 +69,9 @@ Exchanges:
 | `binancefuturescm` | COIN-M, depth at 0ms (undocumented, accepted since the 2026-06-30 CM-UM integration) |
 | `bybit` | linear public topics, plus the full-depth book |
 | `hyperliquid` | symbols are uppercase (`BTC`, not `btcusdt`) |
+| `coinbase` | Coinbase Exchange spot, products as Coinbase names them (`BTC-USD`) |
+| `krakenspot` | Kraken spot (websocket v2), pairs as Kraken names them (`BTC/USD`); files are `btc-usd_<date>.zst` |
+| `krakenfutures` | Kraken Futures perpetuals (`PF_XBTUSD`) |
 
 Same streams as upstream for the most part. All Binance markets also
 subscribe to `aggTrade`, which groups fills by taker order; spot adds
@@ -83,6 +86,33 @@ and another whenever `u` skips or resets to 1. A snapshot line is the raw
 so it has no `topic`; rebuild the book from the latest snapshot and apply the
 deltas whose `u` follows its `result.u`. hftbacktest's Bybit converter skips
 those lines and folds the deltas into its fused book.
+
+Coinbase records the public book (`level2_batch`: the whole book on
+subscribe, then 50 ms batches of changed levels; the unbatched `level2` needs
+an API key), `matches`, `ticker` and `heartbeat`. Kraken spot records the book
+at depth 1000, `trade` (without the snapshot of past trades) and `ticker` on
+every change of the best bid or offer. Kraken Futures records `book`, `trade`
+and `ticker`; every new subscriber is sent the last 100 trades, so a trade can
+appear twice, with the same `seq`.
+
+### Coinbase and Kraken books
+
+These venues send every connection its own version of the book: Coinbase
+batches each connection's updates on its own clock, and Kraken conflates the
+updates of a connection that falls behind and renumbers what follows. Two
+connections' books cannot be merged frame by frame, so each product's book is
+recorded from one connection at a time, starting at that connection's
+snapshot. When that connection drops, or its Kraken Futures `seq` breaks,
+another connection subscribes the book again and its fresh snapshot restarts
+the recording: a hole of about a second, noted in the quality log. At the top
+of every hour the book moves to another connection the same way, without a
+hole, so every hour of a daily file starts from a snapshot. With `-c 1` only a
+reconnect brings a new snapshot. Kraken tickers, samples of the best bid and
+offer, come from the same connection as the book.
+
+To replay, start from a snapshot, which replaces the whole book, and apply the
+updates after it in file order. Kraken spot updates carry the CRC32 of the top
+ten levels; `gap_detector` checks every one.
 
 ## Checking files
 
