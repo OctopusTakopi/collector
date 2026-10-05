@@ -82,8 +82,11 @@ impl Slot {
     }
 }
 
-/// Reconnect pacing: exponential from 100 ms to 10 s with ±25 % jitter, so
-/// connections that fail together do not retry in lockstep.
+/// Reconnect pacing: exponential from 100 ms to 30 s with ±25 % jitter, so
+/// connections that fail together do not retry in lockstep. At the cap a
+/// venue that stays down costs each connection about 20 attempts per 10
+/// minutes: Kraken's Cloudflare front bans an IP for 10 minutes past about
+/// 150 attempts in 10, and the ban takes spot and futures down together.
 #[derive(Debug, Default)]
 pub(crate) struct Backoff {
     /// Consecutive sessions that ended before [`SETTLED`].
@@ -104,7 +107,7 @@ impl Backoff {
 }
 
 fn jittered(failures: u32) -> Duration {
-    let base_ms = (100_u64 << failures.min(7)).min(10_000);
+    let base_ms = (100_u64 << failures.min(9)).min(30_000);
     let spread = base_ms / 4;
     // Sub-second wall-clock nanos are random enough to decorrelate retries.
     let nanos = SystemTime::now()
@@ -466,14 +469,15 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_delay_doubles_up_to_ten_seconds_within_a_quarter() {
+    fn the_delay_doubles_up_to_thirty_seconds_within_a_quarter() {
         for (failures, base_ms) in [
             (0, 100),
             (1, 200),
             (3, 800),
             (6, 6_400),
-            (7, 10_000),
-            (40, 10_000),
+            (8, 25_600),
+            (9, 30_000),
+            (40, 30_000),
         ] {
             let delay = jittered(failures).as_millis() as u64;
             assert!(
