@@ -50,7 +50,12 @@ quality log, and closes the old pane. It never signals a collector: a
 replacement that cannot take over gives up by itself after 180 s, and if none
 was switched the previous binary is put back. Each replacement's output also
 goes to `~/logs/<exe>.<window>.log`. `--dry-run` shows the plan;
-`rolling_update_collector.sh <exe>.prev` rolls back.
+`rolling_update_collector.sh <exe>.prev` rolls back. A collector the new binary cannot
+run (an exchange added after the binary being rolled back to, or any collector
+when that binary predates UDS handover) keeps running on its own binary, which
+is kept as `<exe>.<sha256 prefix>`; the end of the run names it with the
+command that starts it alone, and the script exits 4. `run_collector.sh` would
+restart every collector in the session from `<exe>`, which cannot run it.
 
 Never run `tmux capture-pane` on the collector host. Its tmux (AlmaLinux 10's
 `next-3.4`) crashes on it, and every collector running in it stops. Read the

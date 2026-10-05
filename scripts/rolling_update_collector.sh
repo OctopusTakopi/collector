@@ -23,6 +23,19 @@ set -euo pipefail
 # incumbent carries on; if no collector was switched by then, the previous
 # binary is put back. Roll back with: ./rolling_update_collector.sh <exe>.prev
 #
+# A collector the new binary cannot run, such as one for an exchange added
+# after the binary being rolled back to, or any collector when that binary
+# predates UDS handover, keeps running on its own binary; the new binary's own
+# parser decides (can_run). The binary it runs is kept as <exe>.<sha256
+# prefix>, and the end of the run names the collector with the command that
+# starts it alone: run_collector.sh would restart every collector in the
+# session, from <exe>, which cannot run it.
+#
+# Exit status: 0 when every collector runs the new binary; 4 when some were
+# left on their own binary; 1 when a replacement failed and its incumbent
+# still collects; 2 when a collector is left with nothing collecting; 3 when a
+# handover was still undecided at the timeout.
+#
 # ---------------------------------------------------------------------------
 # WARNING: NEVER RUN `tmux capture-pane` ON THE COLLECTOR HOST, OR ON ANY HOST
 # WITH THE SAME TMUX.
@@ -78,6 +91,10 @@ command -v ss > /dev/null || die "ss (iproute) is needed to find the handover so
 exec 9> "${TMPDIR:-/tmp}/rolling_update.$(id -u).${COLLECTOR_EXE//\//_}.lock"
 flock -n 9 || die "another rolling update of $COLLECTOR_EXE is running"
 
+# Where the new binary is shown each collector's arguments (see can_run).
+PROBE_DIR=$(mktemp -d)
+trap 'rm -rf -- "$PROBE_DIR"' EXIT
+
 NAME=$(basename -- "$COLLECTOR_EXE")
 # The kernel keeps 15 characters of a process name.
 COMM=${NAME:0:15}
@@ -86,7 +103,8 @@ COMM=${NAME:0:15}
 collectors() {
     local pid argv0
     for pid in $(pgrep -x -- "$COMM"); do
-        argv0=$({ tr '\0' '\n' < "/proc/$pid/cmdline"; } 2> /dev/null | head -n 1) || continue
+        # The first NUL-terminated field; the process may be gone already.
+        read -r -d '' argv0 2> /dev/null < "/proc/$pid/cmdline" || continue
         if [ "$argv0" = "$COLLECTOR_EXE" ]; then
             echo "$pid"
         fi
@@ -121,32 +139,154 @@ excerpt() {
     tail -c +"$(($2 + 1))" -- "$1" | sed -E 's/\x1b\[[0-9;]*m//g' | tail -n 20 | sed 's/^/    /'
 }
 
-# Whether a collector listens for a challenger. One built before UDS handover
-# cannot be replaced this way, only stopped and started.
-listens() {
-    ss -xlpH 2> /dev/null | grep -q "pid=$1,"
+# Whether $NEW_EXE can run a collector with arguments "$@", its argv without
+# argv[0]. The binary's own parser decides, aliases included: it gets the
+# same arguments with the output directory and the handover socket moved into
+# $PROBE_DIR, so that nothing it does can reach a running collector, and
+# `--help` after them, on which it exits once they have parsed. The socket
+# option goes in even when the collector runs without one: a binary built
+# before UDS handover does not know it, so it cannot pass. A parser that
+# accepts an exchange its runtime then rejects (sbe-collector before 0d6e740
+# took any name) does pass; that replacement fails to start, and the update
+# stops there as for any failed replacement. The options handled are those of
+# Args in src/main.rs. Returns 0 if it can run them, 1 if it cannot, 2 if they
+# hold an option not handled here (the collector is then tried as before), 3
+# if the binary did not answer as its parser should; prints why unless 0.
+can_run() {
+    local -a args=()
+    local arg positional=0 out status=0 line reason
+    while [ $# -gt 0 ]; do
+        arg=$1
+        shift
+        case $arg in
+            -c | --connections)
+                args+=("$arg" "${1-}")
+                shift || true
+                ;;
+            -c?* | --connections=*) args+=("$arg") ;;
+            # The probe's own socket replaces it.
+            --handover-socket) shift || true ;;
+            --handover-socket=*) ;;
+            -*)
+                echo "this script does not know its option $arg"
+                return 2
+                ;;
+            *)
+                # The first positional argument is the output directory.
+                positional=$((positional + 1))
+                if [ "$positional" -eq 1 ]; then
+                    args+=("$PROBE_DIR/output")
+                else
+                    args+=("$arg")
+                fi
+                ;;
+        esac
+    done
+    # Without colour, so that the reason reads as plain text.
+    out=$(cd "$PROBE_DIR" && timeout -k 5 10 env -u CLICOLOR_FORCE NO_COLOR=1 "$NEW_EXE" \
+        --handover-socket "$PROBE_DIR/socket" "${args[@]}" --help 2>&1 > /dev/null 9>&-) ||
+        status=$?
+    out=$(sed -E 's/\x1b\[[0-9;]*m//g' <<< "$out")
+    # The parser's own line, even if something else wrote to stderr first.
+    reason=${out%%$'\n'*}
+    while IFS= read -r line; do
+        if [[ $line == error:* ]]; then
+            reason=$line
+            break
+        fi
+    done <<< "$out"
+    reason=${reason#error: }
+    case $status in
+        0) return 0 ;;
+        # A usage error, such as "invalid value 'coinbase' for '<EXCHANGE>'".
+        2)
+            if [[ $reason == *--handover-socket* ]]; then
+                echo "it predates UDS handover ($reason)"
+            else
+                echo "$reason"
+            fi
+            return 1
+            ;;
+        124 | 137) echo "it did not exit at --help" ;;
+        *) echo "it exited with status $status at --help: $reason" ;;
+    esac
+    return 3
 }
 
 # Install the new binary by rename, so nothing ever sees a partial file and the
 # running collectors keep theirs. Copy first: in the rollback form $NEW_EXE is
-# $COLLECTOR_EXE.prev, which the hard link below replaces. Fails if the new
-# binary is the one already installed.
+# $COLLECTOR_EXE.prev, which the last rename replaces. Every step is checked,
+# as errexit does not apply in a function called as a condition. Returns 1 if
+# the new binary is the one already installed, 2 if it could not be
+# installed, which leaves $COLLECTOR_EXE as it was.
 install_binary() {
-    local staged="$COLLECTOR_EXE.new.$$"
-    cp -- "$NEW_EXE" "$staged"
-    chmod 755 -- "$staged"
+    local staged="$COLLECTOR_EXE.new.$$" previous="$COLLECTOR_EXE.prev.$$"
+    if ! cp -- "$NEW_EXE" "$staged" || ! cmp -s -- "$NEW_EXE" "$staged" ||
+        ! chmod 755 -- "$staged"; then
+        rm -f -- "$staged"
+        return 2
+    fi
     if cmp -s -- "$staged" "$COLLECTOR_EXE"; then
         rm -f -- "$staged"
         return 1
     fi
-    ln -f -- "$COLLECTOR_EXE" "$COLLECTOR_EXE.prev"
-    mv -f -- "$staged" "$COLLECTOR_EXE"
+    if ! ln -f -- "$COLLECTOR_EXE" "$previous"; then
+        rm -f -- "$staged"
+        return 2
+    fi
+    if ! mv -f -- "$staged" "$COLLECTOR_EXE"; then
+        rm -f -- "$staged" "$previous"
+        return 2
+    fi
+    if ! mv -f -- "$previous" "$COLLECTOR_EXE.prev"; then
+        log "warning: the previous binary is $previous, not $COLLECTOR_EXE.prev"
+    fi
+    return 0
 }
 
+# Swap the previous binary back in and keep the one just installed as
+# $COLLECTOR_EXE.prev, so that in the rollback form the binary rolled back to
+# is not lost.
 restore_binary() {
-    local staged="$COLLECTOR_EXE.restore.$$"
-    ln -f -- "$COLLECTOR_EXE.prev" "$staged"
-    mv -f -- "$staged" "$COLLECTOR_EXE"
+    local installed="$COLLECTOR_EXE.installed.$$"
+    ln -f -- "$COLLECTOR_EXE" "$installed" &&
+        mv -f -- "$COLLECTOR_EXE.prev" "$COLLECTOR_EXE" &&
+        mv -f -- "$installed" "$COLLECTOR_EXE.prev"
+}
+
+# The command that starts collector $1 (an index) alone, from binary $2 (by
+# default the one it runs as), for a new window of its tmux session; the
+# cold-start script would restart every collector in the session instead.
+start_hint() {
+    printf '(cd %q && %q %s)' "${DIR[$1]}" "${2:-$COLLECTOR_EXE}" "${ARGS[$1]% }"
+}
+
+# Keep the binary skipped collector $1 (an index) runs as
+# $COLLECTOR_EXE.<sha256 prefix>, so that no later install can take it off
+# the disk, and note the path in KEPT.
+keep_binary() {
+    local exe="/proc/${PIDS[$1]}/exe" sum kept
+    sum=$(sha256sum < "$exe") || return 1
+    kept="$COLLECTOR_EXE.${sum:0:12}"
+    if [ -e "$kept" ]; then
+        cmp -s -- "$exe" "$kept" || return 1
+    elif ! { cp -- "$exe" "$kept.$$" && chmod 755 -- "$kept.$$" && mv -f -- "$kept.$$" "$kept"; }; then
+        rm -f -- "$kept.$$"
+        return 1
+    fi
+    KEPT[$1]=$kept
+}
+
+# Name each collector left on its own binary, with how to start it alone.
+report_skipped() {
+    local i state
+    for i in "${SKIPPED[@]}"; do
+        state="still runs"
+        kill -0 "${PIDS[i]}" 2> /dev/null || state="HAS EXITED"
+        log "  collector ${PIDS[i]} in ${SESSION[i]}/${WINDOW[i]} $state: ${SKIP[i]}"
+        log "    start it alone with: $(start_hint "$i" "${KEPT[i]:-}")"
+    done
+    log "$RUN_SCRIPT would restart every collector in the session from $COLLECTOR_EXE, which cannot run these"
 }
 
 # --- What is running, checked before anything changes -----------------------
@@ -155,32 +295,81 @@ mapfile -t PIDS < <(collectors)
 [ ${#PIDS[@]} -gt 0 ] ||
     die "no collector is running as $COLLECTOR_EXE; start them with $RUN_SCRIPT"
 
-PANES=$(tmux list-panes -a -F $'#{pane_pid}\t#{pane_id}\t#{session_name}\t#{window_name}') ||
+# Fields are split on ':', which no session name holds; the window name comes
+# last and keeps any of its own. Not a tab: tmux next-3.4 prints a tab in a
+# format as '_'.
+PANES=$(tmux list-panes -a -F '#{pane_pid}:#{pane_id}:#{session_name}:#{window_name}') ||
     die "cannot list tmux panes"
+# Who listens on which Unix socket, read once.
+SOCKETS=$(ss -xlpH) || die "ss cannot list the Unix sockets"
 
-declare -a PANE PANE_PID SESSION WINDOW DIR QUALITY COMMAND
+# SKIP: why the new binary cannot run a collector, empty if it can. TODO and
+# SKIPPED: the collectors to replace, and those it cannot run.
+declare -a PANE PANE_PID SESSION WINDOW DIR QUALITY COMMAND ARGS SKIP NOTE KEPT
+TODO=()
+SKIPPED=()
 for i in "${!PIDS[@]}"; do
     pid=${PIDS[i]}
-    ppid=$(ps -o ppid= -p "$pid" | tr -d ' ')
-    # The pane runs the collector itself, or the shell run_collector.sh typed
-    # into.
-    pane=$(awk -F '\t' -v a="$pid" -v b="$ppid" '$1 == a || $1 == b' <<< "$PANES" | head -n 1)
-    [ -n "$pane" ] ||
-        die "collector $pid is not in a tmux pane; its replacement needs the session's environment"
-    IFS=$'\t' read -r "PANE_PID[$i]" "PANE[$i]" "SESSION[$i]" "WINDOW[$i]" <<< "$pane"
-    DIR[i]=$(readlink -- "/proc/$pid/cwd")
-    QUALITY[i]=$(quality_log "$pid") || die "collector $pid has no quality log open"
-    listens "$pid" ||
-        die "collector $pid has no handover socket: a binary that old can only be stopped and started"
     mapfile -d '' -t argv < "/proc/$pid/cmdline"
     printf -v "COMMAND[$i]" '%q ' "${argv[@]}"
+    printf -v "ARGS[$i]" '%q ' "${argv[@]:1}"
+    SKIP[i]=""
+    NOTE[i]=""
+    status=0
+    why=$(can_run "${argv[@]:1}") || status=$?
+    case $status in
+        0) TODO+=("$i") ;;
+        1)
+            SKIP[i]=$why
+            SKIPPED+=("$i")
+            ;;
+        2)
+            NOTE[i]="its arguments were not checked: $why; it is tried as before"
+            TODO+=("$i")
+            ;;
+        *) die "$NEW_EXE, given collector $pid's arguments: $why" ;;
+    esac
+    ppid=$(ps -o ppid= -p "$pid" | tr -d ' ') || ppid=""
+    # The pane runs the collector itself, or the shell run_collector.sh typed
+    # into.
+    pane=$(awk -F : -v a="$pid" -v b="$ppid" '$1 == a || $1 == b' <<< "$PANES" | head -n 1)
+    PANE_PID[i]=""
+    PANE[i]=""
+    SESSION[i]="?"
+    WINDOW[i]="?"
+    if [ -n "$pane" ]; then
+        IFS=: read -r "PANE_PID[$i]" "PANE[$i]" "SESSION[$i]" _ <<< "$pane"
+        WINDOW[i]=${pane#"${PANE_PID[i]}:${PANE[i]}:${SESSION[i]}:"}
+    fi
+    DIR[i]=$(readlink -- "/proc/$pid/cwd") || DIR[i]=""
+    QUALITY[i]=$(quality_log "$pid") || QUALITY[i]=""
+    # Only a collector to be replaced needs what its replacement relies on.
+    if [ -z "${SKIP[i]}" ]; then
+        [ -n "$pane" ] ||
+            die "collector $pid is not in a tmux pane; its replacement needs the session's environment"
+        [ -n "${QUALITY[i]}" ] || die "collector $pid has no quality log open"
+        [[ $SOCKETS == *"pid=$pid,"* ]] ||
+            die "collector $pid has no handover socket: a binary that old can only be stopped and started"
+    fi
 done
 
 log "new binary: $NEW_VERSION ($(sha256sum -- "$NEW_EXE" | cut -c1-12))"
 for i in "${!PIDS[@]}"; do
-    log "collector ${PIDS[i]} in ${SESSION[i]}/${WINDOW[i]}, output $(dirname -- "${QUALITY[i]}")"
-    log "  replacement: (cd ${DIR[i]} && ${COMMAND[i]})"
+    output=unknown
+    if [ -n "${QUALITY[i]}" ]; then
+        output=$(dirname -- "${QUALITY[i]}")
+    fi
+    log "collector ${PIDS[i]} in ${SESSION[i]}/${WINDOW[i]}, output $output"
+    if [ -n "${SKIP[i]}" ]; then
+        log "  stays on the binary it runs: the new one cannot run it (${SKIP[i]})"
+    else
+        log "  replacement: (cd ${DIR[i]} && ${COMMAND[i]})"
+        if [ -n "${NOTE[i]}" ]; then
+            log "  ${NOTE[i]}"
+        fi
+    fi
 done
+[ ${#TODO[@]} -gt 0 ] || die "the new binary can run none of these collectors; nothing changed"
 if [ "$DRY_RUN" = 1 ]; then
     log "dry run: nothing changed"
     exit 0
@@ -194,7 +383,8 @@ switch() {
     local i=$1
     local pid=${PIDS[i]}
     if ! kill -0 "$pid" 2> /dev/null; then
-        log "collector $pid has exited; not replacing it (start it with $RUN_SCRIPT)"
+        log "collector $pid has exited; not replacing it. Start it alone, in a new window of ${SESSION[i]}, with:"
+        log "  $(start_hint "$i")"
         return 1
     fi
     local log_file="$LOG_DIR/$NAME.${WINDOW[i]}.log"
@@ -215,12 +405,12 @@ switch() {
     # Without fd 9: the update lock must not outlive this script in the
     # replacement.
     local created new_pane new_pane_pid
-    created=$(tmux new-window -d -P -F $'#{pane_id}\t#{pane_pid}' -t "${SESSION[i]}:" \
+    created=$(tmux new-window -d -P -F '#{pane_id}:#{pane_pid}' -t "${SESSION[i]}:" \
         -n "${WINDOW[i]}" -c "${DIR[i]}" "exec bash -c $(printf '%q' "$launch")" 9>&-) || {
         log "cannot open a tmux window in ${SESSION[i]}; collector $pid carries on"
         return 1
     }
-    IFS=$'\t' read -r new_pane new_pane_pid <<< "$created"
+    IFS=: read -r new_pane new_pane_pid <<< "$created"
     log "replacement starting in ${SESSION[i]}/${WINDOW[i]} ($new_pane); output: $log_file"
 
     local challenger=""
@@ -255,7 +445,10 @@ switch() {
             case $state in
                 incumbent_drained | incumbent_drained_degraded | incumbent_lost_after_ready_promoted)
                     log "THE REPLACEMENT EXITED AFTER TAKING OVER: NOTHING COLLECTS ${WINDOW[i]}."
-                    log "Start it with $RUN_SCRIPT. Its output:"
+                    log "Start it alone, in a new window of ${SESSION[i]}, with:"
+                    log "  $(start_hint "$i")"
+                    log "or on the previous binary: $(start_hint "$i" "$COLLECTOR_EXE.prev")"
+                    log "($RUN_SCRIPT would restart every collector in the session.) Its output:"
                     excerpt "$log_file" "$start"
                     return 2
                     ;;
@@ -304,33 +497,55 @@ switch() {
 
 # --- The update ----------------------------------------------------------------
 
+for i in "${SKIPPED[@]}"; do
+    keep_binary "$i" ||
+        die "cannot keep a copy of the binary collector ${PIDS[i]} runs; nothing changed"
+done
+
 INSTALLED=0
-if install_binary; then
-    INSTALLED=1
-    log "installed $NEW_EXE as $COLLECTOR_EXE; the previous binary is $COLLECTOR_EXE.prev"
-else
-    log "$COLLECTOR_EXE already is this binary; restarting the collectors on it"
-fi
+status=0
+install_binary || status=$?
+case $status in
+    0)
+        INSTALLED=1
+        log "installed $NEW_EXE as $COLLECTOR_EXE; the previous binary is $COLLECTOR_EXE.prev"
+        ;;
+    1) log "$COLLECTOR_EXE already is this binary; restarting the collectors on it" ;;
+    *) die "could not install $NEW_EXE as $COLLECTOR_EXE; nothing changed" ;;
+esac
 
 SWITCHED=0
-for i in "${!PIDS[@]}"; do
+for i in "${TODO[@]}"; do
     status=0
     switch "$i" || status=$?
     if [ "$status" -ne 0 ]; then
         # An undecided handover may still put the new binary to work.
         if [ "$status" -ne 3 ] && [ "$SWITCHED" -eq 0 ] && [ "$INSTALLED" -eq 1 ]; then
-            restore_binary
-            log "no collector was switched; put the previous binary back at $COLLECTOR_EXE"
+            if restore_binary; then
+                log "no collector was switched; put the previous binary back at $COLLECTOR_EXE (the new one is $COLLECTOR_EXE.prev)"
+            else
+                log "no collector was switched, but the previous binary could not be put back: $COLLECTOR_EXE is the new one"
+            fi
         else
-            log "$SWITCHED of ${#PIDS[@]} collectors run the new binary; roll back with: $0 $COLLECTOR_EXE.prev"
+            log "$SWITCHED of ${#TODO[@]} collectors run the new binary; roll back with: $0 $COLLECTOR_EXE.prev"
+        fi
+        if [ ${#SKIPPED[@]} -gt 0 ]; then
+            log "left ${#SKIPPED[@]} on their own binary, which the new one cannot run:"
+            report_skipped
         fi
         exit "$status"
     fi
     SWITCHED=$((SWITCHED + 1))
 done
 
-log "done: all $SWITCHED collectors run $NEW_VERSION"
+if [ ${#SKIPPED[@]} -eq 0 ]; then
+    log "done: all $SWITCHED collectors run $NEW_VERSION"
+else
+    log "done: switched $SWITCHED to $NEW_VERSION; left ${#SKIPPED[@]} on their own binary, which the new one cannot run:"
+    report_skipped
+fi
 log "logs: $LOG_DIR/$NAME.<window>.log; read them with tail -f, never tmux capture-pane (see the top of this script)"
 if [ "$INSTALLED" -eq 1 ]; then
     log "roll back with: $0 $COLLECTOR_EXE.prev"
 fi
+[ ${#SKIPPED[@]} -eq 0 ] || exit 4
