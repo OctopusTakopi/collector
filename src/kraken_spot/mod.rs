@@ -34,10 +34,9 @@ pub(crate) async fn collect(
     let pairs: Arc<[String]> = pairs.iter().map(|pair| pair.to_ascii_uppercase()).collect();
     let file_names: Vec<String> = pairs.iter().map(|pair| file_name(pair)).collect();
     let mut recorder = Recorder::new(cx.writer_tx.clone(), &file_names, cx.connections);
-    let symbols = pairs
+    let symbols = file_names
         .iter()
-        .zip(&file_names)
-        .map(|(pair, name)| (pair.clone(), recorder.symbols.resolve(name)))
+        .map(|name| recorder.symbols.resolve(name))
         .collect();
     let sources = file_names
         .iter()
@@ -68,8 +67,8 @@ struct KrakenSpot {
     channels: &'static [&'static str],
     pairs: Arc<[String]>,
     books: Books,
-    /// Each pair as Kraken names it, in the order of `pairs`,, with the symbol its file is named after.
-    symbols: Vec<(String, Symbol)>,
+    /// The symbol each pair's file is named after, in the order of `pairs`.
+    symbols: Vec<Symbol>,
     recorder: Recorder,
 }
 
@@ -91,7 +90,7 @@ impl Venue for KrakenSpot {
         self.books.catch_up(frame.recv_time);
         let pair =
             routing::kraken_symbol(&frame.data).ok_or(ConnectorError::MissingField("symbol"))?;
-        let index = self.symbols.iter().position(|(known, _)| known == pair);
+        let index = self.pairs.iter().position(|known| known == pair);
         let keep = match (routing::kraken_channel(&frame.data), index) {
             (Some("book"), Some(index)) => self.books.admit(
                 frame.connection,
@@ -109,7 +108,7 @@ impl Venue for KrakenSpot {
             return Ok(());
         }
         let symbol = match index {
-            Some(index) => Symbol::clone(&self.symbols[index].1),
+            Some(index) => Symbol::clone(&self.symbols[index]),
             None => self.recorder.symbols.resolve(&file_name(pair)),
         };
         self.recorder
@@ -126,7 +125,7 @@ mod tests {
     use tokio::sync::mpsc::{Receiver, channel};
 
     use super::*;
-    use crate::file::WriteRecord;
+    use crate::{books::Announced, file::WriteRecord};
 
     fn kraken(connections: usize) -> (KrakenSpot, Receiver<WriteRecord>) {
         let (writer_tx, writer_rx) = channel(8);
@@ -135,7 +134,7 @@ mod tests {
             &["BTC-USD".to_owned()],
             NonZeroUsize::new(connections).unwrap(),
         );
-        let symbols = vec![("BTC/USD".to_owned(), recorder.symbols.resolve("BTC-USD"))];
+        let symbols = vec![recorder.symbols.resolve("BTC-USD")];
         let kraken = KrakenSpot {
             channels: &["book"],
             pairs: Arc::from(["BTC/USD".to_owned()]),
@@ -156,6 +155,8 @@ mod tests {
     #[tokio::test]
     async fn one_connections_book_and_ticker_are_recorded() {
         let (mut kraken, mut writer_rx) = kraken(2);
+        let lifecycle = kraken.books.lifecycle();
+        let _sessions = (Announced::new(0, &lifecycle), Announced::new(1, &lifecycle));
         let snapshot = Bytes::from_static(
             br#"{"channel":"book","type":"snapshot","data":[{"symbol":"BTC/USD","bids":[{"price":86100.0,"qty":0.5}],"asks":[],"checksum":1,"timestamp":"2026-10-05T12:17:56.551146Z"}]}"#,
         );

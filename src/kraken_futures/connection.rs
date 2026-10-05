@@ -2,14 +2,14 @@
 //! feed to keep a quiet socket talking, and the book re-subscriptions the
 //! consumer asks for (see [`crate::books`]).
 
-use std::{borrow::Cow, collections::VecDeque, sync::Arc, time::Duration};
+use std::{borrow::Cow, future::Future, sync::Arc, time::Duration};
 
 use serde::Deserialize;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tracing::{error, info, warn};
 
 use crate::{
-    books::{Announced, Lifecycle, Resnapshot},
+    books::{self, Announced, Lifecycle, Resnapshot},
     session::{self, Lost, Protocol, Slot},
     ws::FrameSender,
 };
@@ -70,11 +70,13 @@ struct Subscriptions {
     connection: usize,
     feeds: &'static [&'static str],
     products: Arc<[String]>,
-    /// Per feed, per product.
+    /// Per feed, per product: acknowledged once; a book re-subscription does
+    /// not undo it.
     acked: Vec<bool>,
     /// Kraken answers an unknown product with an alert that names no request,
-    /// so any alert keeps the session unready rather than retire an incumbent
-    /// onto a partial feed.
+    /// so an alert while subscribing keeps the session unready rather than
+    /// retire an incumbent onto a partial feed. A later one answers a book
+    /// re-subscription, which the consumer renews or lets lapse.
     rejected: bool,
     _announced: Announced,
 }
@@ -96,13 +98,13 @@ impl Subscriptions {
         }
     }
 
-    fn mark(&mut self, feed: &str, products: &[Cow<'_, str>], subscribed: bool) {
+    fn ack(&mut self, feed: &str, products: &[Cow<'_, str>]) {
         let Some(feed) = self.feeds.iter().position(|&known| known == feed) else {
             return;
         };
         for product in products {
             if let Some(product) = self.products.iter().position(|known| known == product) {
-                self.acked[feed * self.products.len() + product] = subscribed;
+                self.acked[feed * self.products.len() + product] = true;
             }
         }
     }
@@ -127,15 +129,14 @@ impl Protocol for Subscriptions {
             }
         };
         match (control.event.as_ref(), control.feed.as_deref()) {
-            ("subscribed", Some(feed)) => self.mark(feed, &control.product_ids, true),
-            ("unsubscribed", Some(feed)) => self.mark(feed, &control.product_ids, false),
+            ("subscribed", Some(feed)) => self.ack(feed, &control.product_ids),
             ("alert" | "error", _) => {
                 error!(
                     connection = self.connection,
                     message = control.message.as_deref(),
                     "Kraken Futures rejected a request; the other subscriptions keep streaming"
                 );
-                self.rejected = true;
+                self.rejected |= !self.subscribed();
             }
             _ => {}
         }
@@ -148,43 +149,33 @@ impl Protocol for Subscriptions {
 }
 
 /// Everything one session writes: a subscribe per feed and the heartbeat,
-/// then the book re-subscriptions the consumer asks for, all paced. Returns
-/// only once the socket can no longer be written to.
-async fn control_loop(
+/// then the book re-subscriptions the consumer asks for, all paced.
+fn control_loop(
     sender: FrameSender,
     feeds: &'static [&'static str],
     products: Arc<[String]>,
-    mut commands: UnboundedReceiver<Resnapshot>,
-) {
-    let mut pacer = tokio::time::interval(SUBSCRIBE_PACE);
-    pacer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    commands: UnboundedReceiver<Resnapshot>,
+) -> impl Future<Output = ()> {
     let all: Vec<&str> = products.iter().map(String::as_str).collect();
-    let mut outbox: VecDeque<Vec<u8>> = feeds
+    let subscribes: Vec<Vec<u8>> = feeds
         .iter()
         .map(|feed| request("subscribe", feed, &all))
         .chain([request("subscribe", "heartbeat", &[])])
         .collect();
-
-    loop {
-        tokio::select! {
-            _ = pacer.tick(), if !outbox.is_empty() => {
-                let message = outbox.pop_front().expect("the outbox is not empty");
-                if sender.text(message).await.is_err() {
-                    return;
-                }
-            }
-            Some(Resnapshot(product)) = commands.recv() => {
-                let Some(product) = products.get(product) else {
-                    continue;
-                };
-                outbox.push_back(request("unsubscribe", BOOK, &[product]));
-                outbox.push_back(request("subscribe", BOOK, &[product]));
-            }
-            // Nothing to send, and the consumer is gone: the read side ends
-            // the session.
-            else => std::future::pending::<()>().await,
-        }
-    }
+    books::control_loop(
+        sender,
+        SUBSCRIBE_PACE,
+        None,
+        subscribes,
+        commands,
+        move |product| {
+            let product = products.get(product)?;
+            Some([
+                request("unsubscribe", BOOK, &[product]),
+                request("subscribe", BOOK, &[product]),
+            ])
+        },
+    )
 }
 
 #[cfg(test)]
@@ -251,8 +242,8 @@ mod tests {
         }
     }
 
-    /// Ready only with every feed acknowledged for every product; a
-    /// re-subscription is unready until it is answered again.
+    /// Ready only with every feed acknowledged for every product, and still
+    /// while a book is re-subscribed.
     #[test]
     fn readiness_needs_every_ack() {
         let mut subscriptions = subscriptions();
@@ -266,21 +257,26 @@ mod tests {
         subscriptions
             .control(br#"{"event":"unsubscribed","feed":"book","product_ids":["PF_XBTUSD"]}"#)
             .unwrap();
-        assert!(!subscriptions.subscribed());
-        subscriptions
-            .control(br#"{"event":"subscribed","feed":"book","product_ids":["PF_XBTUSD"]}"#)
-            .unwrap();
         assert!(subscriptions.subscribed());
     }
 
+    const ALERT: &[u8] =
+        br#"{"event":"alert","message":"Couldn't subscribe to invalid product `PF_FOOUSD`"}"#;
+
     #[test]
-    fn an_alert_keeps_the_session_open_but_unready() {
+    fn an_alert_while_subscribing_keeps_the_session_open_but_unready() {
+        let mut subscriptions = subscriptions();
+        subscriptions.control(ALERT).unwrap();
+        subscribe_all(&mut subscriptions);
+        assert!(!subscriptions.subscribed());
+    }
+
+    #[test]
+    fn a_later_alert_leaves_the_session_ready() {
         let mut subscriptions = subscriptions();
         subscribe_all(&mut subscriptions);
-        subscriptions
-            .control(br#"{"event":"alert","message":"Couldn't subscribe to invalid product `PF_FOOUSD`"}"#)
-            .unwrap();
-        assert!(!subscriptions.subscribed());
+        subscriptions.control(ALERT).unwrap();
+        assert!(subscriptions.subscribed());
     }
 
     #[tokio::test(start_paused = true)]

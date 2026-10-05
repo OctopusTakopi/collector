@@ -2,14 +2,14 @@
 //! for every pair, answered pair by pair, an application ping, and the book
 //! re-subscriptions the consumer asks for (see [`crate::books`]).
 
-use std::{borrow::Cow, collections::VecDeque, sync::Arc, time::Duration};
+use std::{borrow::Cow, future::Future, sync::Arc, time::Duration};
 
 use serde::Deserialize;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tracing::{error, info, warn};
 
 use crate::{
-    books::{Announced, Lifecycle, Resnapshot},
+    books::{self, Announced, Lifecycle, Resnapshot},
     routing,
     session::{self, Lost, Protocol, Slot},
     ws::FrameSender,
@@ -19,6 +19,7 @@ const URL: &str = "wss://ws.kraken.com/v2";
 /// Kraken sends a `heartbeat` each second a socket is otherwise quiet.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const PING_INTERVAL: Duration = Duration::from_secs(30);
+const PING: &[u8] = br#"{"method":"ping"}"#;
 const SUBSCRIBE_PACE: Duration = Duration::from_millis(100);
 /// Kraken's deepest book.
 const BOOK_DEPTH: u32 = 1_000;
@@ -96,10 +97,13 @@ struct Subscriptions {
     connection: usize,
     channels: &'static [&'static str],
     pairs: Arc<[String]>,
-    /// Per channel, per pair.
+    /// Per channel, per pair: acknowledged once; a book re-subscription does
+    /// not undo it.
     acked: Vec<bool>,
-    /// A rejected pair is not coming back on this session; it stays unready
-    /// rather than retire an incumbent onto a partial feed.
+    /// A pair rejected while subscribing is not coming back on this session;
+    /// it stays unready rather than retire an incumbent onto a partial feed.
+    /// A later rejection answers a book re-subscription, which the consumer
+    /// renews or lets lapse.
     rejected: bool,
     _announced: Announced,
 }
@@ -166,7 +170,7 @@ impl Protocol for Subscriptions {
                     error = answer.error.as_deref(),
                     "Kraken rejected a subscription; the other subscriptions keep streaming"
                 );
-                self.rejected = true;
+                self.rejected |= !self.subscribed();
             }
         }
         Ok(())
@@ -177,48 +181,36 @@ impl Protocol for Subscriptions {
     }
 }
 
-/// Everything one session writes: a subscribe per channel, then pings and
-/// the book re-subscriptions the consumer asks for, all paced. Returns only
-/// once the socket can no longer be written to.
-async fn control_loop(
+/// Everything one session writes: a subscribe per channel, then the book
+/// re-subscriptions the consumer asks for, all paced, and a ping on its
+/// interval.
+fn control_loop(
     sender: FrameSender,
     channels: &'static [&'static str],
     pairs: Arc<[String]>,
-    mut commands: UnboundedReceiver<Resnapshot>,
-) {
-    let mut ping = tokio::time::interval(PING_INTERVAL);
-    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut pacer = tokio::time::interval(SUBSCRIBE_PACE);
-    pacer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut outbox: VecDeque<Vec<u8>> = channels
+    commands: UnboundedReceiver<Resnapshot>,
+) -> impl Future<Output = ()> {
+    let subscribes: Vec<Vec<u8>> = channels
         .iter()
         .enumerate()
         .map(|(req_id, channel)| request("subscribe", channel, &pairs, req_id))
         .collect();
     let book = channels.iter().position(|&channel| channel == "book");
-
-    loop {
-        tokio::select! {
-            Some(Resnapshot(pair)) = commands.recv() => {
-                if let (Some(book), Some(pair)) = (book, pairs.get(pair)) {
-                    let pair = std::slice::from_ref(pair);
-                    outbox.push_back(request("unsubscribe", "book", pair, book));
-                    outbox.push_back(request("subscribe", "book", pair, book));
-                }
-            }
-            _ = ping.tick() => {
-                if sender.text(br#"{"method":"ping"}"#.to_vec()).await.is_err() {
-                    return;
-                }
-            }
-            _ = pacer.tick(), if !outbox.is_empty() => {
-                let message = outbox.pop_front().expect("the outbox is not empty");
-                if sender.text(message).await.is_err() {
-                    return;
-                }
-            }
-        }
-    }
+    books::control_loop(
+        sender,
+        SUBSCRIBE_PACE,
+        Some((PING_INTERVAL, PING)),
+        subscribes,
+        commands,
+        move |pair| {
+            let (book, pair) = (book?, pairs.get(pair)?);
+            let pair = std::slice::from_ref(pair);
+            Some([
+                request("unsubscribe", "book", pair, book),
+                request("subscribe", "book", pair, book),
+            ])
+        },
+    )
 }
 
 #[cfg(test)]
@@ -293,9 +285,9 @@ mod tests {
     }
 
     /// The rejection as served on 2026-10-05.
-    #[test]
-    fn a_rejected_pair_keeps_the_session_unready() {
-        let mut subscriptions = subscriptions();
+    const REJECTION: &[u8] = br#"{"error":"Currency pair not supported XDG/USD","method":"subscribe","req_id":1,"success":false,"symbol":"XDG/USD","time_in":"2026-10-05T12:30:30.659897Z","time_out":"2026-10-05T12:30:30.659958Z"}"#;
+
+    fn subscribe_all(subscriptions: &mut Subscriptions) {
         for channel in CHANNELS {
             for pair in ["BTC/USD", "DOGE/USD"] {
                 subscriptions
@@ -303,9 +295,26 @@ mod tests {
                     .unwrap();
             }
         }
-        subscriptions
-            .control(br#"{"error":"Currency pair not supported XDG/USD","method":"subscribe","req_id":1,"success":false,"symbol":"XDG/USD","time_in":"2026-10-05T12:30:30.659897Z","time_out":"2026-10-05T12:30:30.659958Z"}"#)
-            .unwrap();
+    }
+
+    #[test]
+    fn a_pair_rejected_while_subscribing_keeps_the_session_unready() {
+        let mut subscriptions = subscriptions();
+        subscriptions.control(REJECTION).unwrap();
+        subscribe_all(&mut subscriptions);
         assert!(!subscriptions.subscribed());
+    }
+
+    /// Once subscribed, a rejection answers a book re-subscription, which the
+    /// consumer renews; an unsubscribe's answer changes nothing either.
+    #[test]
+    fn a_subscribed_session_stays_ready() {
+        let mut subscriptions = subscriptions();
+        subscribe_all(&mut subscriptions);
+        subscriptions
+            .control(br#"{"method":"unsubscribe","req_id":0,"result":{"channel":"book","depth":1000,"symbol":"BTC/USD"},"success":true,"time_in":"2026-10-05T12:30:30.659995Z","time_out":"2026-10-05T12:30:30.660017Z"}"#)
+            .unwrap();
+        subscriptions.control(REJECTION).unwrap();
+        assert!(subscriptions.subscribed());
     }
 }

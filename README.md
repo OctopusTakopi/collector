@@ -103,12 +103,14 @@ updates of a connection that falls behind and renumbers what follows. Two
 connections' books cannot be merged frame by frame, so each product's book is
 recorded from one connection at a time, starting at that connection's
 snapshot. When that connection drops, or its Kraken Futures `seq` breaks,
-another connection subscribes the book again and its fresh snapshot restarts
-the recording: a hole of about a second, noted in the quality log. At the top
-of every hour the book moves to another connection the same way, without a
-hole, so every hour of a daily file starts from a snapshot. With `-c 1` only a
-reconnect brings a new snapshot. Kraken tickers, samples of the best bid and
-offer, come from the same connection as the book.
+another connection subscribes the book again (after a break, the same one if
+it is alone) and its fresh snapshot restarts the recording: a hole of about a
+second, noted in the quality log. A request no snapshot answers within 30 s is
+made again. At the top of every hour the book moves to another connection the
+same way, without a hole, so every hour of a daily file starts from a
+snapshot. With `-c 1` the book never moves; only a reconnect or a break brings
+a new snapshot. Kraken tickers, samples of the best bid and offer, come from
+the same connection as the book.
 
 To replay, start from a snapshot, which replaces the whole book, and apply the
 updates after it in file order. Kraken spot updates carry the CRC32 of the top

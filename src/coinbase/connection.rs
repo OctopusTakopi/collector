@@ -1,14 +1,14 @@
 //! One Coinbase Exchange connection slot: a subscribe per product, and the
 //! book re-subscriptions the consumer asks for (see [`crate::books`]).
 
-use std::{borrow::Cow, collections::VecDeque, sync::Arc, time::Duration};
+use std::{borrow::Cow, future::Future, sync::Arc, time::Duration};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tracing::{error, info, warn};
 
 use crate::{
-    books::{Announced, Lifecycle, Resnapshot},
+    books::{self, Announced, Lifecycle, Resnapshot},
     routing,
     session::{self, Lost, Protocol, Slot},
     ws::FrameSender,
@@ -97,10 +97,13 @@ struct Subscriptions {
     connection: usize,
     products: Arc<[String]>,
     channels: &'static [&'static str],
-    /// Per product: whether the last `subscriptions` listed every channel.
+    /// Per product: whether a `subscriptions` has listed every channel; a
+    /// book re-subscription does not undo it.
     listed: Vec<bool>,
-    /// Coinbase does not say which request failed, so any rejection keeps the
-    /// session unready rather than retire an incumbent onto a partial feed.
+    /// Coinbase does not say which request failed, so a rejection before
+    /// every product is listed keeps the session unready rather than retire
+    /// an incumbent onto a partial feed. A later one answers a book
+    /// re-subscription, which the consumer renews or lets lapse.
     rejected: bool,
     _announced: Announced,
 }
@@ -146,12 +149,12 @@ impl Protocol for Subscriptions {
                 reason = control.reason.as_deref(),
                 "Coinbase rejected a request; the other subscriptions keep streaming"
             );
-            self.rejected = true;
+            self.rejected |= !self.subscribed();
             return Ok(());
         }
         // Every `subscriptions` lists all of the session's subscriptions.
         for (product, listed) in self.products.iter().zip(&mut self.listed) {
-            *listed = self.channels.iter().all(|&channel| {
+            *listed |= self.channels.iter().all(|&channel| {
                 control.channels.iter().any(|entry| {
                     entry.is(channel) && entry.product_ids.iter().any(|id| id == product)
                 })
@@ -166,41 +169,31 @@ impl Protocol for Subscriptions {
 }
 
 /// Everything one session writes: a subscribe per product, then the book
-/// re-subscriptions the consumer asks for, all paced. Returns only once the
-/// socket can no longer be written to.
-async fn control_loop(
+/// re-subscriptions the consumer asks for, all paced.
+fn control_loop(
     sender: FrameSender,
     products: Arc<[String]>,
     channels: &'static [&'static str],
-    mut commands: UnboundedReceiver<Resnapshot>,
-) {
-    let mut pacer = tokio::time::interval(SUBSCRIBE_PACE);
-    pacer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut outbox: VecDeque<Vec<u8>> = products
+    commands: UnboundedReceiver<Resnapshot>,
+) -> impl Future<Output = ()> {
+    let subscribes: Vec<Vec<u8>> = products
         .iter()
         .map(|product| request("subscribe", product, channels))
         .collect();
-
-    loop {
-        tokio::select! {
-            _ = pacer.tick(), if !outbox.is_empty() => {
-                let message = outbox.pop_front().expect("the outbox is not empty");
-                if sender.text(message).await.is_err() {
-                    return;
-                }
-            }
-            Some(Resnapshot(product)) = commands.recv() => {
-                let Some(product) = products.get(product) else {
-                    continue;
-                };
-                outbox.push_back(request("unsubscribe", product, &[BOOK]));
-                outbox.push_back(request("subscribe", product, &[BOOK]));
-            }
-            // Nothing to send, and the consumer is gone: the read side ends
-            // the session.
-            else => std::future::pending::<()>().await,
-        }
-    }
+    books::control_loop(
+        sender,
+        SUBSCRIBE_PACE,
+        None,
+        subscribes,
+        commands,
+        move |product| {
+            let product = products.get(product)?;
+            Some([
+                request("unsubscribe", product, &[BOOK]),
+                request("subscribe", product, &[BOOK]),
+            ])
+        },
+    )
 }
 
 #[cfg(test)]
@@ -267,26 +260,33 @@ mod tests {
             .unwrap();
         assert!(subscriptions.subscribed());
 
-        // Mid re-subscription the book is briefly unlisted.
+        // Mid re-subscription the book is briefly unlisted; the session
+        // stays ready.
         subscriptions
             .control(br#"{"type":"subscriptions","channels":[{"name":"ticker","product_ids":["BTC-USD","ETH-USD"]},{"name":"heartbeat","product_ids":["BTC-USD","ETH-USD"]},{"name":"level2_50","product_ids":["ETH-USD"]},{"name":"matches","product_ids":["BTC-USD","ETH-USD"]}]}"#)
             .unwrap();
+        assert!(subscriptions.subscribed());
+    }
+
+    const REJECTION: &[u8] = br#"{"type":"error","message":"Failed to subscribe","reason":"TRX-USD is not a valid product"}"#;
+    const ALL_LISTED: &[u8] = br#"{"type":"subscriptions","channels":[{"name":"ticker","product_ids":["BTC-USD","ETH-USD"]},{"name":"heartbeat","product_ids":["BTC-USD","ETH-USD"]},{"name":"level2_50","product_ids":["BTC-USD","ETH-USD"]},{"name":"matches","product_ids":["BTC-USD","ETH-USD"]}]}"#;
+
+    #[test]
+    fn a_rejection_while_subscribing_keeps_the_session_open_but_unready() {
+        let (mut subscriptions, _) = subscriptions();
+        subscriptions.control(REJECTION).unwrap();
+        subscriptions.control(ALL_LISTED).unwrap();
         assert!(!subscriptions.subscribed());
     }
 
+    /// Once subscribed, a rejection can only answer a book re-subscription,
+    /// which the consumer renews; the session's other streams are in place.
     #[test]
-    fn a_rejection_keeps_the_session_open_but_unready() {
+    fn a_later_rejection_leaves_the_session_ready() {
         let (mut subscriptions, _) = subscriptions();
-        subscriptions
-            .control(br#"{"type":"subscriptions","channels":[{"name":"ticker","product_ids":["BTC-USD","ETH-USD"]},{"name":"heartbeat","product_ids":["BTC-USD","ETH-USD"]},{"name":"level2_50","product_ids":["BTC-USD","ETH-USD"]},{"name":"matches","product_ids":["BTC-USD","ETH-USD"]}]}"#)
-            .unwrap();
+        subscriptions.control(ALL_LISTED).unwrap();
+        subscriptions.control(REJECTION).unwrap();
         assert!(subscriptions.subscribed());
-
-        subscriptions
-            .control(br#"{"type":"error","message":"Failed to subscribe","reason":"TRX-USD is not a valid product"}"#)
-            .unwrap();
-
-        assert!(!subscriptions.subscribed());
     }
 
     /// The consumer must learn of a session's end as soon as it ends.
