@@ -18,6 +18,11 @@
 //!     events ending at or before the running max are duplicate windows
 //!     from differently coalesced 100 ms buffers;
 //!   - trade ids (`t`, `a`): strict per-trade increments;
+//!   - Coinbase: trade ids per product; tickers and heartbeats must not
+//!     step back in `sequence`;
+//!   - Kraken spot: trade ids per pair, and every book message's checksum
+//!     against a book rebuilt from the recording, from its last snapshot;
+//!   - Kraken Futures: book `seq` and trade `seq`, each one above the last;
 //! * range accounting for point-id streams (trades): with unique ids,
 //!   `(max - min + 1) - count` is the net of missing ids minus late
 //!   duplicates — reorder-proof. `--exact` builds id sets to split that
@@ -45,7 +50,7 @@ use std::{
 
 use anyhow::{Context as _, Result};
 use clap::{Parser, ValueEnum};
-use collector::routing::binance_dedup_key;
+use collector::routing::{binance_dedup_key, coinbase_route, coinbase_sequence_key};
 use jiff::{Span, Timestamp, civil, tz::TimeZone};
 use serde::Deserialize;
 use serde::de::{self, IgnoredAny, SeqAccess, Visitor};
@@ -105,6 +110,9 @@ enum Family {
     BinanceFutures,
     Bybit,
     Hyperliquid,
+    Coinbase,
+    KrakenSpot,
+    KrakenFutures,
     Generic,
 }
 
@@ -120,7 +128,8 @@ impl fmt::Display for Family {
 
 impl Family {
     /// Guess the family from directory names such as
-    /// `raw/binance/futures/um`, `raw/bybit`, `raw/hyperliquid`.
+    /// `raw/binance/futures/um`, `raw/bybit`, `raw/hyperliquid`,
+    /// `raw/kraken/futures`.
     fn guess(dir: &Path) -> Family {
         let comps: Vec<String> = dir
             .components()
@@ -133,6 +142,17 @@ impl Family {
             match comp.as_str() {
                 "hyperliquid" => return Family::Hyperliquid,
                 "bybit" => return Family::Bybit,
+                "coinbase" => return Family::Coinbase,
+                "krakenspot" => return Family::KrakenSpot,
+                "krakenfutures" => return Family::KrakenFutures,
+                "kraken" => {
+                    let next = comps.get(i + 1).map(String::as_str).unwrap_or("");
+                    return if next == "futures" {
+                        Family::KrakenFutures
+                    } else {
+                        Family::KrakenSpot
+                    };
+                }
                 "binancefutures" | "binancefuturesum" | "binancefuturescm" => {
                     return Family::BinanceFutures;
                 }
@@ -421,6 +441,65 @@ struct HyperliquidTradeItem {
     time: Option<i64>,
 }
 
+#[derive(Deserialize)]
+struct CoinbaseMessage<'a> {
+    #[serde(rename = "type", borrow)]
+    kind: Option<&'a str>,
+    trade_id: Option<u64>,
+    sequence: Option<u64>,
+    #[serde(borrow)]
+    time: Option<&'a str>,
+}
+
+#[derive(Deserialize)]
+struct KrakenSpotEnvelope<'a> {
+    #[serde(borrow)]
+    channel: Option<&'a str>,
+    #[serde(rename = "type", borrow)]
+    kind: Option<&'a str>,
+    #[serde(borrow)]
+    data: Option<&'a RawValue>,
+}
+
+#[derive(Deserialize)]
+struct KrakenSpotItem<'a> {
+    trade_id: Option<u64>,
+    #[serde(borrow)]
+    timestamp: Option<&'a str>,
+    /// Book levels keep their price and quantity as the venue wrote them:
+    /// the checksum is over those digits.
+    #[serde(default, borrow)]
+    bids: Vec<KrakenLevel<'a>>,
+    #[serde(default, borrow)]
+    asks: Vec<KrakenLevel<'a>>,
+    checksum: Option<u32>,
+}
+
+#[derive(Deserialize)]
+struct KrakenLevel<'a> {
+    #[serde(borrow)]
+    price: &'a RawValue,
+    #[serde(borrow)]
+    qty: &'a RawValue,
+}
+
+#[derive(Deserialize)]
+struct KrakenFuturesMessage<'a> {
+    #[serde(borrow)]
+    feed: Option<&'a str>,
+    seq: Option<u64>,
+    /// `time` on trades and tickers, `timestamp` on the book.
+    time: Option<i64>,
+    timestamp: Option<i64>,
+    #[serde(default)]
+    trades: Vec<KrakenFuturesTrade>,
+}
+
+#[derive(Deserialize)]
+struct KrakenFuturesTrade {
+    seq: Option<u64>,
+}
+
 #[derive(Clone, Copy, Default)]
 struct StreamStats {
     messages: u64,
@@ -442,6 +521,10 @@ struct StreamStats {
     exact_dups: u64,
     /// Exchange event times that went backwards.
     time_regressions: u64,
+    /// Kraken spot book messages whose checksum was compared against the
+    /// rebuilt book, and those that did not match it.
+    checksums_checked: u64,
+    checksum_mismatches: u64,
 }
 
 impl StreamStats {
@@ -552,6 +635,8 @@ struct SeriesScan {
     prev_recv: Option<i64>,
     gaps: Vec<Gap>,
     streams: Vec<StreamState>,
+    /// A series is one pair, so one book.
+    kraken_book: KrakenBook,
 }
 
 impl SeriesScan {
@@ -597,7 +682,157 @@ impl SeriesScan {
             }
             Family::Bybit => self.bybit_payload(payload),
             Family::Hyperliquid => self.hyperliquid_payload(payload),
+            Family::Coinbase => self.coinbase_payload(payload, recv),
+            Family::KrakenSpot => self.kraken_spot_payload(payload, recv),
+            Family::KrakenFutures => self.kraken_futures_payload(payload, recv),
             Family::Generic => {}
+        }
+    }
+
+    fn coinbase_payload(&mut self, payload: &[u8], recv: i64) {
+        let Ok(message) = serde_json::from_slice::<CoinbaseMessage>(payload) else {
+            self.bad_lines += 1;
+            return;
+        };
+        let Some(kind) = message.kind else {
+            return;
+        };
+        let name = match kind {
+            "match" | "last_match" => "matches",
+            "snapshot" | "l2update" => "book",
+            other => other,
+        };
+        let st = self.stream(name, name == "matches");
+        st.stats.messages += 1;
+        if kind == "snapshot" {
+            // A snapshot restarts the book, from whichever connection leads.
+            st.last_time = None;
+        }
+        if let Some(time) = message.time.and_then(rfc3339_ns) {
+            check_time(&mut st.stats, &mut st.last_time, time);
+        }
+        match kind {
+            "match" | "last_match" => {
+                if let Some(id) = message.trade_id {
+                    st.point_id(id, recv);
+                }
+            }
+            // `sequence` counts every event of the product, so only order is
+            // checked here.
+            "ticker" | "heartbeat" => {
+                if let Some(sequence) = message.sequence {
+                    if st.max_id.is_some_and(|max| sequence < max) {
+                        st.stats.seq_back_events += 1;
+                    }
+                    st.max_id = st.max_id.max(Some(sequence));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn kraken_spot_payload(&mut self, payload: &[u8], recv: i64) {
+        let Ok(env) = serde_json::from_slice::<KrakenSpotEnvelope>(payload) else {
+            self.bad_lines += 1;
+            return;
+        };
+        let (Some(channel), Some(data)) = (env.channel, env.data) else {
+            return;
+        };
+        let Ok(items) = serde_json::from_str::<Vec<KrakenSpotItem>>(data.get()) else {
+            self.bad_lines += 1;
+            return;
+        };
+        let snapshot = env.kind == Some("snapshot");
+        self.stream(channel, channel == "trade");
+        let Self {
+            streams,
+            kraken_book: book,
+            ..
+        } = self;
+        let st = streams
+            .iter_mut()
+            .find(|stream| stream.name == channel)
+            .expect("the stream was just made");
+        st.stats.messages += 1;
+        for item in &items {
+            if channel == "book" && snapshot {
+                st.last_time = None;
+            }
+            // A ticker's `timestamp` is not in order even on one connection
+            // (one in ten on DOGE/USD, 2026-10-05), so only the book and
+            // trades are checked.
+            if channel != "ticker"
+                && let Some(time) = item.timestamp.and_then(rfc3339_ns)
+            {
+                check_time(&mut st.stats, &mut st.last_time, time);
+            }
+            match channel {
+                "trade" => {
+                    if let Some(id) = item.trade_id {
+                        st.point_id(id, recv);
+                    }
+                }
+                "book" => match book.apply(snapshot, item) {
+                    Checked::Matched => st.stats.checksums_checked += 1,
+                    Checked::Mismatched => {
+                        st.stats.checksums_checked += 1;
+                        st.stats.checksum_mismatches += 1;
+                    }
+                    Checked::Unsynced => {}
+                },
+                _ => {}
+            }
+        }
+    }
+
+    fn kraken_futures_payload(&mut self, payload: &[u8], recv: i64) {
+        let Ok(message) = serde_json::from_slice::<KrakenFuturesMessage>(payload) else {
+            self.bad_lines += 1;
+            return;
+        };
+        let Some(feed) = message.feed else {
+            return;
+        };
+        let name = match feed {
+            "book" | "book_snapshot" => "book",
+            "trade" | "trade_snapshot" => "trade",
+            other => other,
+        };
+        let st = self.stream(name, name == "trade");
+        st.stats.messages += 1;
+        match feed {
+            // A snapshot anchors the chain; it fills any break before it.
+            "book_snapshot" => {
+                st.max_id = st.max_id.max(message.seq);
+                st.last_time = None;
+            }
+            "book" => {
+                if let Some(seq) = message.seq {
+                    let step = chain(&mut st.max_id, seq);
+                    st.count(step, recv);
+                }
+            }
+            "trade" => {
+                if let Some(seq) = message.seq {
+                    st.point_id(seq, recv);
+                }
+            }
+            // A new subscriber's recent trades repeat ones already recorded;
+            // range accounting nets them out.
+            "trade_snapshot" => {
+                for trade in &message.trades {
+                    if let Some(seq) = trade.seq {
+                        st.point_id(seq, recv);
+                    }
+                }
+            }
+            _ => {}
+        }
+        if feed != "trade_snapshot"
+            && let Some(time) = message.time.or(message.timestamp)
+        {
+            check_time(&mut st.stats, &mut st.last_time, time);
         }
     }
 
@@ -732,6 +967,149 @@ fn check_time(stats: &mut StreamStats, last: &mut Option<i64>, t: i64) {
     *last = Some(t);
 }
 
+/// An RFC 3339 time (`2026-10-05T12:17:56.266162Z`) in nanoseconds.
+fn rfc3339_ns(time: &str) -> Option<i64> {
+    time.parse::<Timestamp>()
+        .ok()
+        .and_then(|time| i64::try_from(time.as_nanosecond()).ok())
+}
+
+/// The depth the collector subscribes Kraken spot books at. Levels pushed
+/// past it are not announced, so the rebuilt book is cut to it.
+const KRAKEN_BOOK_DEPTH: usize = 1_000;
+
+/// A price level's key: prices of one pair share a precision, so their
+/// values order them and equal literals are equal values.
+#[derive(Clone, Copy)]
+struct Price(f64);
+
+impl PartialEq for Price {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+
+impl Eq for Price {}
+
+impl PartialOrd for Price {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Price {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.total_cmp(&other.0)
+    }
+}
+
+/// One side of a Kraken spot book: each level's price and quantity as
+/// written.
+type Side = BTreeMap<Price, (Box<str>, Box<str>)>;
+
+/// A Kraken spot book rebuilt from its last snapshot, to check each
+/// message's CRC32 of the top ten levels.
+#[derive(Default)]
+struct KrakenBook {
+    bids: Side,
+    asks: Side,
+    /// Since a snapshot and without a mismatch.
+    synced: bool,
+}
+
+enum Checked {
+    Matched,
+    Mismatched,
+    /// No snapshot yet, or none since a mismatch.
+    Unsynced,
+}
+
+impl KrakenBook {
+    fn apply(&mut self, snapshot: bool, item: &KrakenSpotItem) -> Checked {
+        if snapshot {
+            self.bids.clear();
+            self.asks.clear();
+            self.synced = true;
+        }
+        if !self.synced {
+            return Checked::Unsynced;
+        }
+        for (side, levels) in [(&mut self.bids, &item.bids), (&mut self.asks, &item.asks)] {
+            for level in levels {
+                let (price, qty) = (level.price.get(), level.qty.get());
+                let Ok(value) = price.parse::<f64>() else {
+                    continue;
+                };
+                if qty.parse::<f64>().is_ok_and(|qty| qty == 0.0) {
+                    side.remove(&Price(value));
+                } else {
+                    side.insert(Price(value), (price.into(), qty.into()));
+                }
+            }
+        }
+        while self.bids.len() > KRAKEN_BOOK_DEPTH {
+            self.bids.pop_first();
+        }
+        while self.asks.len() > KRAKEN_BOOK_DEPTH {
+            self.asks.pop_last();
+        }
+        let Some(expected) = item.checksum else {
+            return Checked::Unsynced;
+        };
+        if self.checksum() == expected {
+            Checked::Matched
+        } else {
+            self.synced = false;
+            Checked::Mismatched
+        }
+    }
+
+    /// Kraken's book checksum: the ten best asks from the lowest, then the
+    /// ten best bids from the highest, each as price then quantity with the
+    /// decimal point and leading zeros dropped.
+    fn checksum(&self) -> u32 {
+        let mut text = String::new();
+        let levels = self
+            .asks
+            .values()
+            .take(10)
+            .chain(self.bids.values().rev().take(10));
+        for (price, qty) in levels {
+            for number in [price, qty] {
+                let digits: String = number.chars().filter(|&c| c != '.').collect();
+                text.push_str(digits.trim_start_matches('0'));
+            }
+        }
+        crc32(text.as_bytes())
+    }
+}
+
+/// CRC-32 (IEEE 802.3), as Kraken's checksum uses.
+fn crc32(bytes: &[u8]) -> u32 {
+    const TABLE: [u32; 256] = {
+        let mut table = [0u32; 256];
+        let mut index = 0;
+        while index < 256 {
+            let mut crc = index as u32;
+            let mut bit = 0;
+            while bit < 8 {
+                crc = if crc & 1 == 1 {
+                    (crc >> 1) ^ 0xEDB8_8320
+                } else {
+                    crc >> 1
+                };
+                bit += 1;
+            }
+            table[index] = crc;
+            index += 1;
+        }
+        table
+    };
+    !bytes.iter().fold(!0u32, |crc, &byte| {
+        TABLE[((crc ^ u32::from(byte)) & 0xFF) as usize] ^ (crc >> 8)
+    })
+}
+
 /// Advance a strictly incrementing-by-one id (trade ids) against its running
 /// max.
 fn chain(max: &mut Option<u64>, id: u64) -> Step {
@@ -839,11 +1217,12 @@ impl SeriesReport {
             || !self.missing_dates.is_empty()
             || self.bad_lines > 0
             || self.files.iter().any(|f| f.decode_error.is_some())
-            || self
-                .streams
-                .iter()
-                .map(|stream| &stream.stats)
-                .any(|s| s.seq_fwd_events > 0 || s.net_deficit() > 0 || s.exact_missing > 0)
+            || self.streams.iter().map(|stream| &stream.stats).any(|s| {
+                s.seq_fwd_events > 0
+                    || s.net_deficit() > 0
+                    || s.exact_missing > 0
+                    || s.checksum_mismatches > 0
+            })
     }
 }
 
@@ -968,11 +1347,16 @@ fn merge_overlapping_runs(
     }
 }
 
-/// Spot copies of one event differ only in the per-connection `E` stamp, so
-/// spot uses the collector's own dedup key.
+/// Spot copies of one event differ only in the per-connection `E` stamp, and
+/// Coinbase tickers in their rolling volumes, so those use the collector's
+/// own dedup keys.
 fn overlap_key(family: Family, payload: &[u8]) -> u128 {
     match family {
         Family::BinanceSpot => binance_dedup_key(payload),
+        Family::Coinbase => coinbase_route(payload)
+            .ok()
+            .and_then(|route| coinbase_sequence_key(&route))
+            .unwrap_or_else(|| xxhash_rust::xxh3::xxh3_128(payload)),
         _ => xxhash_rust::xxh3::xxh3_128(payload),
     }
 }
@@ -1186,11 +1570,22 @@ fn stream_issues(s: &StreamStats, break_times: &[i64], exact: bool) -> Vec<Strin
             grouped(s.time_regressions)
         ));
     }
+    if s.checksums_checked > 0 {
+        parts.push(format!(
+            "book checksums: {} checked, {} mismatched",
+            grouped(s.checksums_checked),
+            grouped(s.checksum_mismatches)
+        ));
+    }
     parts
 }
 
 fn stream_notable(s: &StreamStats) -> bool {
-    s.id_count > 0 || s.seq_fwd_events > 0 || s.seq_back_events > 0 || s.time_regressions > 0
+    s.id_count > 0
+        || s.seq_fwd_events > 0
+        || s.seq_back_events > 0
+        || s.time_regressions > 0
+        || s.checksums_checked > 0
 }
 
 fn write_report(
@@ -1443,6 +1838,8 @@ struct Totals {
     exact_missing: u64,
     back_events: u64,
     time_regressions: u64,
+    checksums_checked: u64,
+    checksum_mismatches: u64,
     missing_dates: usize,
     decode_errors: usize,
     bad_lines: u64,
@@ -1464,6 +1861,8 @@ impl Totals {
             self.exact_missing += s.exact_missing;
             self.back_events += s.seq_back_events;
             self.time_regressions += s.time_regressions;
+            self.checksums_checked += s.checksums_checked;
+            self.checksum_mismatches += s.checksum_mismatches;
         }
         self.missing_dates += report.missing_dates.len();
         for file in &report.files {
@@ -1515,6 +1914,14 @@ impl Totals {
             "  time regressions      : {}",
             grouped(self.time_regressions)
         )?;
+        if self.checksums_checked > 0 {
+            writeln!(
+                out,
+                "  book checksum misses  : {} of {} checked",
+                grouped(self.checksum_mismatches),
+                grouped(self.checksums_checked)
+            )?;
+        }
         writeln!(out, "  missing dates         : {}", self.missing_dates)?;
         writeln!(out, "  decode errors         : {}", self.decode_errors)?;
         writeln!(out, "  bad lines             : {}", grouped(self.bad_lines))?;
@@ -1649,6 +2056,144 @@ mod tests {
         // Only the 90 < 100 delta counts; once for `u` and once for `seq`.
         assert_eq!(stats.seq_back_events, 2);
         assert_eq!(stats.time_regressions, 1);
+    }
+
+    #[test]
+    fn coinbase_and_kraken_directories_are_recognised() {
+        for (dir, family) in [
+            ("/data/raw/coinbase", Family::Coinbase),
+            ("/data/raw/kraken/spot", Family::KrakenSpot),
+            ("/data/raw/kraken/futures", Family::KrakenFutures),
+            ("/data/raw/krakenspot", Family::KrakenSpot),
+            ("/data/raw/krakenfutures", Family::KrakenFutures),
+        ] {
+            assert_eq!(Family::guess(Path::new(dir)), family, "{dir}");
+        }
+    }
+
+    /// Trades are checked by id; a `last_match` repeating a recorded trade is
+    /// a duplicate, and a skipped id a break.
+    #[test]
+    fn coinbase_trade_ids_are_accounted() {
+        let mut scan = SeriesScan::default();
+        let trade = |kind: &str, id: u64| {
+            format!(
+                r#"{{"type":"{kind}","trade_id":{id},"side":"buy","size":"1","price":"1","product_id":"BTC-USD","sequence":{id},"time":"2026-10-05T12:17:56.{id:06}Z"}}"#
+            )
+        };
+        scan_line(&mut scan, Family::Coinbase, 1, &trade("last_match", 10));
+        scan_line(&mut scan, Family::Coinbase, 2, &trade("match", 11));
+        scan_line(&mut scan, Family::Coinbase, 3, &trade("match", 13));
+        let matches = scan.streams.iter().find(|s| s.name == "matches").unwrap();
+        assert_eq!(matches.stats.seq_fwd_ids, 1);
+        assert_eq!(matches.stats.net_deficit(), 1);
+
+        // A book snapshot restarts the book's clock.
+        let update = |time: &str| {
+            format!(
+                r#"{{"type":"l2update","product_id":"BTC-USD","changes":[],"time":"2026-10-05T12:00:{time}Z"}}"#
+            )
+        };
+        scan_line(&mut scan, Family::Coinbase, 4, &update("05"));
+        scan_line(
+            &mut scan,
+            Family::Coinbase,
+            5,
+            r#"{"type":"snapshot","product_id":"BTC-USD","asks":[],"bids":[]}"#,
+        );
+        scan_line(&mut scan, Family::Coinbase, 6, &update("04"));
+        let book = scan.streams.iter().find(|s| s.name == "book").unwrap();
+        assert_eq!(book.stats.time_regressions, 0);
+    }
+
+    /// A snapshot re-anchors the book chain; a new subscriber's recent trades
+    /// net out against ones already recorded.
+    #[test]
+    fn kraken_futures_seq_chains_are_checked() {
+        let mut scan = SeriesScan::default();
+        let delta = |seq: u64| {
+            format!(
+                r#"{{"feed":"book","product_id":"PF_XBTUSD","side":"sell","seq":{seq},"price":1.0,"qty":1.0,"timestamp":{seq}}}"#
+            )
+        };
+        let snapshot = |seq: u64| {
+            format!(
+                r#"{{"feed":"book_snapshot","product_id":"PF_XBTUSD","timestamp":{seq},"seq":{seq},"tickSize":null,"bids":[],"asks":[]}}"#
+            )
+        };
+        let trade = |seq: u64| {
+            format!(
+                r#"{{"product_id":"PF_XBTUSD","feed":"trade","uid":"u","side":"buy","type":"fill","time":{seq},"qty":1.0,"price":1.0,"seq":{seq}}}"#
+            )
+        };
+        for (recv, line) in [
+            (1, snapshot(100)),
+            (2, delta(101)),
+            (3, delta(103)),
+            (4, snapshot(120)),
+            (5, delta(121)),
+            (6, trade(7)),
+            (7, trade(8)),
+            (
+                8,
+                r#"{"feed":"trade_snapshot","product_id":"PF_XBTUSD","trades":[{"seq":8},{"seq":7}]}"#.to_owned(),
+            ),
+            (9, trade(9)),
+        ] {
+            scan_line(&mut scan, Family::KrakenFutures, recv, &line);
+        }
+        let stream = |name: &str| scan.streams.iter().find(|s| s.name == name).unwrap();
+        let book = &stream("book").stats;
+        assert_eq!((book.seq_fwd_events, book.seq_fwd_ids), (1, 1));
+        let trades = &stream("trade").stats;
+        assert_eq!(trades.net_deficit(), -2, "the two repeated trades");
+        assert_eq!(trades.seq_fwd_events, 0);
+    }
+
+    /// Snapshots as Kraken sent them on 2026-10-05, cut to the ten levels a
+    /// side the checksum covers: prices with one decimal, and with leading
+    /// zeros and a trailing zero (`0.0957580`).
+    const KRAKEN_SNAPSHOTS: [&str; 2] = [
+        r#"{"channel":"book","type":"snapshot","data":[{"symbol":"BTC/USD","bids":[{"price":86056.9,"qty":0.38228347},{"price":86056.7,"qty":0.53564524},{"price":86056.2,"qty":0.35962971},{"price":86055.3,"qty":1.84132868},{"price":86055.2,"qty":2.90510937},{"price":86053.9,"qty":2.90515581},{"price":86052.8,"qty":0.87181841},{"price":86052.2,"qty":0.00232636},{"price":86052.1,"qty":0.00053579},{"price":86051.9,"qty":0.00172996}],"asks":[{"price":86057.0,"qty":0.00020000},{"price":86058.5,"qty":0.02220833},{"price":86060.6,"qty":0.00005100},{"price":86062.0,"qty":0.00030000},{"price":86063.7,"qty":0.53564524},{"price":86064.3,"qty":2.90480692},{"price":86064.9,"qty":0.00005100},{"price":86067.0,"qty":0.00040000},{"price":86067.5,"qty":0.35519089},{"price":86068.1,"qty":0.02323741}],"checksum":2414010054,"timestamp":"2026-10-05T13:08:15.390126Z"}]}"#,
+        r#"{"channel":"book","type":"snapshot","data":[{"symbol":"DOGE/USD","bids":[{"price":0.0957582,"qty":104.39732576},{"price":0.0957581,"qty":4093.63576117},{"price":0.0957580,"qty":10333.86635410},{"price":0.0957559,"qty":3275.75875257},{"price":0.0957442,"qty":12830.32168217},{"price":0.0957441,"qty":21491.32610078},{"price":0.0957410,"qty":21491.32610078},{"price":0.0957403,"qty":1044.49223577},{"price":0.0957385,"qty":5222.55936744},{"price":0.0957370,"qty":4787.69839167}],"asks":[{"price":0.0957862,"qty":9992.05098097},{"price":0.0957871,"qty":3058.18708880},{"price":0.0957925,"qty":5216.56028361},{"price":0.0958137,"qty":25024.00740710},{"price":0.0958138,"qty":10333.86635410},{"price":0.0958140,"qty":6510.07197565},{"price":0.0958169,"qty":44700.42040421},{"price":0.0958170,"qty":27340.89920930},{"price":0.0958171,"qty":80417.19654520},{"price":0.0958172,"qty":16968.04894631}],"checksum":1043240196,"timestamp":"2026-10-05T13:08:15.381817Z"}]}"#,
+    ];
+
+    #[test]
+    fn kraken_spot_checksums_match_the_venues() {
+        for snapshot in KRAKEN_SNAPSHOTS {
+            let mut scan = SeriesScan::default();
+            scan_line(&mut scan, Family::KrakenSpot, 1, snapshot);
+            let book = &scan.streams[0].stats;
+            assert_eq!(
+                (book.checksums_checked, book.checksum_mismatches),
+                (1, 0),
+                "{snapshot}"
+            );
+        }
+    }
+
+    /// An update applies before its checksum; a wrong one is counted once,
+    /// and the book is unchecked until the next snapshot. Snapshots are
+    /// checked too: 1 and 5 here, besides updates 2 and 3.
+    #[test]
+    fn kraken_spot_updates_are_checked_against_the_rebuilt_book() {
+        let mut scan = SeriesScan::default();
+        let update = |checksum: u32| {
+            format!(
+                r#"{{"channel":"book","type":"update","data":[{{"symbol":"DOGE/USD","bids":[{{"price":0.0957582,"qty":200.00000000}}],"asks":[],"checksum":{checksum},"timestamp":"2026-10-05T13:08:16.000000Z"}}]}}"#
+            )
+        };
+        scan_line(&mut scan, Family::KrakenSpot, 1, KRAKEN_SNAPSHOTS[1]);
+        // Worked out independently with Python's zlib.crc32.
+        scan_line(&mut scan, Family::KrakenSpot, 2, &update(4_026_649_801));
+        scan_line(&mut scan, Family::KrakenSpot, 3, &update(1));
+        scan_line(&mut scan, Family::KrakenSpot, 4, &update(4_026_649_801));
+        let book = &scan.streams[0].stats;
+        assert_eq!((book.checksums_checked, book.checksum_mismatches), (3, 1));
+
+        scan_line(&mut scan, Family::KrakenSpot, 5, KRAKEN_SNAPSHOTS[1]);
+        let book = &scan.streams[0].stats;
+        assert_eq!((book.checksums_checked, book.checksum_mismatches), (4, 1));
     }
 
     #[test]
@@ -2134,6 +2679,9 @@ RESULT: issues found in 5 series
                 "binance-futures",
                 "bybit",
                 "hyperliquid",
+                "coinbase",
+                "kraken-spot",
+                "kraken-futures",
                 "generic"
             ]
         );
