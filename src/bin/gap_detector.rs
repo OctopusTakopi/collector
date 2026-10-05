@@ -803,8 +803,10 @@ impl SeriesScan {
         st.stats.messages += 1;
         match feed {
             // A snapshot anchors the chain; it fills any break before it.
+            // After a handover it starts the new leader's numbering, which
+            // may run below the old one's.
             "book_snapshot" => {
-                st.max_id = st.max_id.max(message.seq);
+                st.max_id = message.seq;
                 st.last_time = None;
             }
             "book" => {
@@ -2106,7 +2108,8 @@ mod tests {
         assert_eq!(book.stats.time_regressions, 0);
     }
 
-    /// A snapshot re-anchors the book chain; a new subscriber's recent trades
+    /// A snapshot re-anchors the book chain, also onto a new leader whose
+    /// numbering runs below the old one's; a new subscriber's recent trades
     /// net out against ones already recorded.
     #[test]
     fn kraken_futures_seq_chains_are_checked() {
@@ -2132,19 +2135,29 @@ mod tests {
             (3, delta(103)),
             (4, snapshot(120)),
             (5, delta(121)),
-            (6, trade(7)),
-            (7, trade(8)),
             (
-                8,
+                6,
+                r#"{"feed":"book_snapshot","product_id":"PF_XBTUSD","timestamp":130,"seq":93,"tickSize":null,"bids":[],"asks":[]}"#.to_owned(),
+            ),
+            (
+                7,
+                r#"{"feed":"book","product_id":"PF_XBTUSD","side":"buy","seq":94,"price":1.0,"qty":1.0,"timestamp":131}"#.to_owned(),
+            ),
+            (8, trade(7)),
+            (9, trade(8)),
+            (
+                10,
                 r#"{"feed":"trade_snapshot","product_id":"PF_XBTUSD","trades":[{"seq":8},{"seq":7}]}"#.to_owned(),
             ),
-            (9, trade(9)),
+            (11, trade(9)),
         ] {
             scan_line(&mut scan, Family::KrakenFutures, recv, &line);
         }
         let stream = |name: &str| scan.streams.iter().find(|s| s.name == name).unwrap();
         let book = &stream("book").stats;
         assert_eq!((book.seq_fwd_events, book.seq_fwd_ids), (1, 1));
+        assert_eq!(book.seq_back_events, 0);
+        assert_eq!(book.time_regressions, 0);
         let trades = &stream("trade").stats;
         assert_eq!(trades.net_deficit(), -2, "the two repeated trades");
         assert_eq!(trades.seq_fwd_events, 0);
