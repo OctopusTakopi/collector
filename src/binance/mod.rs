@@ -46,18 +46,11 @@ pub struct Endpoint {
     pub depth_continuity: DepthContinuity,
     /// What one `limit=1000` depth snapshot weighs against the IP's
     /// per-minute request weight.
-    pub depth_weight: usize,
+    pub depth_weight: u32,
     /// How much of that weight snapshots may spend a minute. The rest is
     /// margin for connection requests and for other processes on the host
     /// that share the IP.
-    pub snapshot_budget: usize,
-}
-
-impl Endpoint {
-    /// Snapshots per minute within [`Self::snapshot_budget`].
-    fn snapshots_per_minute(&self) -> usize {
-        self.snapshot_budget / self.depth_weight
-    }
+    pub snapshot_budget: u32,
 }
 
 pub static SPOT: Endpoint = Endpoint {
@@ -154,11 +147,7 @@ pub(crate) async fn collect(
     cx: Context,
 ) -> anyhow::Result<()> {
     let mut recorder = Recorder::new(cx.writer_tx.clone(), symbols, cx.connections);
-    let snapshots = Snapshots::new(
-        endpoint,
-        endpoint.snapshots_per_minute(),
-        cx.writer_tx.clone(),
-    )?;
+    let snapshots = Snapshots::new(endpoint, endpoint.snapshot_budget, cx.writer_tx.clone())?;
     let mut tasks = JoinSet::new();
     // Snapshots seed and repair the depth stream. A worker without one (USD-M's
     // `/market` half) would only spend weight its sibling already spends.
@@ -307,6 +296,10 @@ impl Depth for Endpoint {
         self.label
     }
 
+    fn weight(&self) -> u32 {
+        self.depth_weight
+    }
+
     fn fetch(
         &self,
         client: reqwest::Client,
@@ -330,11 +323,12 @@ impl Depth for Endpoint {
             if !status.is_success() {
                 // 418 is a ban and 429 the warning before one; recording it
                 // gates every later request, not just this one.
-                if matches!(status.as_u16(), 418 | 429)
-                    && let Some(until) =
-                        throttler::ban_expiry(retry_after.as_deref(), &body, Timestamp::now())
-                {
-                    throttler.note_ban(until);
+                if matches!(status.as_u16(), 418 | 429) {
+                    throttler.note_ban(throttler::ban_expiry(
+                        retry_after.as_deref(),
+                        &body,
+                        Timestamp::now(),
+                    ));
                 }
                 // The Binance error code is what tells a bad symbol from a ban.
                 let preview = &body[..body.len().min(1024)];
@@ -414,13 +408,19 @@ mod tests {
     /// Spot weighs a snapshot 50 against 6000 a minute, futures 20 against
     /// 2400; a spot budget sized for futures spent most of the IP's weight.
     #[test]
-    fn snapshot_rates_follow_each_markets_weight() {
-        assert_eq!(SPOT.snapshots_per_minute(), 40);
+    fn snapshot_budgets_follow_each_markets_weight() {
+        assert_eq!(SPOT.snapshot_budget / SPOT.depth_weight, 40);
         for endpoint in [&COINM, &USDM_PUBLIC, &USDM_MARKET] {
-            assert_eq!(endpoint.snapshots_per_minute(), 100, "{}", endpoint.label);
-            assert!(endpoint.snapshots_per_minute() * endpoint.depth_weight < 2_400);
+            assert_eq!(
+                endpoint.snapshot_budget / endpoint.depth_weight,
+                100,
+                "{}",
+                endpoint.label
+            );
+            assert!(endpoint.snapshot_budget < 2_400);
         }
-        assert!(SPOT.snapshots_per_minute() * SPOT.depth_weight + 3_000 < 6_000);
+        // sbe-collector's spot snapshots on the same host may spend 3000.
+        assert!(SPOT.snapshot_budget + 3_000 < 6_000);
     }
 
     #[test]

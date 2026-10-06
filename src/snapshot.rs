@@ -27,6 +27,9 @@ pub(crate) trait Depth: Sync + 'static {
     /// Names the source in logs.
     fn label(&self) -> &'static str;
 
+    /// What one snapshot weighs against the venue's per-minute allowance.
+    fn weight(&self) -> u32;
+
     /// Fetches `symbol`'s snapshot body, recording on `throttler` any ban the
     /// reply announces.
     fn fetch(
@@ -56,15 +59,15 @@ impl<D> Clone for Snapshots<D> {
 }
 
 impl<D: Depth> Snapshots<D> {
-    /// At most `per_minute` requests; 0 sends none, which keeps unit tests
-    /// off the network.
+    /// Spends at most `weight_per_minute` of the venue's request weight; 0
+    /// sends nothing, which keeps unit tests off the network.
     pub(crate) fn new(
         depth: &'static D,
-        per_minute: usize,
+        weight_per_minute: u32,
         writer_tx: Sender<WriteRecord>,
     ) -> anyhow::Result<Self> {
         Ok(Self {
-            throttler: Throttler::new(depth.label(), per_minute),
+            throttler: Throttler::new(depth.label(), weight_per_minute),
             depth,
             client: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(10))
@@ -111,7 +114,7 @@ impl<D: Depth> Snapshots<D> {
             self.throttler.clone(),
             Symbol::clone(&symbol),
         );
-        match self.throttler.execute(fetch).await {
+        match self.throttler.execute(self.depth.weight(), fetch).await {
             Some(Ok(data)) => self
                 .writer_tx
                 .send(WriteRecord {

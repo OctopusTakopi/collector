@@ -32,9 +32,10 @@ const FULL_BOOK: &str = "orderbook.full.";
 const FULL_BOOK_URL: &str =
     "https://api.bybit.com/v5/market/full_orderbook?category=linear&symbol=";
 
-/// Full-book snapshots per minute. The IP may send 600 requests per 5 s, so
-/// size is what binds: a BTCUSDT snapshot is over 1 MB (2026-10-03).
-const SNAPSHOT_RATE_LIMIT: usize = 30;
+/// Full-book snapshots per minute, each weighing 1. The IP may send 600
+/// requests per 5 s, so size is what binds: a BTCUSDT snapshot is over 1 MB
+/// (2026-10-03).
+const SNAPSHOT_RATE_LIMIT: u32 = 30;
 
 /// How long Bybit bars an IP after a 403 "access too frequent".
 const IP_BAN: Duration = Duration::from_secs(10 * 60);
@@ -168,6 +169,11 @@ struct FullBook;
 impl Depth for FullBook {
     fn label(&self) -> &'static str {
         "bybit"
+    }
+
+    /// Bybit limits requests, not weight.
+    fn weight(&self) -> u32 {
+        1
     }
 
     fn fetch(
