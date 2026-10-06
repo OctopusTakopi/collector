@@ -88,11 +88,15 @@ impl Venue for KrakenFutures {
             .iter()
             .position(|product| product == product_id);
         let keep = match (routing::kraken_futures_book(&frame.data), index) {
-            (Some((_, seq, snapshot)), Some(index)) => {
-                self.book(frame.connection, index, seq, snapshot, frame.recv_time)
-            }
+            (Some((_, seq, snapshot)), Some(index)) => self.book(
+                frame.socket.connection,
+                index,
+                seq,
+                snapshot,
+                frame.recv_time,
+            ),
             (None, Some(index)) if routing::kraken_futures_feed(&frame.data) == Some("ticker") => {
-                self.books.leads(frame.connection, index)
+                self.books.leads(frame.socket.connection, index)
                     && !self.recorder.dedup.is_duplicate(&frame.data)
             }
             _ => !self.recorder.dedup.is_duplicate(&frame.data),

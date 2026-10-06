@@ -90,7 +90,7 @@ impl Venue for Coinbase {
             .position(|product| product == product_id);
         let keep = match (route.kind, book) {
             (kind @ ("snapshot" | "l2update"), Some(product)) => self.books.admit(
-                frame.connection,
+                frame.socket.connection,
                 product,
                 kind == "snapshot",
                 frame.recv_time,
@@ -154,9 +154,8 @@ mod tests {
     impl Coinbase {
         async fn feed(&mut self, connection: usize, data: &str) {
             let frame = Frame {
-                connection,
                 recv_time: at("2026-10-05T10:30:01Z"),
-                data: Bytes::from(data.to_owned()),
+                ..Frame::on(connection, data.to_owned())
             };
             self.handle(frame).await.unwrap();
         }

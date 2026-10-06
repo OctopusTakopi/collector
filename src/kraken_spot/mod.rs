@@ -93,13 +93,13 @@ impl Venue for KrakenSpot {
         let index = self.pairs.iter().position(|known| known == pair);
         let keep = match (routing::kraken_channel(&frame.data), index) {
             (Some("book"), Some(index)) => self.books.admit(
-                frame.connection,
+                frame.socket.connection,
                 index,
                 routing::kraken_snapshot(&frame.data),
                 frame.recv_time,
             ),
             (Some("ticker"), Some(index)) => {
-                self.books.leads(frame.connection, index)
+                self.books.leads(frame.socket.connection, index)
                     && !self.recorder.dedup.is_duplicate(&frame.data)
             }
             _ => !self.recorder.dedup.is_duplicate(&frame.data),

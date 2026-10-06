@@ -377,7 +377,7 @@ pub(super) async fn keep_connection(endpoint: &'static Endpoint, url: String, sl
         let mut running = Box::pin(run_session(
             conn,
             Session::new(id, endpoint, connection, event_tx.clone(), max_age),
-            slot.producer(endpoint.label),
+            slot.producer(endpoint.label, id),
             retire_rx,
         ));
 

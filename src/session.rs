@@ -25,21 +25,35 @@ use crate::{
 /// venue's doing rather than a persistent failure.
 pub(crate) const SETTLED: Duration = Duration::from_secs(30);
 
-/// A market frame on the collection queue: the connection slot that read it,
-/// when, and its bytes.
+/// A session within one connection slot, numbered in opening order.
+pub(crate) type SessionId = u64;
+
+/// One socket: a session of a connection slot. Sessions of one slot overlap
+/// while one replaces another, so the slot alone does not name a stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct Socket {
+    pub(crate) connection: usize,
+    pub(crate) session: SessionId,
+}
+
+/// A market frame on the collection queue: the socket that read it, when,
+/// and its bytes.
 #[derive(Debug)]
 pub(crate) struct Frame {
-    pub(crate) connection: usize,
+    pub(crate) socket: Socket,
     pub(crate) recv_time: Timestamp,
     pub(crate) data: Bytes,
 }
 
 #[cfg(test)]
 impl Frame {
-    /// `data` as read now on `connection`.
+    /// `data` as read now on the first session of `connection`.
     pub(crate) fn on(connection: usize, data: impl Into<Bytes>) -> Self {
         Self {
-            connection,
+            socket: Socket {
+                connection,
+                session: 0,
+            },
             recv_time: Timestamp::now(),
             data: data.into(),
         }
@@ -56,8 +70,8 @@ pub(crate) struct Slot {
 }
 
 impl Slot {
-    /// The queue end for one session on this slot.
-    pub(crate) fn producer(&self, endpoint: &'static str) -> Producer {
+    /// The queue end for `session` on this slot.
+    pub(crate) fn producer(&self, endpoint: &'static str, session: SessionId) -> Producer {
         let source = Source {
             endpoint,
             connection: self.connection,
@@ -65,6 +79,7 @@ impl Slot {
         Producer::new(
             self.tx.clone(),
             source,
+            session,
             self.quality.clone(),
             self.readiness.clone(),
         )
@@ -111,6 +126,7 @@ fn jittered(failures: u32) -> Duration {
 pub(crate) struct Producer {
     tx: Sender<Frame>,
     source: Source,
+    socket: Socket,
     overflow: Overflow,
     readiness: Readiness,
     lease: Option<SourceLease>,
@@ -120,12 +136,17 @@ impl Producer {
     pub(crate) fn new(
         tx: Sender<Frame>,
         source: Source,
+        session: SessionId,
         quality: QualityReporter,
         readiness: Readiness,
     ) -> Self {
         Self {
             tx,
             source,
+            socket: Socket {
+                connection: source.connection,
+                session,
+            },
             overflow: Overflow::new(source, quality),
             readiness,
             lease: None,
@@ -135,7 +156,7 @@ impl Producer {
     /// Stamps `payload` and queues it.
     pub(crate) async fn send(&mut self, payload: Bytes) -> Delivery {
         let frame = Frame {
-            connection: self.source.connection,
+            socket: self.socket,
             recv_time: Timestamp::now(),
             data: payload,
         };
@@ -281,6 +302,7 @@ pub(crate) async fn keep_subscribed<P, C>(
 {
     let connection = slot.connection;
     let mut backoff = Backoff::default();
+    let mut next_session: SessionId = 0;
     loop {
         let mut conn = match ws::connect(url, HeaderMap::new(), Arc::clone(&slot.tls)).await {
             Ok(conn) => conn,
@@ -298,7 +320,8 @@ pub(crate) async fn keep_subscribed<P, C>(
         };
         let opened = Instant::now();
         let (mut protocol, control) = start(conn.sender());
-        let mut producer = slot.producer(endpoint);
+        let mut producer = slot.producer(endpoint, next_session);
+        next_session += 1;
         let lost = match read(
             &mut conn,
             &mut protocol,
@@ -343,6 +366,7 @@ pub(crate) mod tests {
         let producer = Producer::new(
             tx,
             TEST_SOURCE,
+            0,
             QualityReporter::disabled(),
             Readiness::new(1).0,
         );
@@ -431,7 +455,7 @@ pub(crate) mod tests {
             let (readiness, ready) = Readiness::new(1);
             readiness.mark_writer_ready();
             let mut producer =
-                Producer::new(tx, TEST_SOURCE, QualityReporter::disabled(), readiness);
+                Producer::new(tx, TEST_SOURCE, 0, QualityReporter::disabled(), readiness);
             let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
             let session = tokio::spawn(async move {
                 let mut protocol = TestProtocol::default();
@@ -487,7 +511,7 @@ pub(crate) mod tests {
 
         let frame = harness.rx.recv().await.unwrap();
         assert_eq!(&frame.data[..], b"market");
-        assert_eq!(frame.connection, TEST_SOURCE.connection);
+        assert_eq!(frame.socket.connection, TEST_SOURCE.connection);
         assert!(harness.ready_after_ping().await);
         assert!(harness.rx.try_recv().is_err(), "control frames stay out");
 
