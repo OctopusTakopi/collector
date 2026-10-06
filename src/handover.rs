@@ -32,6 +32,9 @@ const RESELECT_DELAY: Duration = Duration::from_millis(250);
 /// Role selections after a vanished incumbent before the challenger gives
 /// up, so a flapping peer cannot keep it spinning.
 const MAX_RESELECTIONS: u32 = 5;
+/// Pause after a failed `accept`, so a persistent failure logs once a
+/// second instead of spinning.
+const ACCEPT_RETRY: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Identity {
@@ -128,8 +131,11 @@ enum Challenge {
     /// The incumbent's stream closed or failed before its drain report.
     Lost {
         error: io::Error,
-        /// The incumbent, if this process had already told it it was ready.
-        ready_for: Option<String>,
+        /// The incumbent's run id, once its acknowledgement named it.
+        incumbent: Option<String>,
+        /// Whether this process had reported itself ready
+        /// (`challenger_ready`).
+        after_ready: bool,
     },
 }
 
@@ -188,19 +194,25 @@ async fn take_role(
     quality: &QualityReporter,
 ) -> anyhow::Result<Option<Bound>> {
     let mut lost_incumbents = 0;
-    let mut lost_after_ready: Option<String> = None;
+    // The incumbent of the last challenge, if it vanished before draining,
+    // and whether this process had reported itself ready by then.
+    let mut lost: Option<(String, bool)> = None;
     loop {
         let stream = match select_role(path).await? {
             Role::Incumbent(bound) => {
-                if let Some(incumbent_run_id) = lost_after_ready {
+                // A rollout watching this process's quality log waits for a
+                // terminal state, which a promotion must provide too.
+                if let Some((incumbent_run_id, after_ready)) = lost {
+                    let state = if after_ready {
+                        HandoverState::IncumbentLostAfterReadyPromoted
+                    } else {
+                        HandoverState::IncumbentLostPromoted
+                    };
                     tracing::warn!(
-                        "incumbent disappeared after challenger readiness; promoted challenger"
+                        after_ready,
+                        "incumbent disappeared before draining; promoted challenger"
                     );
-                    report(
-                        quality,
-                        HandoverState::IncumbentLostAfterReadyPromoted,
-                        &incumbent_run_id,
-                    );
+                    report(quality, state, &incumbent_run_id);
                 }
                 return Ok(Some(bound));
             }
@@ -209,7 +221,11 @@ async fn take_role(
         match challenge(stream, path, identity, run_id, ready, shutdown, quality).await? {
             Challenge::Won(bound) => return Ok(Some(bound)),
             Challenge::Stopped => return Ok(None),
-            Challenge::Lost { error, ready_for } => {
+            Challenge::Lost {
+                error,
+                incumbent,
+                after_ready,
+            } => {
                 lost_incumbents += 1;
                 if lost_incumbents > MAX_RESELECTIONS {
                     return Err(error).context(format!(
@@ -217,7 +233,7 @@ async fn take_role(
                     ));
                 }
                 tracing::warn!(%error, "incumbent vanished mid-handover; choosing a role again");
-                lost_after_ready = ready_for;
+                lost = incumbent.map(|incumbent| (incumbent, after_ready));
                 tokio::time::sleep(RESELECT_DELAY).await;
             }
         }
@@ -236,7 +252,13 @@ async fn challenge(
     shutdown: &mut watch::Receiver<bool>,
     quality: &QualityReporter,
 ) -> anyhow::Result<Challenge> {
-    let lost = |error, ready_for| Ok(Challenge::Lost { error, ready_for });
+    let lost = |error, incumbent: Option<&str>, after_ready| {
+        Ok(Challenge::Lost {
+            error,
+            incumbent: incumbent.map(str::to_owned),
+            after_ready,
+        })
+    };
     let hello = Message::Hello {
         protocol_version: PROTOCOL_VERSION,
         run_id: run_id.to_owned(),
@@ -244,7 +266,7 @@ async fn challenge(
     };
     match write_message(&mut stream, &hello).await {
         Ok(()) => {}
-        Err(WireError::Gone(error)) => return lost(error, None),
+        Err(WireError::Gone(error)) => return lost(error, None, false),
         Err(error) => return Err(error.into()),
     }
     let acknowledged = tokio::select! {
@@ -256,7 +278,7 @@ async fn challenge(
         Ok(Ok(Message::HelloAck { run_id })) => run_id,
         Ok(Ok(Message::Reject { reason })) => bail!("handover rejected: {reason}"),
         Ok(Ok(message)) => bail!("unexpected handover response: {message:?}"),
-        Ok(Err(WireError::Gone(error))) => return lost(error, None),
+        Ok(Err(WireError::Gone(error))) => return lost(error, None, false),
         Ok(Err(error)) => return Err(error.into()),
         Err(_) => bail!("timed out waiting for handover acknowledgement"),
     };
@@ -269,9 +291,12 @@ async fn challenge(
         _ = shutdown.wait_for(|stop| *stop) => return Ok(Challenge::Stopped),
         result = wait_until_stably_ready(ready, OVERLAP_GRACE) => result?,
         read = stream.read(&mut probe) => match read {
-            Ok(0) => return lost(io::ErrorKind::UnexpectedEof.into(), None),
+            Ok(0) => {
+                let eof = io::ErrorKind::UnexpectedEof.into();
+                return lost(eof, Some(&incumbent_run_id), false);
+            }
             Ok(_) => bail!("incumbent sent data before its drain report"),
-            Err(error) => return lost(error, None),
+            Err(error) => return lost(error, Some(&incumbent_run_id), false),
         },
     }
     report(quality, HandoverState::ChallengerReady, &incumbent_run_id);
@@ -280,7 +305,7 @@ async fn challenge(
     };
     match write_message(&mut stream, &ready_message).await {
         Ok(()) => {}
-        Err(WireError::Gone(error)) => return lost(error, Some(incumbent_run_id)),
+        Err(WireError::Gone(error)) => return lost(error, Some(&incumbent_run_id), true),
         Err(error) => return Err(error.into()),
     }
 
@@ -294,7 +319,7 @@ async fn challenge(
         }
         Ok(Message::Reject { reason }) => bail!("handover rejected after readiness: {reason}"),
         Ok(message) => bail!("unexpected handover completion: {message:?}"),
-        Err(WireError::Gone(error)) => lost(error, Some(incumbent_run_id)),
+        Err(WireError::Gone(error)) => lost(error, Some(&incumbent_run_id), true),
         Err(error) => Err(error.into()),
     }
 }
@@ -413,7 +438,16 @@ async fn accept_ready_challenger(
     run_id: &str,
 ) -> anyhow::Result<(UnixStream, String)> {
     loop {
-        let (mut stream, _) = listener.accept().await?;
+        let mut stream = match listener.accept().await {
+            Ok((stream, _)) => stream,
+            // Out of descriptors, or a peer gone before it was accepted:
+            // nothing that should stop collection, which failing here would.
+            Err(error) => {
+                tracing::warn!(%error, "cannot accept a handover connection; retrying");
+                tokio::time::sleep(ACCEPT_RETRY).await;
+                continue;
+            }
+        };
         let peer_allowed = match same_uid(&stream, path) {
             Ok(allowed) => allowed,
             Err(error) => {
@@ -755,24 +789,7 @@ mod tests {
 
         /// A challenger with the incumbent's identity, ready from the start.
         fn spawn_ready_challenger(&self) -> tokio::task::JoinHandle<anyhow::Result<()>> {
-            let (readiness, ready) = Readiness::new(1);
-            readiness.mark_writer_ready();
-            let source = readiness.source_live(SOURCE);
-            let (takeover_tx, takeovers) = mpsc::channel(1);
-            let (shutdown, shutdown_rx) = watch::channel(false);
-            let challenger = run(
-                self.path.clone(),
-                self.identity.clone(),
-                "new".to_owned(),
-                ready,
-                takeover_tx,
-                shutdown_rx,
-                QualityReporter::disabled(),
-            );
-            tokio::spawn(async move {
-                let _live = (source, takeovers, shutdown);
-                challenger.await
-            })
+            spawn_challenger(&self.path, &self.identity, QualityReporter::disabled())
         }
 
         async fn takeover_request(&mut self) -> TakeoverRequest {
@@ -784,14 +801,62 @@ mod tests {
 
         /// Waits until something accepts connections on the socket again.
         async fn wait_for_listener(&self) {
-            timeout(Duration::from_secs(2), async {
-                while UnixStream::connect(&self.path).await.is_err() {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .unwrap();
+            wait_for_listener(&self.path).await;
         }
+    }
+
+    /// A challenger named `new` with `identity`, ready from the start.
+    fn spawn_challenger(
+        path: &Path,
+        identity: &Identity,
+        quality: QualityReporter,
+    ) -> tokio::task::JoinHandle<anyhow::Result<()>> {
+        let (readiness, ready) = Readiness::new(1);
+        readiness.mark_writer_ready();
+        let source = readiness.source_live(SOURCE);
+        let (takeover_tx, takeovers) = mpsc::channel(1);
+        let (shutdown, shutdown_rx) = watch::channel(false);
+        let challenger = run(
+            path.to_owned(),
+            identity.clone(),
+            "new".to_owned(),
+            ready,
+            takeover_tx,
+            shutdown_rx,
+            quality,
+        );
+        tokio::spawn(async move {
+            let _live = (source, takeovers, shutdown);
+            challenger.await
+        })
+    }
+
+    /// Waits until something accepts connections on `path` again.
+    async fn wait_for_listener(path: &Path) {
+        timeout(Duration::from_secs(2), async {
+            while UnixStream::connect(path).await.is_err() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    /// The handover states a challenger reported about incumbent `old`, in
+    /// order.
+    fn handover_states(events: &std::sync::mpsc::Receiver<QualityEvent>) -> Vec<HandoverState> {
+        events
+            .try_iter()
+            .filter_map(|event| match event {
+                QualityEvent::Handover {
+                    state, peer_run_id, ..
+                } => {
+                    assert_eq!(peer_run_id, "old");
+                    Some(state)
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     impl Drop for Fixture {
@@ -822,7 +887,8 @@ mod tests {
     #[tokio::test]
     async fn ready_challenger_promotes_when_incumbent_disappears() {
         let mut fixture = Fixture::start("promotion").await;
-        let challenger = fixture.spawn_ready_challenger();
+        let (quality, events) = QualityReporter::test_channel();
+        let challenger = spawn_challenger(&fixture.path, &fixture.identity, quality);
 
         drop(fixture.takeover_request().await);
         assert!(
@@ -834,8 +900,59 @@ mod tests {
         );
         fixture.wait_for_listener().await;
         assert!(!challenger.is_finished());
+        assert_eq!(
+            handover_states(&events),
+            [
+                HandoverState::ChallengerReady,
+                HandoverState::IncumbentLostAfterReadyPromoted
+            ]
+        );
 
         challenger.abort();
+    }
+
+    /// An incumbent that vanishes while the challenger warms up leaves it to
+    /// take over, and a rollout watching for a terminal state must see one.
+    #[tokio::test]
+    async fn a_challenger_reports_its_promotion_when_the_incumbent_vanishes_early() {
+        let dir = test_dir("early-loss");
+        let path = dir.join("collector.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let (quality, events) = QualityReporter::test_channel();
+        // Never ready: the incumbent goes while it warms up.
+        let (_readiness, ready) = Readiness::new(1);
+        let (takeover_tx, _takeovers) = mpsc::channel(1);
+        let (_shutdown, shutdown_rx) = watch::channel(false);
+        let challenger = tokio::spawn(run(
+            path.clone(),
+            test_identity(&dir),
+            "new".to_owned(),
+            ready,
+            takeover_tx,
+            shutdown_rx,
+            quality,
+        ));
+
+        // Acknowledge the challenger, then vanish without unlinking.
+        let (mut stream, _) = listener.accept().await.unwrap();
+        assert!(matches!(
+            read_message(&mut stream).await.unwrap(),
+            Message::Hello { .. }
+        ));
+        let ack = Message::HelloAck {
+            run_id: "old".to_owned(),
+        };
+        write_message(&mut stream, &ack).await.unwrap();
+        drop((stream, listener));
+
+        wait_for_listener(&path).await;
+        assert!(!challenger.is_finished());
+        assert_eq!(
+            handover_states(&events),
+            [HandoverState::IncumbentLostPromoted]
+        );
+        challenger.abort();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

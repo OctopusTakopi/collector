@@ -56,7 +56,12 @@ pub enum HandoverState {
     TakeoverRequested,
     IncumbentDrained,
     IncumbentDrainedDegraded,
+    /// The incumbent vanished after `ChallengerReady`; this process took
+    /// over without its drain.
     IncumbentLostAfterReadyPromoted,
+    /// The incumbent vanished while this process was warming up; this
+    /// process took over without its drain.
+    IncumbentLostPromoted,
 }
 
 impl HandoverState {
@@ -187,6 +192,10 @@ mod tests {
             (
                 HandoverState::IncumbentLostAfterReadyPromoted,
                 "incumbent_lost_after_ready_promoted",
+            ),
+            (
+                HandoverState::IncumbentLostPromoted,
+                "incumbent_lost_promoted",
             ),
         ] {
             let event = serde_json::to_value(QualityEvent::Handover {

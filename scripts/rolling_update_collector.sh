@@ -435,7 +435,7 @@ switch() {
             state=$(handover_state "$quality")
         fi
         case $state in
-            incumbent_drained | incumbent_drained_degraded | incumbent_lost_after_ready_promoted)
+            incumbent_drained | incumbent_drained_degraded | incumbent_lost_after_ready_promoted | incumbent_lost_promoted)
                 if ! kill -0 "$pid" 2> /dev/null; then
                     break
                 fi
@@ -443,7 +443,7 @@ switch() {
         esac
         if ! kill -0 "$challenger" 2> /dev/null; then
             case $state in
-                incumbent_drained | incumbent_drained_degraded | incumbent_lost_after_ready_promoted)
+                incumbent_drained | incumbent_drained_degraded | incumbent_lost_after_ready_promoted | incumbent_lost_promoted)
                     log "THE REPLACEMENT EXITED AFTER TAKING OVER: NOTHING COLLECTS ${WINDOW[i]}."
                     log "Start it alone, in a new window of ${SESSION[i]}, with:"
                     log "  $(start_hint "$i")"
@@ -460,7 +460,12 @@ switch() {
         fi
         if [ "$SECONDS" -ge "$deadline" ]; then
             log "no switch within ${SWITCH_TIMEOUT}s (handover state: ${state:-none})."
-            log "Both collectors are still running; nothing was signalled. Read $log_file"
+            if kill -0 "$pid" 2> /dev/null; then
+                log "Both collectors are still running; nothing was signalled. Read $log_file"
+            else
+                log "Collector $pid has exited; the replacement $challenger runs, but its"
+                log "quality log records no takeover. Read $log_file"
+            fi
             return 3
         fi
         sleep 1
@@ -470,6 +475,8 @@ switch() {
             log "warning: collector $pid reported a degraded drain; see $quality" ;;
         incumbent_lost_after_ready_promoted)
             log "warning: collector $pid vanished after the replacement was ready; see $quality" ;;
+        incumbent_lost_promoted)
+            log "warning: collector $pid vanished while the replacement was warming up; see $quality" ;;
     esac
     log "switched: collector $challenger replaced $pid"
 

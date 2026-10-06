@@ -239,15 +239,20 @@ async fn main() -> Result<(), anyhow::Error> {
         result = &mut handle => Shutdown::Collection(joined(result)),
     };
 
+    if !matches!(shutdown, Shutdown::Takeover(_)) {
+        // Release the handover socket at once. A takeover request that raced
+        // this exit is dropped with the channel, and its challenger chooses
+        // its role again instead of waiting for a drain report.
+        shutdown_tx.send_replace(true);
+        drop(takeover_rx);
+    }
+    let mut handover_result = Ok(());
     let (collection_result, takeover_request) = match shutdown {
         Shutdown::Collection(result) => (result, None),
         Shutdown::Takeover(request) => (drain(&shutdown_tx, &mut handle).await, Some(request)),
         Shutdown::HandoverFailed(error) => {
-            let drained = drain(&shutdown_tx, &mut handle).await;
-            (
-                first_error([("collection", drained), ("handover", Err(error))]),
-                None,
-            )
+            handover_result = Err(error);
+            (drain(&shutdown_tx, &mut handle).await, None)
         }
         Shutdown::Signal | Shutdown::Writer | Shutdown::Quality => {
             (drain(&shutdown_tx, &mut handle).await, None)
@@ -259,12 +264,17 @@ async fn main() -> Result<(), anyhow::Error> {
         Err(_) => Err(anyhow!("writer thread panicked")),
     };
 
-    if let Err(error) = &collection_result {
-        quality.report(QualityEvent::CriticalTaskFailed {
-            at_ns: QualityEvent::now_ns(),
-            task: "collection".to_owned(),
-            error: error.to_string(),
-        });
+    for (task, result) in [
+        ("handover", &handover_result),
+        ("collection", &collection_result),
+    ] {
+        if let Err(error) = result {
+            quality.report(QualityEvent::CriticalTaskFailed {
+                at_ns: QualityEvent::now_ns(),
+                task: task.to_owned(),
+                error: error.to_string(),
+            });
+        }
     }
     if let Err(error) = &writer_result {
         quality.report(QualityEvent::StorageDegraded {
@@ -284,40 +294,36 @@ async fn main() -> Result<(), anyhow::Error> {
             peer_run_id: request.peer_run_id.clone(),
         });
         request.complete(drained);
-        if timeout(HANDOVER_REPLY_TIMEOUT, &mut handover_handle)
-            .await
-            .is_err()
-        {
-            handover_handle.abort();
-            let _ = handover_handle.await;
-        }
-    } else if !handover_handle.is_finished() {
-        // The task releases the socket once it sees the shutdown. A takeover
-        // request that raced the shutdown is dropped with the channel; its
-        // challenger then chooses its role again.
-        shutdown_tx.send_replace(true);
-        drop(takeover_rx);
-        if timeout(HANDOVER_REPLY_TIMEOUT, &mut handover_handle)
-            .await
-            .is_err()
-        {
-            handover_handle.abort();
-            let _ = handover_handle.await;
-        }
     }
+    // The last reply after a takeover, or the release of the socket.
+    finish_or_abort(&mut handover_handle, HANDOVER_REPLY_TIMEOUT).await;
     drop(quality);
     let quality_result = match quality_thread.join() {
         Ok(result) => result.map_err(anyhow::Error::from),
         Err(_) => Err(anyhow!("quality writer thread panicked")),
     };
 
-    // The collection error is the root cause; a writer close failure is usually
-    // a symptom of the same problem, so it must not mask it.
+    // A failed handover is what stopped the collection; the collection error
+    // is the root cause of what follows, and a writer close failure is
+    // usually a symptom of the same problem, so neither may mask it.
     first_error([
+        ("handover", handover_result),
         ("collection", collection_result),
         ("writer", writer_result),
         ("quality log", quality_result),
     ])
+}
+
+/// Gives `task` `grace` to finish, then aborts it. A task whose output was
+/// already taken is left alone: polling it again would panic.
+async fn finish_or_abort<T>(task: &mut JoinHandle<T>, grace: Duration) {
+    if task.is_finished() {
+        return;
+    }
+    if timeout(grace, &mut *task).await.is_err() {
+        task.abort();
+        let _ = task.await;
+    }
 }
 
 /// Asks the collection to stop reading and waits for it to hand what it
