@@ -44,6 +44,20 @@ pub struct Endpoint {
     /// symbol is idle, so a longer gap means the connection is dead.
     pub idle_timeout: Duration,
     pub depth_continuity: DepthContinuity,
+    /// What one `limit=1000` depth snapshot weighs against the IP's
+    /// per-minute request weight.
+    pub depth_weight: usize,
+    /// How much of that weight snapshots may spend a minute. The rest is
+    /// margin for connection requests and for other processes on the host
+    /// that share the IP.
+    pub snapshot_budget: usize,
+}
+
+impl Endpoint {
+    /// Snapshots per minute within [`Self::snapshot_budget`].
+    fn snapshots_per_minute(&self) -> usize {
+        self.snapshot_budget / self.depth_weight
+    }
 }
 
 pub static SPOT: Endpoint = Endpoint {
@@ -53,6 +67,11 @@ pub static SPOT: Endpoint = Endpoint {
     // Pings every 20 s and allows a minute for the pong.
     idle_timeout: Duration::from_secs(75),
     depth_continuity: DepthContinuity::FirstUpdateId,
+    // Of the IP's 6000 a minute: sbe-collector's spot snapshots on the same
+    // host may spend 3000.
+    // <https://developers.binance.com/docs/binance-spot-api-docs/rest-api/market-data-endpoints>
+    depth_weight: 50,
+    snapshot_budget: 2_000,
 };
 
 pub static COINM: Endpoint = Endpoint {
@@ -62,6 +81,9 @@ pub static COINM: Endpoint = Endpoint {
     // Futures pings every 3 minutes.
     idle_timeout: Duration::from_secs(300),
     depth_continuity: DepthContinuity::PrevUpdateId,
+    // Of the IP's 2400 a minute.
+    depth_weight: 20,
+    snapshot_budget: 2_000,
 };
 
 /// USD-M book and trade streams.
@@ -75,6 +97,8 @@ pub static USDM_PUBLIC: Endpoint = Endpoint {
     depth_url: "https://fapi.binance.com/fapi/v1/depth?symbol=",
     idle_timeout: Duration::from_secs(300),
     depth_continuity: DepthContinuity::PrevUpdateId,
+    depth_weight: 20,
+    snapshot_budget: 2_000,
 };
 
 /// USD-M `aggTrade`, `forceOrder`, `markPrice`, klines and tickers. These
@@ -88,6 +112,8 @@ pub static USDM_MARKET: Endpoint = Endpoint {
     depth_url: "https://fapi.binance.com/fapi/v1/depth?symbol=",
     idle_timeout: Duration::from_secs(300),
     depth_continuity: DepthContinuity::PrevUpdateId,
+    depth_weight: 20,
+    snapshot_budget: 2_000,
 };
 
 /// The USD-M endpoints `streams` need, each with the streams it serves.
@@ -115,12 +141,6 @@ fn is_public(stream: &str) -> bool {
     matches!(kind, "trade" | "bookTicker" | "rpiDepth") || kind.starts_with("depth")
 }
 
-/// Snapshots per minute. An IP may spend 2,400 weight a minute and a
-/// depth-1000 snapshot weighs 20, so at most 120; the rest is margin for
-/// connection requests.
-/// <https://www.binance.com/en/support/faq/rate-limits-on-binance-futures-281596e222414cdd9051664ea621cdc3>
-const SNAPSHOT_RATE_LIMIT: usize = 100;
-
 /// How far a depth update id may fall below the last one seen before the book
 /// is treated as restarted rather than reordered. Redundant connections
 /// reorder by at most the dedup window (thousands of updates); a re-based book
@@ -135,7 +155,11 @@ pub(crate) async fn collect(
     tls: Arc<ClientConfig>,
 ) -> anyhow::Result<()> {
     let mut recorder = Recorder::new(cx.writer_tx.clone(), symbols, cx.connections);
-    let snapshots = Snapshots::new(endpoint, SNAPSHOT_RATE_LIMIT, cx.writer_tx.clone())?;
+    let snapshots = Snapshots::new(
+        endpoint,
+        endpoint.snapshots_per_minute(),
+        cx.writer_tx.clone(),
+    )?;
     let mut tasks = JoinSet::new();
     // Snapshots seed and repair the depth stream. A worker without one (USD-M's
     // `/market` half) would only spend weight its sibling already spends.
@@ -346,6 +370,8 @@ mod tests {
         depth_url: "https://example.invalid/depth?symbol=",
         idle_timeout: Duration::from_secs(75),
         depth_continuity: DepthContinuity::FirstUpdateId,
+        depth_weight: 50,
+        snapshot_budget: 2_000,
     };
 
     static TEST_FUTURES: Endpoint = Endpoint {
@@ -354,6 +380,8 @@ mod tests {
         depth_url: "https://example.invalid/depth?symbol=",
         idle_timeout: Duration::from_secs(300),
         depth_continuity: DepthContinuity::PrevUpdateId,
+        depth_weight: 20,
+        snapshot_budget: 2_000,
     };
 
     /// A consumer for BTCUSDT on `endpoint`, behind `connections` redundant
@@ -389,6 +417,18 @@ mod tests {
 
     fn written(writer_rx: &mut Receiver<WriteRecord>) -> Vec<Bytes> {
         std::iter::from_fn(|| writer_rx.try_recv().ok().map(|record| record.data)).collect()
+    }
+
+    /// Spot weighs a snapshot 50 against 6000 a minute, futures 20 against
+    /// 2400; a spot budget sized for futures spent most of the IP's weight.
+    #[test]
+    fn snapshot_rates_follow_each_markets_weight() {
+        assert_eq!(SPOT.snapshots_per_minute(), 40);
+        for endpoint in [&COINM, &USDM_PUBLIC, &USDM_MARKET] {
+            assert_eq!(endpoint.snapshots_per_minute(), 100, "{}", endpoint.label);
+            assert!(endpoint.snapshots_per_minute() * endpoint.depth_weight < 2_400);
+        }
+        assert!(SPOT.snapshots_per_minute() * SPOT.depth_weight + 3_000 < 6_000);
     }
 
     #[test]
