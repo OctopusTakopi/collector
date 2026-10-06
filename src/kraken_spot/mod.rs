@@ -8,19 +8,17 @@
 //! Kraken names pairs `BTC/USD`; a file is named after the pair with `-` for
 //! the slash, `btc-usd_<date>.zst`.
 
-mod connection;
+mod protocol;
 
-use std::{future::Future, sync::Arc};
+use std::sync::Arc;
 
 use jiff::Timestamp;
-use rustls::ClientConfig;
 use tokio::task::JoinSet;
 
 use crate::{
     books::Books,
-    collection::{self, Consumer, Context, Recorder, Venue},
+    collection::{self, Consumer, Context, Recorder},
     error::ConnectorError,
-    legacy::Slot,
     routing,
     session::Frame,
     symbol::Symbol,
@@ -30,7 +28,6 @@ pub(crate) async fn collect(
     channels: &'static [&'static str],
     pairs: &[String],
     cx: Context,
-    tls: Arc<ClientConfig>,
 ) -> anyhow::Result<()> {
     let pairs: Arc<[String]> = pairs.iter().map(|pair| pair.to_ascii_uppercase()).collect();
     let file_names: Vec<String> = pairs.iter().map(|pair| file_name(pair)).collect();
@@ -43,19 +40,20 @@ pub(crate) async fn collect(
         .iter()
         .map(|name| format!("krakenspot/{}", name.to_ascii_lowercase()))
         .collect();
+    let books = Books::new(
+        sources,
+        cx.connections.get(),
+        cx.quality.clone(),
+        Timestamp::now(),
+    );
+    let spot = protocol::Spot::new(channels, Arc::clone(&pairs), books.lifecycle());
     let kraken = KrakenSpot {
-        channels,
         pairs,
-        books: Books::new(
-            sources,
-            cx.connections.get(),
-            cx.quality.clone(),
-            Timestamp::now(),
-        ),
+        books,
         symbols,
         recorder,
     };
-    collection::run(kraken, cx, tls, JoinSet::new()).await
+    collection::run_slots(spot, kraken, cx, JoinSet::new()).await
 }
 
 /// `BTC/USD` as a file name: a slash would make it a directory.
@@ -65,27 +63,11 @@ fn file_name(pair: &str) -> String {
 
 /// The consumer of Kraken spot's queue, which carries market data only.
 struct KrakenSpot {
-    channels: &'static [&'static str],
     pairs: Arc<[String]>,
     books: Books,
     /// The symbol each pair's file is named after, in the order of `pairs`.
     symbols: Vec<Symbol>,
     recorder: Recorder,
-}
-
-impl Venue for KrakenSpot {
-    fn label(&self) -> &'static str {
-        "krakenspot"
-    }
-
-    fn keep_connection(&self, slot: Slot) -> impl Future<Output = ()> + Send + 'static {
-        connection::keep_connection(
-            self.channels,
-            Arc::clone(&self.pairs),
-            self.books.lifecycle(),
-            slot,
-        )
-    }
 }
 
 impl Consumer for KrakenSpot {
@@ -140,7 +122,6 @@ mod tests {
         );
         let symbols = vec![recorder.symbols.resolve("BTC-USD")];
         let kraken = KrakenSpot {
-            channels: &["book"],
             pairs: Arc::from(["BTC/USD".to_owned()]),
             books: Books::new(
                 vec!["krakenspot/btc-usd".to_owned()],
@@ -161,14 +142,14 @@ mod tests {
         let (mut kraken, mut writer_rx) = kraken(2);
         let lifecycle = kraken.books.lifecycle();
         let _sessions = (
-            Announced::new(
+            Announced::test(
                 Socket {
                     connection: 0,
                     session: 0,
                 },
                 &lifecycle,
             ),
-            Announced::new(
+            Announced::test(
                 Socket {
                     connection: 1,
                     session: 0,

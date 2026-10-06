@@ -14,7 +14,6 @@ pub mod handover;
 mod hyperliquid;
 mod kraken_futures;
 mod kraken_spot;
-mod legacy;
 pub mod quality;
 pub mod readiness;
 pub mod routing;

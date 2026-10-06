@@ -6,47 +6,45 @@
 //! 28 of 241 batches alike across two connections), so it is recorded from
 //! one connection at a time; see [`crate::books`].
 
-mod connection;
+mod protocol;
 
-use std::{future::Future, sync::Arc};
+use std::sync::Arc;
 
 use jiff::Timestamp;
-use rustls::ClientConfig;
 use tokio::task::JoinSet;
 
 use crate::{
     books::Books,
-    collection::{self, Consumer, Context, Recorder, Venue},
+    collection::{self, Consumer, Context, Recorder},
     error::ConnectorError,
-    legacy::Slot,
     routing,
     session::Frame,
 };
 
-pub(crate) use connection::BOOK;
+pub(crate) use protocol::BOOK;
 
 pub(crate) async fn collect(
     channels: &'static [&'static str],
     products: &[String],
     cx: Context,
-    tls: Arc<ClientConfig>,
 ) -> anyhow::Result<()> {
     let products: Arc<[String]> = products
         .iter()
         .map(|product| product.to_ascii_uppercase())
         .collect();
+    let books = Books::new(
+        sources(&products),
+        cx.connections.get(),
+        cx.quality.clone(),
+        Timestamp::now(),
+    );
+    let feed = protocol::Feed::new(Arc::clone(&products), channels, books.lifecycle());
     let coinbase = Coinbase {
         recorder: Recorder::new(cx.writer_tx.clone(), &products, cx.connections),
-        books: Books::new(
-            sources(&products),
-            cx.connections.get(),
-            cx.quality.clone(),
-            Timestamp::now(),
-        ),
+        books,
         products,
-        channels,
     };
-    collection::run(coinbase, cx, tls, JoinSet::new()).await
+    collection::run_slots(feed, coinbase, cx, JoinSet::new()).await
 }
 
 /// Each product's name in quality reports.
@@ -60,24 +58,8 @@ fn sources(products: &[String]) -> Vec<String> {
 /// The consumer of Coinbase's queue, which carries market data only.
 struct Coinbase {
     products: Arc<[String]>,
-    channels: &'static [&'static str],
     recorder: Recorder,
     books: Books,
-}
-
-impl Venue for Coinbase {
-    fn label(&self) -> &'static str {
-        "coinbase"
-    }
-
-    fn keep_connection(&self, slot: Slot) -> impl Future<Output = ()> + Send + 'static {
-        connection::keep_connection(
-            Arc::clone(&self.products),
-            self.channels,
-            self.books.lifecycle(),
-            slot,
-        )
-    }
 }
 
 impl Consumer for Coinbase {
@@ -122,8 +104,6 @@ mod tests {
     use crate::session::Socket;
     use crate::{books::Announced, file::WriteRecord, quality::QualityReporter};
 
-    const CHANNELS: &[&str] = &[BOOK, "matches", "ticker", "heartbeat"];
-
     fn at(time: &str) -> Timestamp {
         time.parse().unwrap()
     }
@@ -144,7 +124,6 @@ mod tests {
                 at("2026-10-05T10:30:00Z"),
             ),
             products,
-            channels: CHANNELS,
         };
         (coinbase, writer_rx)
     }
@@ -207,14 +186,14 @@ mod tests {
         let (mut coinbase, mut writer_rx) = coinbase(2);
         let lifecycle = coinbase.books.lifecycle();
         let _sessions = (
-            Announced::new(
+            Announced::test(
                 Socket {
                     connection: 0,
                     session: 0,
                 },
                 &lifecycle,
             ),
-            Announced::new(
+            Announced::test(
                 Socket {
                     connection: 1,
                     session: 0,

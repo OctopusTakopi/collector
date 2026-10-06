@@ -2,17 +2,13 @@
 //! redundant connections feeding a shared queue, drained by a single consumer
 //! into the writer.
 
-use std::{future::Future, num::NonZeroUsize, sync::Arc, time::Duration};
+use std::{future::Future, num::NonZeroUsize, sync::Arc};
 
 use bytes::Bytes;
 use clap::ValueEnum;
 use jiff::Timestamp;
-use rustls::ClientConfig;
 use tokio::{
-    sync::{
-        mpsc::{self, Sender},
-        watch,
-    },
+    sync::{mpsc::Sender, watch},
     task::JoinSet,
 };
 use tracing::error;
@@ -24,22 +20,11 @@ use crate::{
     feed::{BackgroundResult, Feed},
     file::WriteRecord,
     hyperliquid, kraken_futures, kraken_spot,
-    legacy::Slot,
     quality::QualityReporter,
     readiness::Readiness,
     session::{self, Frame, Protocol},
     symbol::{Symbol, SymbolCache},
-    ws,
 };
-
-/// Queue room per connection: the queue is shared, so redundancy does not
-/// shrink the burst each connection can absorb.
-const WS_QUEUE_CAPACITY: usize = 16_384;
-
-/// Redundant connections are opened this far apart. Simultaneous handshakes
-/// are what a venue's connection rate limit notices, and connections opened
-/// together tend to be recycled together.
-const CONNECT_STAGGER: Duration = Duration::from_secs(5);
 
 /// An exchange the collector records, as named on the command line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -121,11 +106,10 @@ impl Exchange {
 
     /// Records `symbols` until shutdown or a critical failure.
     pub async fn collect(self, symbols: Vec<String>, cx: Context) -> anyhow::Result<()> {
-        let tls = ws::tls_config();
         futures_util::future::try_join_all(
             self.workers()
                 .into_iter()
-                .map(|worker| worker.collect(&symbols, cx.clone(), Arc::clone(&tls))),
+                .map(|worker| worker.collect(&symbols, cx.clone())),
         )
         .await?;
         Ok(())
@@ -161,21 +145,16 @@ enum Worker {
 }
 
 impl Worker {
-    async fn collect(
-        self,
-        symbols: &[String],
-        cx: Context,
-        tls: Arc<ClientConfig>,
-    ) -> anyhow::Result<()> {
+    async fn collect(self, symbols: &[String], cx: Context) -> anyhow::Result<()> {
         match self {
             Self::Binance(endpoint, streams) => {
                 binance::collect(endpoint, &streams, symbols, cx).await
             }
             Self::Bybit(topics) => bybit::collect(topics, symbols, cx).await,
             Self::Hyperliquid(kinds) => hyperliquid::collect(kinds, symbols, cx).await,
-            Self::Coinbase(channels) => coinbase::collect(channels, symbols, cx, tls).await,
-            Self::KrakenSpot(channels) => kraken_spot::collect(channels, symbols, cx, tls).await,
-            Self::KrakenFutures(feeds) => kraken_futures::collect(feeds, symbols, cx, tls).await,
+            Self::Coinbase(channels) => coinbase::collect(channels, symbols, cx).await,
+            Self::KrakenSpot(channels) => kraken_spot::collect(channels, symbols, cx).await,
+            Self::KrakenFutures(feeds) => kraken_futures::collect(feeds, symbols, cx).await,
         }
     }
 }
@@ -194,15 +173,6 @@ pub struct Context {
 /// whichever connection it came.
 pub(crate) trait Consumer {
     fn handle(&mut self, frame: Frame) -> impl Future<Output = Result<(), ConnectorError>> + Send;
-}
-
-/// A venue still on [`crate::legacy`]'s reconnect loop.
-pub(crate) trait Venue: Consumer {
-    /// Names the endpoint in logs and errors.
-    fn label(&self) -> &'static str;
-
-    /// Keeps one connection slot filled until the queue closes.
-    fn keep_connection(&self, slot: Slot) -> impl Future<Output = ()> + Send + 'static;
 }
 
 /// Consumer state every venue shares: duplicate suppression across redundant
@@ -241,40 +211,6 @@ impl Recorder {
             .await
             .map_err(|_| ConnectorError::WriterClosed)
     }
-}
-
-/// Runs `venue` until shutdown has drained its queue, or until a task in
-/// `tasks` or a connection supervisor fails.
-pub(crate) async fn run<V: Venue>(
-    venue: V,
-    cx: Context,
-    tls: Arc<ClientConfig>,
-    mut tasks: JoinSet<BackgroundResult>,
-) -> anyhow::Result<()> {
-    let connections = cx.connections.get();
-    let (tx, rx) = mpsc::channel(WS_QUEUE_CAPACITY * connections);
-    for connection in 0..connections {
-        let supervisor = venue.keep_connection(Slot {
-            connection,
-            tx: tx.clone(),
-            tls: Arc::clone(&tls),
-            quality: cx.quality.clone(),
-            readiness: cx.readiness.clone(),
-        });
-        let label = venue.label();
-        tasks.spawn(async move {
-            tokio::time::sleep(CONNECT_STAGGER * connection as u32).await;
-            supervisor.await;
-            Err(anyhow::anyhow!(
-                "{label} connection supervisor {connection} exited"
-            ))
-        });
-    }
-    // Only the connections may keep the queue open, or `Feed` never sees it
-    // close.
-    drop(tx);
-    let label = venue.label();
-    consume(venue, label, Feed::new(rx, cx.shutdown), tasks).await
 }
 
 /// Runs `protocol`'s connection slots, and `consumer` on the queue they

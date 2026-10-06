@@ -7,30 +7,27 @@
 //! and a break in that connection's `seq` hands the book over too; so is the
 //! ticker, a sample. Trades carry their own ids and are kept once by payload.
 
-mod connection;
+mod protocol;
 
-use std::{future::Future, sync::Arc};
+use std::sync::Arc;
 
 use jiff::Timestamp;
-use rustls::ClientConfig;
 use tokio::task::JoinSet;
 
 use crate::{
     books::Books,
-    collection::{self, Consumer, Context, Recorder, Venue},
+    collection::{self, Consumer, Context, Recorder},
     error::ConnectorError,
-    legacy::Slot,
     routing,
     session::{Frame, Socket},
 };
 
-pub(crate) use connection::BOOK;
+pub(crate) use protocol::BOOK;
 
 pub(crate) async fn collect(
     feeds: &'static [&'static str],
     products: &[String],
     cx: Context,
-    tls: Arc<ClientConfig>,
 ) -> anyhow::Result<()> {
     let products: Arc<[String]> = products
         .iter()
@@ -40,45 +37,30 @@ pub(crate) async fn collect(
         .iter()
         .map(|product| format!("krakenfutures/{}", product.to_ascii_lowercase()))
         .collect();
+    let books = Books::new(
+        sources,
+        cx.connections.get(),
+        cx.quality.clone(),
+        Timestamp::now(),
+    );
+    let futures = protocol::Futures::new(feeds, Arc::clone(&products), books.lifecycle());
     let kraken = KrakenFutures {
         recorder: Recorder::new(cx.writer_tx.clone(), &products, cx.connections),
-        books: Books::new(
-            sources,
-            cx.connections.get(),
-            cx.quality.clone(),
-            Timestamp::now(),
-        ),
+        books,
         chain: vec![None; products.len()],
-        feeds,
         products,
     };
-    collection::run(kraken, cx, tls, JoinSet::new()).await
+    collection::run_slots(futures, kraken, cx, JoinSet::new()).await
 }
 
 /// The consumer of Kraken Futures' queue, which carries market data only.
 struct KrakenFutures {
-    feeds: &'static [&'static str],
     products: Arc<[String]>,
     recorder: Recorder,
     books: Books,
     /// Per product: the last book `seq` recorded, from the leader's snapshot
     /// on.
     chain: Vec<Option<i64>>,
-}
-
-impl Venue for KrakenFutures {
-    fn label(&self) -> &'static str {
-        "krakenfutures"
-    }
-
-    fn keep_connection(&self, slot: Slot) -> impl Future<Output = ()> + Send + 'static {
-        connection::keep_connection(
-            self.feeds,
-            Arc::clone(&self.products),
-            self.books.lifecycle(),
-            slot,
-        )
-    }
 }
 
 impl Consumer for KrakenFutures {
@@ -153,7 +135,11 @@ mod tests {
     use tokio::sync::mpsc::{Receiver, channel};
 
     use super::*;
-    use crate::{books::Announced, file::WriteRecord, quality::QualityReporter};
+    use crate::{
+        books::{self, Announced},
+        file::WriteRecord,
+        quality::QualityReporter,
+    };
 
     fn kraken(connections: usize) -> (KrakenFutures, Receiver<WriteRecord>) {
         let (writer_tx, writer_rx) = channel(16);
@@ -171,7 +157,6 @@ mod tests {
                 Timestamp::now(),
             ),
             chain: vec![None],
-            feeds: &[BOOK],
             products,
         };
         (kraken, writer_rx)
@@ -216,14 +201,14 @@ mod tests {
         let (mut kraken, mut writer_rx) = kraken(2);
         let lifecycle = kraken.books.lifecycle();
         let _sessions = (
-            Announced::new(
+            Announced::test(
                 Socket {
                     connection: 0,
                     session: 0,
                 },
                 &lifecycle,
             ),
-            Announced::new(
+            Announced::test(
                 Socket {
                     connection: 1,
                     session: 0,
@@ -252,7 +237,7 @@ mod tests {
     async fn a_break_on_the_leader_waits_for_a_fresh_snapshot() {
         let (mut kraken, mut writer_rx) = kraken(1);
         let lifecycle = kraken.books.lifecycle();
-        let (_session, mut commands) = Announced::new(
+        let (_session, mut commands) = Announced::test(
             Socket {
                 connection: 0,
                 session: 0,
@@ -269,7 +254,7 @@ mod tests {
         }
         kraken.handle(Frame::on(0, delta(103))).await.unwrap();
         kraken.handle(Frame::on(0, delta(104))).await.unwrap();
-        assert_eq!(commands.try_recv(), Ok(crate::books::Resnapshot(0)));
+        assert_eq!(books::asked(&mut commands), Some(0));
         kraken.handle(Frame::on(0, snapshot(110))).await.unwrap();
         kraken.handle(Frame::on(0, delta(111))).await.unwrap();
 

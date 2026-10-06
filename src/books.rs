@@ -14,19 +14,15 @@
 //! only by its reconnects and its own breaks. A session that replaces the
 //! leader on its own slot takes the book over at its first snapshot.
 
-use std::{collections::VecDeque, time::Duration};
+use std::sync::Arc;
 
 use jiff::{SignedDuration, Timestamp};
-use tokio::{
-    sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
-    time::{Instant, Interval, MissedTickBehavior},
-};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tracing::{error, info, warn};
 
 use crate::{
     quality::{QualityEvent, QualityReporter},
-    session::{SessionId, Socket},
-    ws::FrameSender,
+    session::{Later, SessionId, Socket},
 };
 
 /// How long a requested snapshot may take before it is asked for again. One
@@ -35,21 +31,35 @@ use crate::{
 const RESNAPSHOT_TIMEOUT: SignedDuration = SignedDuration::from_secs(30);
 
 /// A session starting or ending.
-#[derive(Debug)]
 pub(crate) enum Lifecycle {
     Opened {
         socket: Socket,
-        commands: UnboundedSender<Resnapshot>,
+        resubscriber: Resubscriber,
     },
     Closed {
         socket: Socket,
     },
 }
 
-/// Asks a session to subscribe one product's book again (by its index), so a
-/// fresh snapshot follows.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) struct Resnapshot(pub(crate) usize);
+/// Asks one session to subscribe a product's book again, so a fresh
+/// snapshot follows: the venue's unsubscribe and subscribe for the product,
+/// through the session's later requests.
+pub(crate) struct Resubscriber {
+    requests: UnboundedSender<Later>,
+    /// Per product, its unsubscribe and subscribe as the venue spells them.
+    texts: Arc<[[String; 2]]>,
+}
+
+impl Resubscriber {
+    /// Asks for `product`'s book again; `false` once the session is gone.
+    fn ask(&self, product: usize) -> bool {
+        self.texts.get(product).is_some_and(|texts| {
+            texts
+                .iter()
+                .all(|text| self.requests.send(Later::now(text.clone())).is_ok())
+        })
+    }
+}
 
 /// A session's side: announces the session, and its end once dropped, which
 /// is as soon as it ends.
@@ -59,14 +69,19 @@ pub(crate) struct Announced {
 }
 
 impl Announced {
-    /// Announces a session on `socket`; the receiver gets what the consumer
-    /// asks of it.
+    /// Announces a session on `socket`, which `texts` re-subscribes product
+    /// by product; the receiver is the session's later requests.
     pub(crate) fn new(
         socket: Socket,
         lifecycle: &UnboundedSender<Lifecycle>,
-    ) -> (Self, UnboundedReceiver<Resnapshot>) {
-        let (commands, received) = unbounded_channel();
-        let _ = lifecycle.send(Lifecycle::Opened { socket, commands });
+        texts: Arc<[[String; 2]]>,
+    ) -> (Self, UnboundedReceiver<Later>) {
+        let (requests, received) = unbounded_channel();
+        let resubscriber = Resubscriber { requests, texts };
+        let _ = lifecycle.send(Lifecycle::Opened {
+            socket,
+            resubscriber,
+        });
         let announced = Self {
             socket,
             lifecycle: lifecycle.clone(),
@@ -80,60 +95,6 @@ impl Drop for Announced {
         let _ = self.lifecycle.send(Lifecycle::Closed {
             socket: self.socket,
         });
-    }
-}
-
-/// Everything a session of a venue under book leadership writes: its
-/// subscribes, then the book re-subscriptions the consumer asks for, all
-/// `pace` apart, and `ping` on its interval for a venue that wants one.
-/// `resubscribe` turns a product into its unsubscribe and subscribe. Returns
-/// only once the socket can no longer be written to.
-pub(crate) async fn control_loop(
-    sender: FrameSender,
-    pace: Duration,
-    ping: Option<(Duration, &'static str)>,
-    subscribes: impl IntoIterator<Item = String>,
-    mut commands: UnboundedReceiver<Resnapshot>,
-    resubscribe: impl Fn(usize) -> Option<[String; 2]>,
-) {
-    let interval = |start, period| {
-        let mut interval = tokio::time::interval_at(start, period);
-        interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        interval
-    };
-    let now = Instant::now();
-    let mut pacer = interval(now, pace);
-    let mut pinger = ping.map(|(period, _)| interval(now + period, period));
-    let mut outbox: VecDeque<String> = subscribes.into_iter().collect();
-
-    loop {
-        tokio::select! {
-            () = tick(pinger.as_mut()) => {
-                let (_, payload) = ping.expect("only a ping interval ticks");
-                if sender.text(payload).await.is_err() {
-                    return;
-                }
-            }
-            _ = pacer.tick(), if !outbox.is_empty() => {
-                let message = outbox.pop_front().expect("the outbox is not empty");
-                if sender.text(message).await.is_err() {
-                    return;
-                }
-            }
-            Some(Resnapshot(product)) = commands.recv() => {
-                outbox.extend(resubscribe(product).into_iter().flatten());
-            }
-        }
-    }
-}
-
-/// The next tick of `interval`, or never without one.
-async fn tick(interval: Option<&mut Interval>) {
-    match interval {
-        Some(interval) => {
-            interval.tick().await;
-        }
-        None => std::future::pending().await,
     }
 }
 
@@ -153,7 +114,7 @@ struct Pending {
 /// A connection slot's newest live session.
 struct Session {
     id: SessionId,
-    commands: UnboundedSender<Resnapshot>,
+    resubscriber: Resubscriber,
 }
 
 /// Which socket each product's book is recorded from. Products are indices
@@ -250,13 +211,16 @@ impl Books {
 
     fn on_lifecycle(&mut self, event: Lifecycle, now: Timestamp) {
         match event {
-            Lifecycle::Opened { socket, commands } => {
+            Lifecycle::Opened {
+                socket,
+                resubscriber,
+            } => {
                 let Some(session) = self.sessions.get_mut(socket.connection) else {
                     return;
                 };
                 *session = Some(Session {
                     id: socket.session,
-                    commands,
+                    resubscriber,
                 });
                 // A replacement on the leader's own slot takes the book over
                 // at its first snapshot, while the leader keeps recording.
@@ -412,7 +376,7 @@ impl Books {
         let mut asked = None;
         for connection in candidates {
             if let Some(Some(session)) = self.sessions.get(connection)
-                && session.commands.send(Resnapshot(product)).is_ok()
+                && session.resubscriber.ask(product)
             {
                 asked = Some(Socket {
                     connection,
@@ -446,6 +410,42 @@ impl Books {
     }
 }
 
+/// Re-subscription texts tests can read back: `unsub-<product>` and
+/// `sub-<product>`.
+#[cfg(test)]
+fn test_texts() -> Arc<[[String; 2]]> {
+    (0..8)
+        .map(|product| [format!("unsub-{product}"), format!("sub-{product}")])
+        .collect()
+}
+
+#[cfg(test)]
+impl Announced {
+    /// Announces `socket` with [`test_texts`].
+    pub(crate) fn test(
+        socket: Socket,
+        lifecycle: &UnboundedSender<Lifecycle>,
+    ) -> (Self, UnboundedReceiver<Later>) {
+        Self::new(socket, lifecycle, test_texts())
+    }
+}
+
+/// The product a session announced with [`Announced::test`] was asked to
+/// subscribe again, if any.
+#[cfg(test)]
+pub(crate) fn asked(requests: &mut UnboundedReceiver<Later>) -> Option<usize> {
+    let unsubscribe = requests.try_recv().ok()?;
+    let subscribe = requests.try_recv().unwrap();
+    let product = subscribe
+        .text
+        .strip_prefix("sub-")
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(unsubscribe.text, format!("unsub-{product}"));
+    Some(product)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -473,9 +473,9 @@ mod tests {
 
     impl Books {
         /// Opens a session on `socket`; returns the guard that closes it and
-        /// what it is asked to do.
-        fn open(&self, socket: Socket) -> (Announced, UnboundedReceiver<Resnapshot>) {
-            Announced::new(socket, &self.lifecycle_tx)
+        /// what it is asked to send.
+        fn open(&self, socket: Socket) -> (Announced, UnboundedReceiver<Later>) {
+            Announced::test(socket, &self.lifecycle_tx)
         }
 
         fn snapshot(&mut self, socket: Socket, time: &str) -> bool {
@@ -518,7 +518,7 @@ mod tests {
 
         drop(s0);
         assert!(!books.update(on(1, 0), "2026-10-05T10:30:10Z"));
-        assert_eq!(c1.try_recv(), Ok(Resnapshot(0)));
+        assert_eq!(asked(&mut c1), Some(0));
         assert!(books.snapshot(on(1, 0), "2026-10-05T10:30:10.8Z"));
         assert!(books.update(on(1, 0), "2026-10-05T10:30:11Z"));
 
@@ -551,7 +551,7 @@ mod tests {
 
         drop(s0);
         assert!(!books.snapshot(on(0, 0), "2026-10-05T10:30:01Z"));
-        assert_eq!(c1.try_recv(), Ok(Resnapshot(0)));
+        assert_eq!(asked(&mut c1), Some(0));
         assert!(books.snapshot(on(1, 0), "2026-10-05T10:30:02Z"));
     }
 
@@ -565,22 +565,22 @@ mod tests {
         let (_s1, mut c1) = books.open(on(1, 0));
         assert!(books.snapshot(on(0, 0), "2026-10-05T10:30:00Z"));
         assert!(books.update(on(0, 0), "2026-10-05T10:59:59Z"));
-        assert!(c1.try_recv().is_err());
+        assert!(asked(&mut c1).is_none());
 
         assert!(books.update(on(0, 0), "2026-10-05T11:00:00Z"));
-        assert_eq!(c1.try_recv(), Ok(Resnapshot(0)));
+        assert_eq!(asked(&mut c1), Some(0));
         assert!(books.update(on(0, 0), "2026-10-05T11:00:00.5Z"));
         assert!(books.snapshot(on(1, 0), "2026-10-05T11:00:00.9Z"));
         assert!(!books.update(on(0, 0), "2026-10-05T11:00:01Z"));
         assert!(books.update(on(1, 0), "2026-10-05T11:00:01Z"));
-        assert!(c0.try_recv().is_err(), "the leader is never asked");
+        assert!(asked(&mut c0).is_none(), "the leader is never asked");
         assert!(events.try_recv().is_err(), "a handover is not a hole");
 
         // The next one comes an hour later, back to connection 0.
         assert!(books.update(on(1, 0), "2026-10-05T11:59:59Z"));
-        assert!(c0.try_recv().is_err());
+        assert!(asked(&mut c0).is_none());
         assert!(books.update(on(1, 0), "2026-10-05T12:00:00Z"));
-        assert_eq!(c0.try_recv(), Ok(Resnapshot(0)));
+        assert_eq!(asked(&mut c0), Some(0));
     }
 
     /// A lone connection has nobody to hand over to; its reconnect's own
@@ -591,7 +591,7 @@ mod tests {
         let (s0, mut c0) = books.open(on(0, 0));
         assert!(books.snapshot(on(0, 0), "2026-10-05T10:30:00Z"));
         assert!(books.update(on(0, 0), "2026-10-05T11:00:01Z"));
-        assert!(c0.try_recv().is_err(), "a handover never asks the leader");
+        assert!(asked(&mut c0).is_none(), "a handover never asks the leader");
 
         drop(s0);
         let (_s1, _c1) = books.open(on(0, 1));
@@ -610,13 +610,13 @@ mod tests {
         assert!(books.snapshot(on(0, 0), "2026-10-05T10:30:00Z"));
         drop(s0);
         assert!(!books.update(on(1, 0), "2026-10-05T10:30:01Z"));
-        assert_eq!(c1.try_recv(), Ok(Resnapshot(0)));
+        assert_eq!(asked(&mut c1), Some(0));
 
         assert!(!books.update(on(2, 0), "2026-10-05T10:30:30Z"));
-        assert!(c2.try_recv().is_err(), "the request is not due yet");
+        assert!(asked(&mut c2).is_none(), "the request is not due yet");
         assert!(!books.update(on(2, 0), "2026-10-05T10:30:31Z"));
-        assert_eq!(c2.try_recv(), Ok(Resnapshot(0)));
-        assert!(c1.try_recv().is_err());
+        assert_eq!(asked(&mut c2), Some(0));
+        assert!(asked(&mut c1).is_none());
         assert!(books.snapshot(on(2, 0), "2026-10-05T10:30:32Z"));
     }
 
@@ -627,15 +627,18 @@ mod tests {
         let (_s0, mut c0) = books.open(on(0, 0));
         assert!(books.snapshot(on(0, 0), "2026-10-05T10:30:00Z"));
         books.broken(on(0, 0), 0, at("2026-10-05T10:30:30Z"));
-        assert_eq!(c0.try_recv(), Ok(Resnapshot(0)));
+        assert_eq!(asked(&mut c0), Some(0));
 
         for time in ["2026-10-05T10:31:00Z", "2026-10-05T10:31:30Z"] {
             assert!(!books.update(on(0, 0), time));
-            assert_eq!(c0.try_recv(), Ok(Resnapshot(0)), "{time}");
+            assert_eq!(asked(&mut c0), Some(0), "{time}");
         }
         assert!(books.snapshot(on(0, 0), "2026-10-05T10:31:31Z"));
         assert!(books.update(on(0, 0), "2026-10-05T10:32:01Z"));
-        assert!(c0.try_recv().is_err(), "an answered request is not renewed");
+        assert!(
+            asked(&mut c0).is_none(),
+            "an answered request is not renewed"
+        );
     }
 
     /// A handover nobody answers lapses until the next hour; the leader keeps
@@ -647,11 +650,11 @@ mod tests {
         let (_s1, mut c1) = books.open(on(1, 0));
         assert!(books.snapshot(on(0, 0), "2026-10-05T10:30:00Z"));
         assert!(books.update(on(0, 0), "2026-10-05T11:00:00Z"));
-        assert_eq!(c1.try_recv(), Ok(Resnapshot(0)));
+        assert_eq!(asked(&mut c1), Some(0));
 
         assert!(books.update(on(0, 0), "2026-10-05T11:00:31Z"));
         assert!(books.update(on(0, 0), "2026-10-05T11:30:00Z"));
-        assert!(c0.try_recv().is_err() && c1.try_recv().is_err());
+        assert!(asked(&mut c0).is_none() && asked(&mut c1).is_none());
     }
 
     /// A broken chain stops the leader's book; another connection is asked
@@ -672,8 +675,8 @@ mod tests {
 
         books.broken(on(0, 0), 0, at("2026-10-05T10:30:02Z"));
         assert!(!books.update(on(0, 0), "2026-10-05T10:30:02Z"));
-        assert_eq!(c1.try_recv(), Ok(Resnapshot(0)));
-        assert!(c0.try_recv().is_err());
+        assert_eq!(asked(&mut c1), Some(0));
+        assert!(asked(&mut c0).is_none());
         assert!(books.snapshot(on(1, 0), "2026-10-05T10:30:03Z"));
         assert!(matches!(
             events.try_recv(),
@@ -714,7 +717,7 @@ mod tests {
         assert!(!books.snapshot(on(0, 0), "2026-10-05T10:30:00Z"));
         assert!(books.snapshot(on(0, 1), "2026-10-05T10:30:01Z"));
         books.broken(on(0, 1), 0, at("2026-10-05T10:30:02Z"));
-        assert_eq!(c1.try_recv(), Ok(Resnapshot(0)), "the newest is asked");
+        assert_eq!(asked(&mut c1), Some(0), "the newest is asked");
     }
 
     #[test]
@@ -730,45 +733,6 @@ mod tests {
         assert_eq!(
             next_hour(at("2026-10-05T23:59:59.9Z")),
             at("2026-10-06T00:00:00Z")
-        );
-    }
-
-    /// Subscribes go first, then a re-subscription per request, all paced;
-    /// pings come on their own interval.
-    #[tokio::test(start_paused = true)]
-    async fn the_control_loop_paces_subscribes_and_resubscriptions() {
-        let start = Instant::now();
-        let (conn, mut server) = crate::ws::duplex_pair();
-        let (commands_tx, commands) = unbounded_channel();
-        commands_tx.send(Resnapshot(7)).unwrap();
-        let control = tokio::spawn(control_loop(
-            conn.sender(),
-            Duration::from_millis(100),
-            Some((Duration::from_secs(30), "ping")),
-            ["sub-a".to_owned(), "sub-b".to_owned()],
-            commands,
-            |product| Some([format!("unsub-{product}"), format!("sub-{product}")]),
-        ));
-
-        let mut sent = Vec::new();
-        for _ in 0..6 {
-            let frame = server.read_frame().await.unwrap();
-            sent.push((
-                String::from_utf8(frame.payload.to_vec()).unwrap(),
-                start.elapsed().as_millis(),
-            ));
-        }
-        control.abort();
-        assert_eq!(
-            sent,
-            [
-                ("sub-a".to_owned(), 0),
-                ("sub-b".to_owned(), 100),
-                ("unsub-7".to_owned(), 200),
-                ("sub-7".to_owned(), 300),
-                ("ping".to_owned(), 30_000),
-                ("ping".to_owned(), 60_000),
-            ]
         );
     }
 }

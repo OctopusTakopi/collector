@@ -1,18 +1,18 @@
-//! One Kraken spot connection slot (websocket v2): a subscribe per channel
+//! Kraken spot's websocket v2 on the slot supervisor: a subscribe per channel
 //! for every pair, answered pair by pair, an application ping, and the book
 //! re-subscriptions the consumer asks for (see [`crate::books`]).
 
-use std::{borrow::Cow, future::Future, sync::Arc, time::Duration};
+use std::{borrow::Cow, sync::Arc, time::Duration};
 
+use hyper::header::HeaderMap;
 use serde::Deserialize;
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
-use tracing::{error, info, warn};
+use tokio::sync::mpsc::UnboundedSender;
+use tracing::{error, warn};
 
 use crate::{
-    books::{self, Announced, Lifecycle, Resnapshot},
-    legacy::{self, Lost, Protocol, Slot},
+    books::{Announced, Lifecycle},
     routing,
-    ws::FrameSender,
+    session::{Handshake, Keepalive, Protocol, Requests, Session, Socket, Verdict},
 };
 
 const URL: &str = "wss://ws.kraken.com/v2";
@@ -26,27 +26,6 @@ const BOOK_DEPTH: u32 = 1_000;
 /// Channels whose messages are market data; `status`, `heartbeat` and the
 /// answers to requests are not.
 const MARKET_CHANNELS: [&str; 3] = ["book", "trade", "ticker"];
-
-pub(super) async fn keep_connection(
-    channels: &'static [&'static str],
-    pairs: Arc<[String]>,
-    lifecycle: UnboundedSender<Lifecycle>,
-    slot: Slot,
-) {
-    let connection = slot.connection;
-    info!(
-        pairs = pairs.len(),
-        connection, "connecting to the Kraken spot websocket"
-    );
-    legacy::keep_subscribed("krakenspot", URL, IDLE_TIMEOUT, slot, |socket, sender| {
-        let (announced, commands) = Announced::new(socket, &lifecycle);
-        (
-            Subscriptions::new(connection, channels, Arc::clone(&pairs), announced),
-            control_loop(sender, channels, Arc::clone(&pairs), commands),
-        )
-    })
-    .await;
-}
 
 /// A request for `channel` on every pair; `req_id` is the channel's index.
 ///
@@ -67,6 +46,85 @@ fn request(method: &str, channel: &str, pairs: &[String], req_id: usize) -> Stri
         "req_id": req_id,
     })
     .to_string()
+}
+
+/// Every channel of every pair, the books under leadership.
+pub(super) struct Spot {
+    channels: &'static [&'static str],
+    pairs: Arc<[String]>,
+    lifecycle: UnboundedSender<Lifecycle>,
+    /// Per pair, the unsubscribe and subscribe of its book.
+    resubscribe: Arc<[[String; 2]]>,
+}
+
+impl Spot {
+    pub(super) fn new(
+        channels: &'static [&'static str],
+        pairs: Arc<[String]>,
+        lifecycle: UnboundedSender<Lifecycle>,
+    ) -> Self {
+        let book = channels.iter().position(|&channel| channel == "book");
+        let resubscribe = match book {
+            Some(book) => pairs
+                .iter()
+                .map(|pair| {
+                    let pair = std::slice::from_ref(pair);
+                    [
+                        request("unsubscribe", "book", pair, book),
+                        request("subscribe", "book", pair, book),
+                    ]
+                })
+                .collect(),
+            None => Arc::from([]),
+        };
+        Self {
+            channels,
+            pairs,
+            lifecycle,
+            resubscribe,
+        }
+    }
+}
+
+impl Protocol for Spot {
+    type Session = Subscriptions;
+
+    fn label(&self) -> &'static str {
+        "krakenspot"
+    }
+
+    fn handshake(&self) -> anyhow::Result<Handshake<'_>> {
+        Ok(Handshake {
+            url: URL,
+            headers: HeaderMap::new(),
+        })
+    }
+
+    fn idle_timeout(&self) -> Duration {
+        IDLE_TIMEOUT
+    }
+
+    fn open(&self, socket: Socket) -> (Subscriptions, Requests) {
+        let (announced, later) =
+            Announced::new(socket, &self.lifecycle, Arc::clone(&self.resubscribe));
+        let requests = Requests {
+            initial: self
+                .channels
+                .iter()
+                .enumerate()
+                .map(|(req_id, channel)| request("subscribe", channel, &self.pairs, req_id))
+                .collect(),
+            pace: SUBSCRIBE_PACE,
+            keepalive: Some(Keepalive {
+                every: PING_INTERVAL,
+                text: PING,
+            }),
+            later: Some(later),
+        };
+        let subscriptions =
+            Subscriptions::new(socket, self.channels, Arc::clone(&self.pairs), announced);
+        (subscriptions, requests)
+    }
 }
 
 #[derive(Deserialize)]
@@ -92,59 +150,65 @@ struct Subscribed<'a> {
     symbol: Cow<'a, str>,
 }
 
-/// The read side of one session's subscriptions.
-struct Subscriptions {
-    connection: usize,
+/// One session's subscriptions, and its announcement to the books.
+pub(super) struct Subscriptions {
+    socket: Socket,
     channels: &'static [&'static str],
     pairs: Arc<[String]>,
     /// Per channel, per pair: acknowledged once; a book re-subscription does
     /// not undo it.
     acked: Vec<bool>,
-    /// A pair rejected while subscribing is not coming back on this session;
-    /// it stays unready rather than retire an incumbent onto a partial feed.
-    /// A later rejection answers a book re-subscription, which the consumer
-    /// renews or lets lapse.
+    /// How many are acknowledged.
+    complete: usize,
+    /// A pair rejected while subscribing is not coming back on this session:
+    /// it settles incomplete. A later rejection answers a book
+    /// re-subscription, which the consumer renews or lets lapse.
     rejected: bool,
     _announced: Announced,
 }
 
 impl Subscriptions {
     fn new(
-        connection: usize,
+        socket: Socket,
         channels: &'static [&'static str],
         pairs: Arc<[String]>,
         announced: Announced,
     ) -> Self {
         Self {
-            connection,
+            socket,
             acked: vec![false; channels.len() * pairs.len()],
+            complete: 0,
             channels,
             pairs,
             rejected: false,
             _announced: announced,
         }
     }
+
+    fn all_acked(&self) -> bool {
+        self.complete == self.acked.len()
+    }
 }
 
-impl Protocol for Subscriptions {
-    fn is_control(&self, payload: &[u8]) -> bool {
-        !routing::kraken_channel(payload).is_some_and(|channel| MARKET_CHANNELS.contains(&channel))
+impl Session for Subscriptions {
+    fn is_control(&self, text: &[u8]) -> bool {
+        !routing::kraken_channel(text).is_some_and(|channel| MARKET_CHANNELS.contains(&channel))
     }
 
-    fn control(&mut self, payload: &[u8]) -> Result<(), Lost> {
+    fn on_control(&mut self, text: &[u8]) -> Verdict {
         // `heartbeat` and `status` need no answer.
-        if routing::kraken_channel(payload).is_some() {
-            return Ok(());
+        if routing::kraken_channel(text).is_some() {
+            return Verdict::Continue;
         }
-        let answer: Answer<'_> = match serde_json::from_slice(payload) {
+        let answer: Answer<'_> = match serde_json::from_slice(text) {
             Ok(answer) => answer,
             Err(error) => {
-                warn!(%error, payload = %String::from_utf8_lossy(payload), "unreadable Kraken spot answer");
-                return Ok(());
+                warn!(%error, text = %String::from_utf8_lossy(text), "unreadable Kraken spot answer");
+                return Verdict::Continue;
             }
         };
         if answer.method.as_deref() != Some("subscribe") {
-            return Ok(());
+            return Verdict::Continue;
         }
         match (answer.success, answer.result) {
             (Some(true), Some(subscribed)) => {
@@ -157,12 +221,15 @@ impl Protocol for Subscriptions {
                     .iter()
                     .position(|pair| *pair == subscribed.symbol);
                 if let (Some(channel), Some(pair)) = (channel, pair) {
-                    self.acked[channel * self.pairs.len() + pair] = true;
+                    let acked = &mut self.acked[channel * self.pairs.len() + pair];
+                    if !std::mem::replace(acked, true) {
+                        self.complete += 1;
+                    }
                 }
             }
             _ => {
                 error!(
-                    connection = self.connection,
+                    connection = self.socket.connection,
                     channel = answer
                         .req_id
                         .and_then(|req_id| self.channels.get(req_id).copied()),
@@ -170,67 +237,42 @@ impl Protocol for Subscriptions {
                     error = answer.error.as_deref(),
                     "Kraken rejected a subscription; the other subscriptions keep streaming"
                 );
-                self.rejected |= !self.subscribed();
+                self.rejected |= !self.all_acked();
             }
         }
-        Ok(())
+        Verdict::Continue
     }
 
-    fn subscribed(&self) -> bool {
-        !self.rejected && self.acked.iter().all(|&acked| acked)
+    fn settled(&self) -> bool {
+        self.rejected || self.all_acked()
     }
-}
 
-/// Everything one session writes: a subscribe per channel, then the book
-/// re-subscriptions the consumer asks for, all paced, and a ping on its
-/// interval.
-fn control_loop(
-    sender: FrameSender,
-    channels: &'static [&'static str],
-    pairs: Arc<[String]>,
-    commands: UnboundedReceiver<Resnapshot>,
-) -> impl Future<Output = ()> {
-    let subscribes: Vec<String> = channels
-        .iter()
-        .enumerate()
-        .map(|(req_id, channel)| request("subscribe", channel, &pairs, req_id))
-        .collect();
-    let book = channels.iter().position(|&channel| channel == "book");
-    books::control_loop(
-        sender,
-        SUBSCRIBE_PACE,
-        Some((PING_INTERVAL, PING)),
-        subscribes,
-        commands,
-        move |pair| {
-            let (book, pair) = (book?, pairs.get(pair)?);
-            let pair = std::slice::from_ref(pair);
-            Some([
-                request("unsubscribe", "book", pair, book),
-                request("subscribe", "book", pair, book),
-            ])
-        },
-    )
+    fn complete(&self) -> bool {
+        !self.rejected && self.all_acked()
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use tokio::sync::mpsc::UnboundedReceiver;
+
     use super::*;
-    use crate::session::Socket;
 
     const CHANNELS: &[&str] = &["book", "trade", "ticker"];
 
-    fn subscriptions() -> Subscriptions {
+    fn spot() -> (Spot, UnboundedReceiver<Lifecycle>) {
         let pairs: Arc<[String]> = Arc::from(["BTC/USD".to_owned(), "DOGE/USD".to_owned()]);
-        let (lifecycle, _) = tokio::sync::mpsc::unbounded_channel();
-        let (announced, _commands) = Announced::new(
-            Socket {
-                connection: 0,
-                session: 0,
-            },
-            &lifecycle,
-        );
-        Subscriptions::new(0, CHANNELS, pairs, announced)
+        let (lifecycle, lifecycle_rx) = tokio::sync::mpsc::unbounded_channel();
+        (Spot::new(CHANNELS, pairs, lifecycle), lifecycle_rx)
+    }
+
+    fn subscriptions() -> Subscriptions {
+        let (spot, _) = spot();
+        spot.open(Socket {
+            connection: 0,
+            session: 0,
+        })
+        .0
     }
 
     fn ack(channel: &str, pair: &str) -> String {
@@ -259,6 +301,31 @@ mod tests {
         assert_eq!(value("ticker", 2)["params"]["event_trigger"], "bbo");
     }
 
+    /// A session subscribes each channel for every pair, pings, and can
+    /// subscribe one pair's book again.
+    #[test]
+    fn a_session_subscribes_every_channel_and_can_resubscribe_one_book() {
+        let (spot, _) = spot();
+        let (_subscriptions, requests) = spot.open(Socket {
+            connection: 0,
+            session: 0,
+        });
+        assert_eq!(requests.initial.len(), CHANNELS.len());
+        assert_eq!(
+            requests.keepalive.map(|keepalive| keepalive.text),
+            Some(PING)
+        );
+        let [unsubscribe, subscribe] = spot.resubscribe[1]
+            .each_ref()
+            .map(|text| serde_json::from_str::<serde_json::Value>(text).unwrap());
+        assert_eq!(unsubscribe["method"], "unsubscribe");
+        assert_eq!(
+            subscribe["params"]["symbol"],
+            serde_json::json!(["DOGE/USD"])
+        );
+        assert_eq!(subscribe["params"]["depth"], 1000);
+    }
+
     #[test]
     fn only_market_channels_reach_the_queue() {
         let subscriptions = subscriptions();
@@ -275,20 +342,16 @@ mod tests {
     }
 
     #[test]
-    fn readiness_needs_every_channel_for_every_pair() {
+    fn the_session_completes_with_every_channel_for_every_pair() {
         let mut subscriptions = subscriptions();
         for channel in CHANNELS {
-            subscriptions
-                .control(ack(channel, "BTC/USD").as_bytes())
-                .unwrap();
+            subscriptions.on_control(ack(channel, "BTC/USD").as_bytes());
         }
-        assert!(!subscriptions.subscribed());
+        assert!(!subscriptions.settled());
         for channel in CHANNELS {
-            subscriptions
-                .control(ack(channel, "DOGE/USD").as_bytes())
-                .unwrap();
+            subscriptions.on_control(ack(channel, "DOGE/USD").as_bytes());
         }
-        assert!(subscriptions.subscribed());
+        assert!(subscriptions.settled() && subscriptions.complete());
     }
 
     /// The rejection as served on 2026-10-05.
@@ -297,31 +360,28 @@ mod tests {
     fn subscribe_all(subscriptions: &mut Subscriptions) {
         for channel in CHANNELS {
             for pair in ["BTC/USD", "DOGE/USD"] {
-                subscriptions
-                    .control(ack(channel, pair).as_bytes())
-                    .unwrap();
+                subscriptions.on_control(ack(channel, pair).as_bytes());
             }
         }
     }
 
     #[test]
-    fn a_pair_rejected_while_subscribing_keeps_the_session_unready() {
+    fn a_pair_rejected_while_subscribing_settles_the_session_incomplete() {
         let mut subscriptions = subscriptions();
-        subscriptions.control(REJECTION).unwrap();
+        subscriptions.on_control(REJECTION);
+        assert!(subscriptions.settled() && !subscriptions.complete());
         subscribe_all(&mut subscriptions);
-        assert!(!subscriptions.subscribed());
+        assert!(!subscriptions.complete());
     }
 
     /// Once subscribed, a rejection answers a book re-subscription, which the
     /// consumer renews; an unsubscribe's answer changes nothing either.
     #[test]
-    fn a_subscribed_session_stays_ready() {
+    fn a_complete_session_stays_complete() {
         let mut subscriptions = subscriptions();
         subscribe_all(&mut subscriptions);
-        subscriptions
-            .control(br#"{"method":"unsubscribe","req_id":0,"result":{"channel":"book","depth":1000,"symbol":"BTC/USD"},"success":true,"time_in":"2026-10-05T12:30:30.659995Z","time_out":"2026-10-05T12:30:30.660017Z"}"#)
-            .unwrap();
-        subscriptions.control(REJECTION).unwrap();
-        assert!(subscriptions.subscribed());
+        subscriptions.on_control(br#"{"method":"unsubscribe","req_id":0,"result":{"channel":"book","depth":1000,"symbol":"BTC/USD"},"success":true,"time_in":"2026-10-05T12:30:30.659995Z","time_out":"2026-10-05T12:30:30.660017Z"}"#);
+        subscriptions.on_control(REJECTION);
+        assert!(subscriptions.complete());
     }
 }

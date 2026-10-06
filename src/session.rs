@@ -248,6 +248,16 @@ pub(crate) struct Later {
     pub(crate) after: Duration,
 }
 
+impl Later {
+    /// `text`, to go out as soon as the pace allows.
+    pub(crate) fn now(text: String) -> Self {
+        Self {
+            text,
+            after: Duration::ZERO,
+        }
+    }
+}
+
 /// What a session reports to its slot's supervisor.
 #[derive(Debug)]
 enum Event {
@@ -1340,12 +1350,7 @@ pub(crate) mod tests {
                 after: Duration::from_secs(2),
             })
             .unwrap();
-        later_tx
-            .send(Later {
-                text: "resubscribe".to_owned(),
-                after: Duration::ZERO,
-            })
-            .unwrap();
+        later_tx.send(Later::now("resubscribe".to_owned())).unwrap();
         let mut harness = Harness::with(
             Script::default(),
             Requests {
