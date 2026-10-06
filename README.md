@@ -5,8 +5,9 @@ the collector in [hftbacktest](https://github.com/nkaz001/hftbacktest/tree/maste
 and still takes the same basic arguments: an output directory, an exchange name,
 and the symbols you want.
 
-There is a separate crate, `sbe-collector`, for Binance's SBE spot stream.
-That one does not write JSON.
+A sibling crate, `sbe-collector`, records SBE websockets (Binance spot, OKX,
+Gate spot and futures) into binary records instead of JSON lines. The two
+share their design: connections, file layout, handover, startup checks.
 
 ## vs the hftbacktest collector
 
@@ -42,8 +43,16 @@ What we added on top of the original process:
   Every file the collector closes, and every merge, ends with a 24-byte zstd
   skippable frame (the clean-close trailer), so that check is one read instead
   of a walk over every block; `zstd -dc` and other libzstd readers skip it.
-* A `_quality_<run-id>.jsonl` next to the data when frames are dropped or the
-  writer cannot fsync.
+* A `_quality_<run-id>.jsonl` next to the data, created at start: frames shed
+  under backpressure, feeds degraded (rejected subscriptions, depth gaps),
+  storage faults, and the handover's steps.
+* An `_exchange` file naming the directory's exchange, written on first start.
+  A collector for any other exchange, sbe-collector's included, refuses the
+  directory, so two venues never append to one symbol's file.
+* Symbols are checked against the venue's REST listing at startup. One the
+  venue says it does not list stops the process with the venue's answer,
+  before anything is created; a venue that cannot answer is asked again for
+  up to two minutes.
 * `gap_detector`, which scans a directory tree for recv-time holes and venue
   sequence breaks.
 
@@ -52,6 +61,25 @@ session, so it is the wrong tool for a rolling upgrade; use
 `scripts/rolling_update_collector.sh` (see ROLLING_UPDATE.md). The SIGHUP that
 `tmux kill-session` sends drains and closes the files like SIGTERM, unless
 SIGHUP was already ignored when the collector started (e.g. under `nohup`).
+
+## Connections
+
+Each of the `-c N` slots keeps one socket open. A session is replaced
+make-before-break: the new one connects while the old one keeps delivering,
+and the old one is retired only once the new one has every subscription
+answered and data flowing. That happens when Binance announces a server
+shutdown, and at its 23-hour connection age, staggered across slots. A lost
+socket is reconnected with backoff from 100 ms to 30 s, and attempts across
+slots are at least 400 ms apart.
+
+A session counts towards a rolling update's readiness only while it is
+complete: a subscription the venue rejects leaves it recording what it has,
+reported in the quality log, but unready, so it never retires a complete one.
+
+With `-c 1` duplicates are not filtered: nothing can be a copy except during a
+session's replacement, when the overlap records a few frames twice. That is
+the cheaper error, since a repeat can be dropped when reading and a frame
+never written cannot be recovered.
 
 ## Build and run
 
@@ -124,7 +152,10 @@ cargo build --release --bin gap_detector
 ```
 
 Open files will be reported as an unterminated zstd stream. That is the writer
-still holding them, not a corrupt record. `bad lines` should be 0.
+still holding them, not a corrupt record. `bad lines` should be 0. Each
+directory is checked as the exchange its `_exchange` file names, or guessed
+from its path without one; `--exchange` overrides. A directory sbe-collector
+recorded is skipped.
 
 ```sh
 zstd -dc /data/raw/binance/spot/btcusdt_20260821.zst | head

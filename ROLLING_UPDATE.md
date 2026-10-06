@@ -14,16 +14,18 @@ The replacement must match the incumbent's exchange, ordered symbol list,
 connection count, and canonical output path. While warming up it may write a
 run-local sidecar (`<symbol>_<UTC-date>_<run-id>.zst`) if today's canonical
 daily file is already locked by the incumbent. Only after every required
-endpoint/connection is currently delivering frames, the writer has accepted its
-first record, and that state has remained continuously healthy for two seconds
-does it request takeover. A disconnect or dropped delivery restarts the overlap
+endpoint/connection has every subscription answered and is currently
+delivering frames, the writer has accepted its first record, and that state
+has remained continuously healthy for two seconds does it request takeover. A disconnect or dropped delivery restarts the overlap
 grace; the incumbent then drains, fsyncs, and exits only after a healthy
 request.
 
 A collector stopped by a signal releases the handover socket at once, before
 its drain, so a replacement started right away (as `run_collector.sh` does
 after `tmux kill-session`) becomes the incumbent; one that had already
-connected chooses its role again instead of failing.
+connected chooses its role again instead of failing. Processes started at
+the same moment choose their roles one at a time, under `<socket>.lock`, so
+they agree on one incumbent.
 
 Steady-state recordings use one file per symbol per UTC day:
 `<symbol>_<UTC-date>.zst`. During handover overlap the challenger writes a
@@ -35,8 +37,7 @@ challenger exits before the switch, the sidecar stays on disk. Overlap
 intentionally favors no gaps over no duplicates.
 
 The first upgrade from a binary without UDS support is necessarily a normal
-stop/start. Existing deployment scripts that stop the old tmux session must be
-updated separately before they can exercise this handover path.
+stop/start.
 
 ## On the collector host
 
