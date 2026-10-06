@@ -36,6 +36,11 @@ const ZSTD_BATCH_BYTES: usize = 128 * 1024;
 /// every symbol.
 const MERGE_RETRY_BACKOFF: Duration = Duration::from_secs(5);
 const MERGE_RETRY_MAX: Duration = Duration::from_secs(600);
+/// While another writer holds the daily file, how often a sidecar probes its
+/// lock. Probing per record would open, lock and close the file thousands of
+/// times a second through a handover's overlap; the incumbent releases it
+/// once, when it exits.
+const BUSY_PROBE_INTERVAL: Duration = Duration::from_secs(1);
 const ZSTD_MAGIC: u32 = 0xFD2F_B528;
 const SKIPPABLE_MAGIC: u32 = 0x184D_2A50;
 const SKIPPABLE_MAGIC_MASK: u32 = 0xFFFF_FFF0;
@@ -507,9 +512,11 @@ enum AfterSwitch {
 /// attempts keeps the outcome the backoff must see.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Progress {
-    /// Nothing to do, or another writer still holds the daily file.
+    /// Nothing to do.
     Idle,
     Done,
+    /// Another writer still holds the daily file.
+    Busy,
     Failed,
 }
 
@@ -529,6 +536,8 @@ impl Backoff {
         match progress {
             Progress::Idle => {}
             Progress::Done => *self = Self::default(),
+            // Neither failure nor success: probe again shortly.
+            Progress::Busy => self.until = Some(Instant::now() + BUSY_PROBE_INTERVAL),
             Progress::Failed => {
                 self.until = Some(Instant::now() + retry_delay(self.failures));
                 self.failures = self.failures.saturating_add(1);
@@ -620,10 +629,13 @@ impl RotatingFile {
         let path = day_file(&self.prefix, date, format_args!("_{}", self.run_id));
         match try_lock_daily(&self.prefix, date) {
             Ok(Some(daily)) => return Ok(Sink::Daily(ZstdEncoder::new(daily, ZSTD_LEVEL)?)),
-            Ok(None) => warn!(
-                path = %path.display(),
-                "daily file busy; writing a run-local sidecar until the incumbent releases it"
-            ),
+            Ok(None) => {
+                warn!(
+                    path = %path.display(),
+                    "daily file busy; writing a run-local sidecar until the incumbent releases it"
+                );
+                self.retry.record(Progress::Busy);
+            }
             Err(error) => {
                 self.daily_unusable(date, &error);
                 self.retry.record(Progress::Failed);
@@ -659,7 +671,7 @@ impl RotatingFile {
         if timestamp >= self.day.end {
             self.rotate(timestamp)?;
         }
-        if self.retry.ready() {
+        if self.merge_due() {
             let switched = self.switch_to_daily(AfterSwitch::Continue)?;
             let merged = self.merge_pending_sidecars();
             self.retry.record(switched.max(merged));
@@ -732,7 +744,7 @@ impl RotatingFile {
         };
         let mut daily = match try_lock_daily(&self.prefix, self.day.date) {
             Ok(Some(daily)) => daily,
-            Ok(None) => return Ok(Progress::Idle),
+            Ok(None) => return Ok(Progress::Busy),
             Err(error) => {
                 self.daily_unusable(self.day.date, &error);
                 return Ok(Progress::Failed);
@@ -880,37 +892,37 @@ impl RotatingFile {
         Ok(())
     }
 
+    /// Appends the queued sidecars whose daily file is free. Filtered in
+    /// place: nothing is allocated per record while one waits.
     fn merge_pending_sidecars(&mut self) -> Progress {
         let mut progress = Progress::Idle;
-        for sidecar in mem::take(&mut self.pending_sidecars) {
+        let mut pending = mem::take(&mut self.pending_sidecars);
+        pending.retain(|sidecar| {
             // This run holds that daily file: the sidecar goes in once the
             // file is released, at rotation or close.
             if sidecar.date == self.day.date && matches!(self.sink, Sink::Daily(_)) {
-                self.pending_sidecars.push(sidecar);
-                continue;
+                return true;
             }
-            let step = match merge_into_daily(&self.prefix, sidecar.date, &sidecar.path) {
-                Ok(Some(Merge::Appended)) => Progress::Done,
+            let (step, keep) = match merge_into_daily(&self.prefix, sidecar.date, &sidecar.path) {
+                Ok(Some(Merge::Appended)) => (Progress::Done, false),
                 Ok(Some(Merge::Unterminated)) => {
                     self.sidecar_unterminated(&sidecar.path);
-                    Progress::Done
+                    (Progress::Done, false)
                 }
-                Ok(None) => {
-                    self.pending_sidecars.push(sidecar);
-                    Progress::Idle
-                }
+                Ok(None) => (Progress::Busy, true),
                 Err(unmerged) => {
                     self.faults.report(
                         &sidecar.path,
                         unmerged,
                         "failed to append queued overlap sidecar",
                     );
-                    self.pending_sidecars.push(sidecar);
-                    Progress::Failed
+                    (Progress::Failed, true)
                 }
             };
             progress = progress.max(step);
-        }
+            keep
+        });
+        self.pending_sidecars = pending;
         progress
     }
 
@@ -924,6 +936,12 @@ impl RotatingFile {
 
     fn holds_sidecars(&self) -> bool {
         self.sink.sidecar().is_some() || !self.pending_sidecars.is_empty()
+    }
+
+    /// Whether a sidecar waits to be switched or merged and no backoff holds
+    /// the attempt back. The clock is read only while one waits.
+    fn merge_due(&self) -> bool {
+        self.holds_sidecars() && self.retry.ready()
     }
 
     fn flush_batch(&mut self) -> io::Result<()> {
@@ -1227,6 +1245,14 @@ mod tests {
         names
     }
 
+    /// The incumbent is gone: the next write probes the daily file at once
+    /// instead of after the busy interval.
+    fn reprobe(writer: &mut Writer) {
+        for file in writer.files.values_mut() {
+            file.retry = Backoff::default();
+        }
+    }
+
     fn has_sidecar(dir: &Path, run_id: &str) -> bool {
         let suffix = format!("_{run_id}.zst");
         names(dir).iter().any(|name| name.ends_with(&suffix))
@@ -1420,6 +1446,7 @@ mod tests {
         );
 
         incumbent.close().unwrap();
+        reprobe(&mut challenger);
         put(&mut challenger, day_one(), br#"{"n":3}"#);
         assert!(
             matches!(challenger.files["btcusdt"].sink, Sink::Daily(_)),
@@ -1670,6 +1697,7 @@ mod tests {
         let mut challenger = writer(&dir, "challenger");
         put(&mut challenger, day_one(), br#"{"n":2}"#);
         incumbent.close().unwrap();
+        reprobe(&mut challenger);
         put(&mut challenger, day_one(), br#"{"n":3}"#);
         assert_eq!(names(&dir), [DAY_ONE], "the sidecar must be merged");
         assert!(ends_with_its_trailer(&fs::read(dir.join(DAY_ONE)).unwrap()));
@@ -1698,6 +1726,7 @@ mod tests {
         let bytes = fs::read(&sidecar).unwrap();
         fs::write(&sidecar, &bytes[..bytes.len() - TRAILER_LEN - 1]).unwrap();
         incumbent.close().unwrap();
+        reprobe(&mut challenger);
 
         put(&mut challenger, day_two(), br#"{"n":4}"#);
         assert!(challenger.files["btcusdt"].pending_sidecars.is_empty());
@@ -1725,6 +1754,7 @@ mod tests {
         let mut challenger = writer(&dir, "challenger");
         put(&mut challenger, day_one(), br#"{"n":2}"#);
         incumbent.close().unwrap();
+        reprobe(&mut challenger);
         fault::arm(fault::Step::Append, 1);
         fault::arm(fault::Step::Resume, 1);
         let locks = fault::calls(fault::Step::Lock);
@@ -1757,6 +1787,7 @@ mod tests {
         let mut challenger = writer(&dir, "challenger");
         put(&mut challenger, day_one(), br#"{"n":2}"#);
         incumbent.close().unwrap();
+        reprobe(&mut challenger);
         fault::arm(fault::Step::Append, 1);
         fault::arm(fault::Step::Rollback, 1);
 
@@ -1789,6 +1820,7 @@ mod tests {
         let mut challenger = writer(&dir, "challenger");
         put(&mut challenger, day_one(), br#"{"n":2}"#);
         incumbent.close().unwrap();
+        reprobe(&mut challenger);
         fault::arm(fault::Step::Append, 1);
         fault::arm(fault::Step::Rollback, 1);
         fault::arm(fault::Step::Resume, 1);
@@ -1843,6 +1875,7 @@ mod tests {
         let mut challenger = writer(&dir, "challenger");
         put(&mut challenger, day_one(), br#"{"n":2}"#);
         incumbent.close().unwrap();
+        reprobe(&mut challenger);
         fault::arm(fault::Step::Append, 2);
         fault::arm(fault::Step::Resume, 1);
 
@@ -1924,12 +1957,47 @@ mod tests {
         backoff.record(Progress::Failed);
         assert!(!backoff.ready());
         assert_eq!(backoff.failures, 2);
-        // A daily file still held elsewhere is neither failure nor success.
+        // Nothing to do changes nothing.
         backoff.record(Progress::Idle);
         assert_eq!(backoff.failures, 2);
         backoff.record(Progress::Done);
         assert!(backoff.ready());
         assert_eq!(backoff.failures, 0);
+
+        // A daily file still held elsewhere is neither: it is probed again
+        // after a short wait.
+        backoff.record(Progress::Busy);
+        assert!(!backoff.ready());
+        assert_eq!(backoff.failures, 0);
+    }
+
+    /// Through a handover's overlap the daily file is probed once a second,
+    /// not on every record.
+    #[test]
+    fn a_busy_daily_file_is_not_probed_on_every_record() {
+        let dir = test_dir("busy-probe");
+        let mut incumbent = writer(&dir, "incumbent");
+        put(&mut incumbent, day_one(), br#"{"n":0}"#);
+        let mut challenger = writer(&dir, "challenger");
+        let locks = fault::calls(fault::Step::Lock);
+
+        for record in numbered(1, 1_000) {
+            challenger
+                .write(day_one(), Symbol::from("btcusdt"), record)
+                .unwrap();
+        }
+        assert_eq!(
+            fault::calls(fault::Step::Lock) - locks,
+            1,
+            "only the sidecar's opening probed"
+        );
+        incumbent.close().unwrap();
+        challenger.close().unwrap();
+        assert_eq!(names(&dir), [DAY_ONE]);
+        let text = decoded(dir.join(DAY_ONE));
+        assert!(text.contains(r#"{"n":0}"#));
+        assert_eq!(numbers(&text), (1..=1_000).collect::<Vec<_>>());
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -1941,6 +2009,7 @@ mod tests {
         let mut challenger = Writer::new(&dir, "challenger", quality);
         put(&mut challenger, day_one(), br#"{"n":2}"#);
         incumbent.close().unwrap();
+        reprobe(&mut challenger);
         fault::arm(fault::Step::Sync, 1);
 
         put(&mut challenger, day_one(), br#"{"n":3}"#);
@@ -1983,6 +2052,7 @@ mod tests {
         let mut challenger = writer(&dir, "challenger");
         put(&mut challenger, day_one(), br#"{"n":2}"#);
         incumbent.close().unwrap();
+        reprobe(&mut challenger);
         fault::arm(fault::Step::Finish, 1);
 
         put(&mut challenger, day_one(), br#"{"n":3}"#);
