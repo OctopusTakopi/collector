@@ -1,16 +1,12 @@
 //! Hyperliquid perpetuals over the public websocket.
 
-mod connection;
+mod protocol;
 
-use std::{future::Future, sync::Arc, time::Duration};
-
-use rustls::ClientConfig;
 use tokio::task::JoinSet;
 
 use crate::{
-    collection::{self, Consumer, Context, Recorder, Venue},
+    collection::{self, Consumer, Context, Recorder},
     error::ConnectorError,
-    legacy::Slot,
     routing::HyperliquidMessage,
     session::Frame,
 };
@@ -22,7 +18,6 @@ pub(crate) async fn collect(
     kinds: &'static [&'static str],
     coins: &[String],
     cx: Context,
-    tls: Arc<ClientConfig>,
 ) -> anyhow::Result<()> {
     // Every redundant connection subscribes to the full set for itself.
     let per_connection = kinds.len() * coins.len();
@@ -34,29 +29,19 @@ pub(crate) async fn collect(
             cx.connections
         );
     }
+    let public = protocol::Public {
+        subscriptions: protocol::subscriptions(kinds, coins),
+        pace: protocol::subscribe_pace(cx.connections),
+    };
     let hyperliquid = Hyperliquid {
-        subscriptions: connection::subscriptions(kinds, coins),
-        pace: connection::subscribe_pace(cx.connections),
         recorder: Recorder::new(cx.writer_tx.clone(), coins, cx.connections),
     };
-    collection::run(hyperliquid, cx, tls, JoinSet::new()).await
+    collection::run_slots(public, hyperliquid, cx, JoinSet::new()).await
 }
 
 /// The consumer of Hyperliquid's queue, which carries market data only.
 struct Hyperliquid {
-    subscriptions: Arc<[connection::Subscription]>,
-    pace: Duration,
     recorder: Recorder,
-}
-
-impl Venue for Hyperliquid {
-    fn label(&self) -> &'static str {
-        "hyperliquid"
-    }
-
-    fn keep_connection(&self, slot: Slot) -> impl Future<Output = ()> + Send + 'static {
-        connection::keep_connection(Arc::clone(&self.subscriptions), self.pace, slot)
-    }
 }
 
 impl Consumer for Hyperliquid {
@@ -91,8 +76,6 @@ mod tests {
         let coins = ["BTC".to_owned()];
         let connections = NonZeroUsize::new(connections).unwrap();
         let hyperliquid = Hyperliquid {
-            subscriptions: connection::subscriptions(&["trades"], &coins),
-            pace: connection::subscribe_pace(connections),
             recorder: Recorder::new(writer_tx, &coins, connections),
         };
         (hyperliquid, writer_rx)
@@ -152,14 +135,9 @@ mod tests {
             readiness: crate::readiness::Readiness::new(1).0,
         };
 
-        let error = collect(
-            &["trades", "l2Book", "bbo"],
-            &coins,
-            cx,
-            crate::ws::tls_config(),
-        )
-        .await
-        .unwrap_err();
+        let error = collect(&["trades", "l2Book", "bbo"], &coins, cx)
+            .await
+            .unwrap_err();
 
         assert!(error.to_string().contains("= 1200"), "{error}");
     }

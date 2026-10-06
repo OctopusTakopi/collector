@@ -172,7 +172,7 @@ impl Worker {
                 binance::collect(endpoint, &streams, symbols, cx).await
             }
             Self::Bybit(topics) => bybit::collect(topics, symbols, cx).await,
-            Self::Hyperliquid(kinds) => hyperliquid::collect(kinds, symbols, cx, tls).await,
+            Self::Hyperliquid(kinds) => hyperliquid::collect(kinds, symbols, cx).await,
             Self::Coinbase(channels) => coinbase::collect(channels, symbols, cx, tls).await,
             Self::KrakenSpot(channels) => kraken_spot::collect(channels, symbols, cx, tls).await,
             Self::KrakenFutures(feeds) => kraken_futures::collect(feeds, symbols, cx, tls).await,
