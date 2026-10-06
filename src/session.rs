@@ -49,10 +49,12 @@ const CONNECT_STAGGER: Duration = Duration::from_secs(5);
 pub(crate) const SETTLED: Duration = Duration::from_secs(30);
 
 /// How long a session may wait for every request's answer once its requests
-/// are out. Answers come within milliseconds; one that never comes would
-/// otherwise leave the slot unready, and a channel missing, with nothing to
-/// say so.
-const SUBSCRIBE_TIMEOUT: Duration = Duration::from_secs(10);
+/// are out; one that never comes would otherwise leave the slot unready, and
+/// a channel missing, with nothing to say so. Answers come within
+/// milliseconds, but queue behind the book snapshots that follow earlier
+/// subscribes: on 2026-10-07 a cold start of all seven venues over one
+/// congested link kept a second connection's answers back more than 10 s.
+const SUBSCRIBE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The least spacing between any two connection attempts of a collection.
 /// A venue-wide outage drops every slot at once, and their reconnects must not
