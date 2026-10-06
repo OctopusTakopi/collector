@@ -209,7 +209,7 @@ async fn control_loop(
     loop {
         tokio::select! {
             _ = ping.tick() => {
-                if sender.text(br#"{"method":"ping"}"#.to_vec()).await.is_err() {
+                if sender.text(r#"{"method":"ping"}"#).await.is_err() {
                     return;
                 }
             }
@@ -217,7 +217,7 @@ async fn control_loop(
                 let subscription = &subscriptions[next];
                 debug!(?subscription, "sending subscription");
                 let request = SubscribeRequest { method: "subscribe", subscription };
-                let frame = serde_json::to_vec(&request).expect("a subscription serialises");
+                let frame = serde_json::to_string(&request).expect("a subscription serialises");
                 if sender.text(frame).await.is_err() {
                     return;
                 }

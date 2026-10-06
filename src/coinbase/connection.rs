@@ -59,8 +59,8 @@ struct Request<'a> {
 
 /// One product's request, one at a time: Coinbase rejects an unknown product
 /// with an error that names no request, and keeps the rest of a request.
-fn request(kind: &'static str, product: &str, channels: &[&str]) -> Vec<u8> {
-    serde_json::to_vec(&Request {
+fn request(kind: &'static str, product: &str, channels: &[&str]) -> String {
+    serde_json::to_string(&Request {
         kind,
         product_ids: [product],
         channels,
@@ -176,7 +176,7 @@ fn control_loop(
     channels: &'static [&'static str],
     commands: UnboundedReceiver<Resnapshot>,
 ) -> impl Future<Output = ()> {
-    let subscribes: Vec<Vec<u8>> = products
+    let subscribes: Vec<String> = products
         .iter()
         .map(|product| request("subscribe", product, channels))
         .collect();
@@ -219,7 +219,7 @@ mod tests {
     #[test]
     fn a_request_names_one_product() {
         assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&request("subscribe", "BTC-USD", CHANNELS))
+            serde_json::from_str::<serde_json::Value>(&request("subscribe", "BTC-USD", CHANNELS))
                 .unwrap(),
             serde_json::json!({
                 "type": "subscribe",

@@ -9,32 +9,21 @@ use std::{
 
 use bytes::Bytes;
 use fastwebsockets::OpCode;
+use hyper::header::HeaderMap;
 use jiff::Timestamp;
 use rustls::ClientConfig;
-use tokio::{
-    io::AsyncRead,
-    sync::mpsc::{self, Sender},
-    time::timeout,
-};
-use tracing::{error, info};
+use tokio::{io::AsyncRead, sync::mpsc::Sender, time::timeout};
+use tracing::error;
 
 use crate::{
-    quality::{QualityEvent, QualityReporter},
+    quality::QualityReporter,
     readiness::{Readiness, Source, SourceLease},
-    ws::{self, Connection, FrameSender},
+    ws::{self, Connection, Delivery, FrameSender, Overflow},
 };
 
 /// A session that lived this long was healthy, so whatever ended it was the
 /// venue's doing rather than a persistent failure.
 pub(crate) const SETTLED: Duration = Duration::from_secs(30);
-
-/// How long a frame may wait for room in the queue before frames are shed.
-///
-/// The wait blocks the read loop, which then cannot answer a server ping, so
-/// it stays far below the shortest pong deadline (Binance: about a minute).
-pub(crate) const QUEUE_FULL_GRACE: Duration = Duration::from_secs(1);
-
-const OVERFLOW_REPORT_INTERVAL: Duration = Duration::from_secs(5);
 
 /// A market frame on the collection queue: the connection slot that read it,
 /// when, and its bytes.
@@ -117,88 +106,11 @@ fn jittered(failures: u32) -> Duration {
     Duration::from_millis(base_ms - spread + u64::from(nanos) % (2 * spread + 1))
 }
 
-/// Rate-limited accounting for frames shed because the writer cannot keep up.
-///
-/// Shedding beats stalling: a stalled read loop stops answering pings, the
-/// venue closes the connection, and that gap is far larger than the overflow.
-/// What must never happen is shedding silently.
-struct Overflow {
-    source: Source,
-    quality: QualityReporter,
-    dropped: u64,
-    reported: u64,
-    last_report: Instant,
-    /// Set once the consumer has proved too slow; frames are then shed without
-    /// waiting until one gets through.
-    shedding: bool,
-}
-
-impl Overflow {
-    fn new(source: Source, quality: QualityReporter) -> Self {
-        Self {
-            source,
-            quality,
-            dropped: 0,
-            reported: 0,
-            last_report: Instant::now(),
-            shedding: false,
-        }
-    }
-
-    fn record_drop(&mut self) {
-        self.dropped += 1;
-        if self.dropped == 1 || self.last_report.elapsed() >= OVERFLOW_REPORT_INTERVAL {
-            error!(
-                endpoint = %self.source,
-                dropped_total = self.dropped,
-                dropped_since_last_report = self.dropped - self.reported,
-                "writer cannot keep up; dropping frames"
-            );
-            self.quality.report(QualityEvent::MarketDataDropped {
-                at_ns: QualityEvent::now_ns(),
-                source: self.source.to_string(),
-                dropped_total: self.dropped,
-                dropped_since_last_report: self.dropped - self.reported,
-            });
-            self.reported = self.dropped;
-            self.last_report = Instant::now();
-        }
-    }
-
-    /// Reports recovery once, on the first frame through after a drop.
-    fn record_sent(&mut self) {
-        if self.dropped > 0 {
-            info!(
-                endpoint = %self.source,
-                dropped_total = self.dropped,
-                "writer caught up; no longer dropping frames"
-            );
-            self.quality.report(QualityEvent::MarketDataRecovered {
-                at_ns: QualityEvent::now_ns(),
-                source: self.source.to_string(),
-                dropped_total: self.dropped,
-            });
-            self.dropped = 0;
-            self.reported = 0;
-        }
-        self.shedding = false;
-    }
-}
-
-/// Outcome of handing a frame to the queue.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum Delivery {
-    Sent,
-    /// Shed because the consumer is saturated; counted and reported.
-    Dropped,
-    /// The consumer is gone: the collector is shutting down.
-    Closed,
-}
-
 /// One session's end of the collection queue, holding its readiness lease
 /// while its market data reaches the queue.
 pub(crate) struct Producer {
     tx: Sender<Frame>,
+    source: Source,
     overflow: Overflow,
     readiness: Readiness,
     lease: Option<SourceLease>,
@@ -213,6 +125,7 @@ impl Producer {
     ) -> Self {
         Self {
             tx,
+            source,
             overflow: Overflow::new(source, quality),
             readiness,
             lease: None,
@@ -220,48 +133,18 @@ impl Producer {
     }
 
     /// Stamps `payload` and queues it.
-    ///
-    /// Waiting for room blocks the read loop, so it waits only when the queue
-    /// first fills; after that frames are shed at once until one gets through.
-    /// Waiting on every frame would throttle reads to one per grace period and
-    /// leave the venue's ping stuck behind market data in the kernel buffer.
     pub(crate) async fn send(&mut self, payload: Bytes) -> Delivery {
         let frame = Frame {
-            connection: self.overflow.source.connection,
+            connection: self.source.connection,
             recv_time: Timestamp::now(),
             data: payload,
         };
-        match self.tx.try_reserve() {
-            Ok(permit) => {
-                permit.send(frame);
-                self.overflow.record_sent();
-                return Delivery::Sent;
-            }
-            Err(mpsc::error::TrySendError::Closed(())) => return Delivery::Closed,
-            Err(mpsc::error::TrySendError::Full(())) => {}
-        }
-        if self.overflow.shedding {
-            self.overflow.record_drop();
-            return Delivery::Dropped;
-        }
-        match timeout(QUEUE_FULL_GRACE, self.tx.reserve()).await {
-            Ok(Ok(permit)) => {
-                permit.send(frame);
-                self.overflow.record_sent();
-                Delivery::Sent
-            }
-            Ok(Err(_)) => Delivery::Closed,
-            Err(_) => {
-                self.overflow.shedding = true;
-                self.overflow.record_drop();
-                Delivery::Dropped
-            }
-        }
+        ws::deliver(&self.tx, &mut self.overflow, frame).await
     }
 
     fn set_live(&mut self, live: bool) {
         if live != self.lease.is_some() {
-            self.lease = live.then(|| self.readiness.source_live(self.overflow.source));
+            self.lease = live.then(|| self.readiness.source_live(self.source));
         }
     }
 }
@@ -368,6 +251,8 @@ where
                 }
             }
             OpCode::Close => {
+                let (code, reason) = ws::close_reason(&message.payload);
+                tracing::warn!(?code, %reason, "websocket closed by the venue");
                 // `read` queued the close echo; let it reach the wire.
                 conn.flush_close().await;
                 return End::Lost(Lost::ClosedByServer);
@@ -397,7 +282,7 @@ pub(crate) async fn keep_subscribed<P, C>(
     let connection = slot.connection;
     let mut backoff = Backoff::default();
     loop {
-        let mut conn = match ws::connect(url, &slot.tls).await {
+        let mut conn = match ws::connect(url, HeaderMap::new(), Arc::clone(&slot.tls)).await {
             Ok(conn) => conn,
             Err(error) => {
                 error!(
@@ -442,7 +327,10 @@ pub(crate) async fn keep_subscribed<P, C>(
 pub(crate) mod tests {
     use super::*;
     use fastwebsockets::{Frame as WsFrame, Payload, WebSocket};
-    use tokio::{io::DuplexStream, sync::mpsc::Receiver};
+    use tokio::{
+        io::DuplexStream,
+        sync::mpsc::{self, Receiver},
+    };
 
     pub(crate) const TEST_SOURCE: Source = Source {
         endpoint: "test",
@@ -498,74 +386,6 @@ pub(crate) mod tests {
 
         backoff.wait(Some(SETTLED * 2)).await;
         assert_eq!(backoff.failures, 0);
-    }
-
-    #[test]
-    fn overflow_reports_the_first_drop_and_resets_after_recovery() {
-        let (quality, rx) = QualityReporter::test_channel();
-        let mut overflow = Overflow::new(TEST_SOURCE, quality);
-        overflow.record_drop();
-        overflow.record_drop();
-        assert_eq!(overflow.dropped, 2);
-        overflow.record_sent();
-        assert_eq!(overflow.dropped, 0);
-        assert!(matches!(
-            rx.recv().unwrap(),
-            QualityEvent::MarketDataDropped {
-                dropped_total: 1,
-                dropped_since_last_report: 1,
-                ..
-            }
-        ));
-        assert!(matches!(
-            rx.recv().unwrap(),
-            QualityEvent::MarketDataRecovered {
-                dropped_total: 2,
-                ..
-            }
-        ));
-    }
-
-    /// A sustained stall must not cost one grace period per frame: that would
-    /// throttle socket reads and leave pings stuck behind market data.
-    #[tokio::test(start_paused = true)]
-    async fn sustained_backpressure_sheds_without_waiting_after_the_first_grace() {
-        let (mut producer, _rx) = producer(1);
-        assert_eq!(producer.send(Bytes::new()).await, Delivery::Sent);
-
-        let before = tokio::time::Instant::now();
-        assert_eq!(producer.send(Bytes::new()).await, Delivery::Dropped);
-        let after_first = tokio::time::Instant::now();
-        assert!(
-            after_first - before >= QUEUE_FULL_GRACE,
-            "the first frame should absorb a burst"
-        );
-
-        for _ in 2..100 {
-            assert_eq!(producer.send(Bytes::new()).await, Delivery::Dropped);
-        }
-        assert_eq!(
-            tokio::time::Instant::now(),
-            after_first,
-            "shedding must not wait"
-        );
-        assert_eq!(producer.overflow.dropped, 99);
-    }
-
-    /// A brief burst is absorbed losslessly rather than shed.
-    #[tokio::test(start_paused = true)]
-    async fn a_short_burst_is_absorbed_without_dropping() {
-        let (mut producer, mut rx) = producer(1);
-        assert_eq!(producer.send(Bytes::new()).await, Delivery::Sent);
-
-        tokio::spawn(async move {
-            tokio::time::sleep(QUEUE_FULL_GRACE / 2).await;
-            let _ = rx.recv().await;
-            std::future::pending::<()>().await;
-        });
-
-        assert_eq!(producer.send(Bytes::new()).await, Delivery::Sent);
-        assert_eq!(producer.overflow.dropped, 0);
     }
 
     /// Frames starting with `#` are control: `#ack` completes the

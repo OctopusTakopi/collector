@@ -170,11 +170,12 @@ impl Protocol for Subscriptions {
 }
 
 async fn subscribe(sender: &FrameSender, group: &Group) -> anyhow::Result<()> {
-    let message = serde_json::to_vec(&serde_json::json!({
+    let message = serde_json::json!({
         "req_id": group.topic,
         "op": "subscribe",
         "args": [group.topic],
-    }))?;
+    })
+    .to_string();
     sender.text(message).await
 }
 
@@ -202,7 +203,7 @@ async fn control_loop(
     loop {
         tokio::select! {
             _ = ping.tick() => {
-                if sender.text(br#"{"req_id":"ping","op":"ping"}"#.to_vec()).await.is_err() {
+                if sender.text(r#"{"req_id":"ping","op":"ping"}"#).await.is_err() {
                     return;
                 }
             }

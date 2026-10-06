@@ -19,7 +19,7 @@ const URL: &str = "wss://ws.kraken.com/v2";
 /// Kraken sends a `heartbeat` each second a socket is otherwise quiet.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const PING_INTERVAL: Duration = Duration::from_secs(30);
-const PING: &[u8] = br#"{"method":"ping"}"#;
+const PING: &str = r#"{"method":"ping"}"#;
 const SUBSCRIBE_PACE: Duration = Duration::from_millis(100);
 /// Kraken's deepest book.
 const BOOK_DEPTH: u32 = 1_000;
@@ -53,7 +53,7 @@ pub(super) async fn keep_connection(
 /// The book is as deep as Kraken goes. Trades come without the snapshot of
 /// recent ones, which a second connection subscribing later would record a
 /// second time. The ticker fires on every change of the best bid or offer.
-fn request(method: &str, channel: &str, pairs: &[String], req_id: usize) -> Vec<u8> {
+fn request(method: &str, channel: &str, pairs: &[String], req_id: usize) -> String {
     let mut params = serde_json::json!({ "channel": channel, "symbol": pairs });
     match channel {
         "book" => params["depth"] = BOOK_DEPTH.into(),
@@ -61,12 +61,12 @@ fn request(method: &str, channel: &str, pairs: &[String], req_id: usize) -> Vec<
         "ticker" => params["event_trigger"] = "bbo".into(),
         _ => {}
     }
-    serde_json::to_vec(&serde_json::json!({
+    serde_json::json!({
         "method": method,
         "params": params,
         "req_id": req_id,
-    }))
-    .expect("a request serialises")
+    })
+    .to_string()
 }
 
 #[derive(Deserialize)]
@@ -190,7 +190,7 @@ fn control_loop(
     pairs: Arc<[String]>,
     commands: UnboundedReceiver<Resnapshot>,
 ) -> impl Future<Output = ()> {
-    let subscribes: Vec<Vec<u8>> = channels
+    let subscribes: Vec<String> = channels
         .iter()
         .enumerate()
         .map(|(req_id, channel)| request("subscribe", channel, &pairs, req_id))
@@ -236,7 +236,7 @@ mod tests {
     fn each_channel_is_asked_for_with_its_parameters() {
         let pairs = ["BTC/USD".to_owned(), "DOGE/USD".to_owned()];
         let value = |channel, req_id| {
-            serde_json::from_slice::<serde_json::Value>(&request(
+            serde_json::from_str::<serde_json::Value>(&request(
                 "subscribe",
                 channel,
                 &pairs,

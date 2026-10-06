@@ -5,7 +5,6 @@ edition = "2024"
 
 [dependencies]
 url = "2.5"
-http = "1.4"
 bytes = "1.12"
 rustls = "0.23"
 jiff = "0.2.32"

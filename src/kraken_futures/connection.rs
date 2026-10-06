@@ -44,13 +44,13 @@ pub(super) async fn keep_connection(
     .await;
 }
 
-fn request(event: &str, feed: &str, products: &[&str]) -> Vec<u8> {
+fn request(event: &str, feed: &str, products: &[&str]) -> String {
     let request = if products.is_empty() {
         serde_json::json!({ "event": event, "feed": feed })
     } else {
         serde_json::json!({ "event": event, "feed": feed, "product_ids": products })
     };
-    serde_json::to_vec(&request).expect("a request serialises")
+    request.to_string()
 }
 
 #[derive(Deserialize)]
@@ -157,7 +157,7 @@ fn control_loop(
     commands: UnboundedReceiver<Resnapshot>,
 ) -> impl Future<Output = ()> {
     let all: Vec<&str> = products.iter().map(String::as_str).collect();
-    let subscribes: Vec<Vec<u8>> = feeds
+    let subscribes: Vec<String> = feeds
         .iter()
         .map(|feed| request("subscribe", feed, &all))
         .chain([request("subscribe", "heartbeat", &[])])
@@ -207,7 +207,7 @@ mod tests {
     #[test]
     fn requests_name_the_feed_and_every_product() {
         assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&request(
+            serde_json::from_str::<serde_json::Value>(&request(
                 "subscribe",
                 "book",
                 &["PF_XBTUSD", "PF_ETHUSD"]
@@ -216,7 +216,7 @@ mod tests {
             serde_json::json!({"event": "subscribe", "feed": "book", "product_ids": ["PF_XBTUSD", "PF_ETHUSD"]})
         );
         assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&request("subscribe", "heartbeat", &[]))
+            serde_json::from_str::<serde_json::Value>(&request("subscribe", "heartbeat", &[]))
                 .unwrap(),
             serde_json::json!({"event": "subscribe", "feed": "heartbeat"})
         );

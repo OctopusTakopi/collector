@@ -219,7 +219,6 @@ dependencies = [
  "clap",
  "fastwebsockets",
  "futures-util",
- "http",
  "http-body-util",
  "hyper",
  "hyper-util",

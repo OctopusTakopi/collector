@@ -3,10 +3,12 @@
 
 use std::{
     fmt,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
 use fastwebsockets::OpCode;
+use hyper::header::HeaderMap;
 use tokio::{
     io::AsyncRead,
     sync::{mpsc, oneshot},
@@ -18,8 +20,8 @@ use tracing::{debug, error, info, warn};
 use super::Endpoint;
 use crate::{
     routing,
-    session::{self, Backoff, Delivery, End, Lost, Producer, Protocol, Slot},
-    ws::{self, Connection},
+    session::{self, Backoff, End, Lost, Producer, Protocol, Slot},
+    ws::{self, Connection, Delivery},
 };
 
 /// When a session starts arranging its replacement. Binance: "a single
@@ -353,7 +355,7 @@ pub(super) async fn keep_connection(endpoint: &'static Endpoint, url: String, sl
         while lingering.try_join_next().is_some() {}
 
         let opened = Instant::now();
-        let conn = match ws::connect(&url, &slot.tls).await {
+        let conn = match ws::connect(&url, HeaderMap::new(), Arc::clone(&slot.tls)).await {
             Ok(conn) => conn,
             Err(error) => {
                 error!(

@@ -92,10 +92,10 @@ impl Drop for Announced {
 pub(crate) async fn control_loop(
     sender: FrameSender,
     pace: Duration,
-    ping: Option<(Duration, &'static [u8])>,
-    subscribes: impl IntoIterator<Item = Vec<u8>>,
+    ping: Option<(Duration, &'static str)>,
+    subscribes: impl IntoIterator<Item = String>,
     mut commands: UnboundedReceiver<Resnapshot>,
-    resubscribe: impl Fn(usize) -> Option<[Vec<u8>; 2]>,
+    resubscribe: impl Fn(usize) -> Option<[String; 2]>,
 ) {
     let interval = |start, period| {
         let mut interval = tokio::time::interval_at(start, period);
@@ -105,7 +105,7 @@ pub(crate) async fn control_loop(
     let now = Instant::now();
     let mut pacer = interval(now, pace);
     let mut pinger = ping.map(|(period, _)| interval(now + period, period));
-    let mut outbox: VecDeque<Vec<u8>> = subscribes.into_iter().collect();
+    let mut outbox: VecDeque<String> = subscribes.into_iter().collect();
 
     loop {
         tokio::select! {
@@ -661,15 +661,10 @@ mod tests {
         let control = tokio::spawn(control_loop(
             conn.sender(),
             Duration::from_millis(100),
-            Some((Duration::from_secs(30), b"ping".as_slice())),
-            [b"sub-a".to_vec(), b"sub-b".to_vec()],
+            Some((Duration::from_secs(30), "ping")),
+            ["sub-a".to_owned(), "sub-b".to_owned()],
             commands,
-            |product| {
-                Some([
-                    format!("unsub-{product}").into_bytes(),
-                    format!("sub-{product}").into_bytes(),
-                ])
-            },
+            |product| Some([format!("unsub-{product}"), format!("sub-{product}")]),
         ));
 
         let mut sent = Vec::new();
