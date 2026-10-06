@@ -291,6 +291,16 @@ impl Binance {
     }
 }
 
+/// Whether `body` is a depth snapshot, spot's or futures': both open with
+/// the book's update id.
+fn is_book(body: &[u8]) -> bool {
+    body.starts_with(br#"{"lastUpdateId":"#)
+}
+
+fn preview(body: &[u8]) -> std::borrow::Cow<'_, str> {
+    String::from_utf8_lossy(&body[..body.len().min(1024)])
+}
+
 impl Depth for Endpoint {
     fn label(&self) -> &'static str {
         self.label
@@ -331,11 +341,15 @@ impl Depth for Endpoint {
                     ));
                 }
                 // The Binance error code is what tells a bad symbol from a ban.
-                let preview = &body[..body.len().min(1024)];
                 anyhow::bail!(
                     "{label} depth snapshot returned {status}: {}",
-                    String::from_utf8_lossy(preview)
+                    preview(&body)
                 );
+            }
+            // Recorded as a book, an error or a proxy's page under 200 would
+            // read as one to every tool downstream.
+            if !is_book(&body) {
+                anyhow::bail!("{label} depth snapshot is not a book: {}", preview(&body));
             }
             Ok(body)
         }
@@ -403,6 +417,18 @@ mod tests {
 
     fn written(writer_rx: &mut Receiver<WriteRecord>) -> Vec<Bytes> {
         std::iter::from_fn(|| writer_rx.try_recv().ok().map(|record| record.data)).collect()
+    }
+
+    #[test]
+    fn only_a_book_passes_for_a_snapshot() {
+        assert!(is_book(
+            br#"{"lastUpdateId":1027024,"bids":[["4.0","431.0"]],"asks":[]}"#
+        ));
+        assert!(is_book(
+            br#"{"lastUpdateId":1027024,"E":1589436922972,"T":1589436922959,"bids":[],"asks":[]}"#
+        ));
+        assert!(!is_book(br#"{"code":-1121,"msg":"Invalid symbol."}"#));
+        assert!(!is_book(b"<html>502 Bad Gateway</html>"));
     }
 
     /// Spot weighs a snapshot 50 against 6000 a minute, futures 20 against

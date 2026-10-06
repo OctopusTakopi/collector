@@ -2,7 +2,12 @@
 //! stream, and one-off fetches to repair a gap in it. Each body is recorded
 //! as the venue sent it.
 
-use std::{future::Future, time::Duration};
+use std::{
+    collections::{HashMap, hash_map::Entry},
+    future::Future,
+    sync::{Arc, Mutex, PoisonError},
+    time::Duration,
+};
 
 use bytes::Bytes;
 use jiff::Timestamp;
@@ -40,11 +45,20 @@ pub(crate) trait Depth: Sync + 'static {
     ) -> impl Future<Output = anyhow::Result<Bytes>> + Send + use<Self>;
 }
 
+/// A symbol's repair under way: its fetch, and whether a gap seen while it
+/// was in flight is owed another.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Repair {
+    Running,
+    Owed,
+}
+
 pub(crate) struct Snapshots<D: 'static> {
     depth: &'static D,
     client: reqwest::Client,
     throttler: Throttler,
     writer_tx: Sender<WriteRecord>,
+    repairs: Arc<Mutex<HashMap<Symbol, Repair>>>,
 }
 
 impl<D> Clone for Snapshots<D> {
@@ -54,6 +68,7 @@ impl<D> Clone for Snapshots<D> {
             client: self.client.clone(),
             throttler: self.throttler.clone(),
             writer_tx: self.writer_tx.clone(),
+            repairs: Arc::clone(&self.repairs),
         }
     }
 }
@@ -74,6 +89,7 @@ impl<D: Depth> Snapshots<D> {
                 .timeout(Duration::from_secs(30))
                 .build()?,
             writer_tx,
+            repairs: Arc::default(),
         })
     }
 
@@ -98,13 +114,44 @@ impl<D: Depth> Snapshots<D> {
 
     /// Fetches a snapshot of `symbol` in the background to repair a gap in its
     /// depth stream, forgetting repairs that already finished.
+    ///
+    /// Gaps while a fetch is in flight cost one more fetch between them, not
+    /// one each: the snapshot in flight may predate them, the next cannot. A
+    /// burst of gaps would otherwise spend the whole budget on one symbol and
+    /// leave the next gap, on any symbol, unrepaired.
     pub(crate) fn repair(&self, repairs: &mut JoinSet<()>, symbol: &Symbol) {
         while repairs.try_join_next().is_some() {}
+        match self.lock_repairs().entry(Symbol::clone(symbol)) {
+            Entry::Occupied(mut repair) => {
+                *repair.get_mut() = Repair::Owed;
+                return;
+            }
+            Entry::Vacant(repair) => {
+                repair.insert(Repair::Running);
+            }
+        }
         let snapshots = self.clone();
         let symbol = Symbol::clone(symbol);
         repairs.spawn(async move {
-            let _ = snapshots.take(symbol).await;
+            loop {
+                if snapshots.take(Symbol::clone(&symbol)).await.is_err() {
+                    return;
+                }
+                let mut running = snapshots.lock_repairs();
+                match running.get_mut(&symbol) {
+                    Some(repair @ Repair::Owed) => *repair = Repair::Running,
+                    _ => {
+                        running.remove(&symbol);
+                        return;
+                    }
+                }
+            }
         });
+    }
+
+    fn lock_repairs(&self) -> std::sync::MutexGuard<'_, HashMap<Symbol, Repair>> {
+        // A panic mid-update leaves at worst a symbol marked as repairing.
+        self.repairs.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Fetches one snapshot and queues it. Fails only once the writer is gone.
@@ -133,5 +180,60 @@ impl<D: Depth> Snapshots<D> {
                 Ok(())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::sync::mpsc::channel;
+
+    use super::*;
+
+    /// Answers every fetch with an empty body, counting them.
+    struct Counted(std::sync::atomic::AtomicUsize);
+
+    impl Depth for Counted {
+        fn label(&self) -> &'static str {
+            "test"
+        }
+
+        fn weight(&self) -> u32 {
+            1
+        }
+
+        fn fetch(
+            &self,
+            _client: reqwest::Client,
+            _throttler: Throttler,
+            _symbol: Symbol,
+        ) -> impl Future<Output = anyhow::Result<Bytes>> + Send + use<> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            async { Ok(Bytes::new()) }
+        }
+    }
+
+    /// Three gaps while a repair is in flight cost one more fetch, and a gap
+    /// after the repairs ended costs its own.
+    #[tokio::test]
+    async fn gaps_during_a_repair_are_coalesced_into_one_more() {
+        static FETCHES: Counted = Counted(std::sync::atomic::AtomicUsize::new(0));
+        let (writer_tx, mut writer_rx) = channel(16);
+        let snapshots = Snapshots::new(&FETCHES, 100, writer_tx).unwrap();
+        let mut repairs = JoinSet::new();
+        let btc = Symbol::from("btcusdt");
+
+        for _ in 0..4 {
+            snapshots.repair(&mut repairs, &btc);
+        }
+        assert_eq!(repairs.len(), 1, "one fetch in flight per symbol");
+        while repairs.join_next().await.is_some() {}
+        assert_eq!(FETCHES.0.load(std::sync::atomic::Ordering::Relaxed), 2);
+
+        snapshots.repair(&mut repairs, &btc);
+        snapshots.repair(&mut repairs, &Symbol::from("ethusdt"));
+        assert_eq!(repairs.len(), 2, "symbols are repaired independently");
+        while repairs.join_next().await.is_some() {}
+        assert_eq!(FETCHES.0.load(std::sync::atomic::Ordering::Relaxed), 4);
+        assert_eq!(std::iter::from_fn(|| writer_rx.try_recv().ok()).count(), 4);
     }
 }
