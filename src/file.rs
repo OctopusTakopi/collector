@@ -240,6 +240,19 @@ fn ends_on_frame_boundary(file: &File) -> io::Result<bool> {
     Ok(pos == len)
 }
 
+/// Makes a file's creation, renaming or removal durable: an fsync of the
+/// file does not cover its directory entry, so after a crash a merged
+/// sidecar could come back, or a fresh one vanish.
+fn sync_dir(path: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    fault::check(fault::Step::SyncDir)?;
+    let dir = path
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    File::open(dir)?.sync_all()
+}
+
 fn rollback_append(daily: &mut File, start: u64) -> io::Result<()> {
     #[cfg(test)]
     fault::check(fault::Step::Rollback)?;
@@ -269,6 +282,11 @@ fn try_lock_daily(prefix: &Path, date: Date) -> io::Result<Option<File>> {
         return Ok(None);
     };
     match ends_cleanly(&file) {
+        // Empty, it may have just been created.
+        Ok(true) if file.metadata()?.len() == 0 => {
+            sync_dir(&daily)?;
+            return Ok(Some(file));
+        }
         Ok(true) => return Ok(Some(file)),
         Ok(false) => {}
         Err(error) => warn!(
@@ -288,6 +306,7 @@ fn try_lock_daily(prefix: &Path, date: Date) -> io::Result<Option<File>> {
     #[cfg(test)]
     fault::check(fault::Step::SetAside)?;
     fs::rename(&daily, &salvage)?;
+    sync_dir(&daily)?;
     warn!(
         path = %daily.display(),
         salvage = %salvage.display(),
@@ -296,7 +315,11 @@ fn try_lock_daily(prefix: &Path, date: Date) -> io::Result<Option<File>> {
     let fresh = open_locked(&daily);
     // The old inode stays locked until the fresh one is.
     drop(file);
-    fresh
+    let fresh = fresh?;
+    if fresh.is_some() {
+        sync_dir(&daily)?;
+    }
+    Ok(fresh)
 }
 
 /// Why a sink could not be closed cleanly.
@@ -428,7 +451,7 @@ fn merge_sidecar(daily: &mut File, sidecar: &Path) -> Result<Merge, Unmerged> {
             )),
         });
     }
-    match fs::remove_file(sidecar) {
+    match fs::remove_file(sidecar).and_then(|()| sync_dir(sidecar)) {
         Ok(()) => info!(
             sidecar = %sidecar.display(),
             "switch complete; merged and removed overlap sidecar"
@@ -436,7 +459,7 @@ fn merge_sidecar(daily: &mut File, sidecar: &Path) -> Result<Merge, Unmerged> {
         Err(error) => warn!(
             sidecar = %sidecar.display(),
             %error,
-            "switch complete; merged overlap sidecar but failed to remove it"
+            "switch complete; merged overlap sidecar but failed to remove it durably"
         ),
     }
     Ok(Merge::Appended)
@@ -643,6 +666,7 @@ impl RotatingFile {
         }
         let file = File::options().create_new(true).write(true).open(&path)?;
         lock_exclusively(&file, &path)?;
+        sync_dir(&path)?;
         Ok(Sink::Sidecar {
             encoder: ZstdEncoder::new(file, ZSTD_LEVEL)?,
             path,
@@ -1157,8 +1181,9 @@ mod fault {
         Finish,
         Sync,
         Rollback,
+        SyncDir,
     }
-    const STEPS: usize = 9;
+    const STEPS: usize = 10;
 
     thread_local! {
         static ARMED: Cell<[u32; STEPS]> = const { Cell::new([0; STEPS]) };
@@ -2267,6 +2292,26 @@ mod tests {
             error.contains("storage degraded earlier") && error.contains(&daily),
             "close must not report a clean exit, and says why: {error}"
         );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Creating the daily file, creating the sidecar and removing it once
+    /// merged each sync the directory.
+    #[test]
+    fn directory_changes_are_synced() {
+        let dir = test_dir("sync-dir");
+        let synced = || fault::calls(fault::Step::SyncDir);
+        let before = synced();
+        let mut incumbent = writer(&dir, "incumbent");
+        put(&mut incumbent, day_one(), br#"{"n":1}"#);
+        assert_eq!(synced() - before, 1, "the new daily file");
+        let mut challenger = writer(&dir, "challenger");
+        put(&mut challenger, day_one(), br#"{"n":2}"#);
+        assert_eq!(synced() - before, 2, "the new sidecar");
+        incumbent.close().unwrap();
+        challenger.close().unwrap();
+        assert_eq!(synced() - before, 3, "the merged sidecar's removal");
+        assert_eq!(names(&dir), [DAY_ONE]);
         fs::remove_dir_all(&dir).unwrap();
     }
 
