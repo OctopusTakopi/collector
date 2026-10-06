@@ -527,6 +527,27 @@ fn retry_delay(failures: u32) -> Duration {
         .min(MERGE_RETRY_MAX)
 }
 
+/// Storage faults that collection survives.
+struct Faults {
+    /// The first one: collection continues, but the exit is not clean.
+    first: Option<String>,
+    quality: QualityReporter,
+}
+
+impl Faults {
+    /// Logs and reports a fault in `target`.
+    fn report(&mut self, target: &Path, error: impl fmt::Display, what: &str) {
+        error!(path = %target.display(), %error, "{what}");
+        self.first
+            .get_or_insert_with(|| format!("{}: {error}", target.display()));
+        self.quality.report(QualityEvent::StorageDegraded {
+            at_ns: QualityEvent::now_ns(),
+            target: target.display().to_string(),
+            error: error.to_string(),
+        });
+    }
+}
+
 /// A sidecar sealed at UTC midnight, still owned by this run, appended once
 /// its day's file is free.
 struct PendingSidecar {
@@ -546,12 +567,9 @@ struct RotatingFile {
     sink: Sink,
     pending_sidecars: Vec<PendingSidecar>,
     batch: BytesMut,
-    /// A file could not be finalized or a sidecar not merged. Collection
-    /// continues, but close must not report a clean exit.
-    degraded: bool,
     /// No switch or merge is attempted before a failed one's backoff ends.
     retry: Backoff,
-    quality: QualityReporter,
+    faults: Faults,
 }
 
 impl RotatingFile {
@@ -569,9 +587,11 @@ impl RotatingFile {
             sink: Sink::Closed,
             pending_sidecars: Vec::new(),
             batch: BytesMut::with_capacity(ZSTD_BATCH_BYTES),
-            degraded: false,
             retry: Backoff::default(),
-            quality,
+            faults: Faults {
+                first: None,
+                quality,
+            },
         };
         file.sink = file.open_sink(day.date)?;
         Ok(file)
@@ -603,12 +623,19 @@ impl RotatingFile {
     /// The day's file could not be locked, verified or set aside.
     fn daily_unusable(&mut self, date: Date, error: &io::Error) {
         let daily = day_file(&self.prefix, date, format_args!(""));
-        error!(
-            path = %daily.display(),
-            %error,
-            "cannot use the daily file; records go to a run-local sidecar meanwhile"
+        self.faults.report(
+            &daily,
+            error,
+            "cannot use the daily file; records go to a run-local sidecar meanwhile",
         );
-        self.mark_degraded(daily.display().to_string(), error);
+    }
+
+    /// The file the open sink writes: the day's file, or this run's sidecar.
+    fn sink_path(&self) -> PathBuf {
+        match self.sink.sidecar() {
+            Some(sidecar) => sidecar.to_path_buf(),
+            None => day_file(&self.prefix, self.day.date, format_args!("")),
+        }
     }
 
     fn write(&mut self, timestamp: Timestamp, data: Bytes) -> io::Result<()> {
@@ -641,14 +668,14 @@ impl RotatingFile {
     fn rotate(&mut self, timestamp: Timestamp) -> io::Result<()> {
         let switched = self.switch_to_daily(AfterSwitch::Release)?;
         self.retry.record(switched);
+        let path = self.sink_path();
         let finalized = self.finalize();
         if let Err(error) = &finalized {
-            error!(
-                path = %self.prefix.display(),
-                %error,
-                "failed to finalize file on rotation; continuing with the new file"
+            self.faults.report(
+                &path,
+                error,
+                "failed to finalize file on rotation; continuing with the new file",
             );
-            self.mark_degraded(self.prefix.display().to_string(), error);
         }
         // A finished frame is whole even if its sync failed.
         let whole = !matches!(finalized, Err(FinalizeError::Unfinished(_)));
@@ -697,23 +724,18 @@ impl RotatingFile {
         let sidecar = sidecar.to_path_buf();
         match self.finalize() {
             Ok(()) => {}
-            Err(FinalizeError::Unsynced(error)) => {
-                error!(
-                    path = %sidecar.display(),
-                    %error,
-                    "handover sidecar is finished but not synced; appending it anyway"
-                );
-                self.mark_degraded(sidecar.display().to_string(), &error);
-            }
+            Err(FinalizeError::Unsynced(error)) => self.faults.report(
+                &sidecar,
+                error,
+                "handover sidecar is finished but not synced; appending it anyway",
+            ),
             Err(FinalizeError::Unfinished(error)) => {
-                error!(
-                    path = %sidecar.display(),
-                    %error,
-                    "failed to finalize handover sidecar before switching to the daily file"
-                );
-                self.mark_degraded(sidecar.display().to_string(), &error);
                 // An unfinished frame must never be appended.
-                warn!(path = %sidecar.display(), "leaving unfinished overlap sidecar on disk");
+                self.faults.report(
+                    &sidecar,
+                    error,
+                    "failed to finalize handover sidecar; leaving it on disk unfinished",
+                );
                 // Records the sidecar did not take go to the daily file.
                 self.skip_persisted(&sidecar);
                 let after = if self.batch.is_empty() {
@@ -729,12 +751,11 @@ impl RotatingFile {
             Ok(Merge::Appended) => {}
             Ok(Merge::Unterminated) => self.sidecar_unterminated(&sidecar),
             Err(error) => {
-                error!(
-                    path = %sidecar.display(),
-                    %error,
-                    "failed to append overlap sidecar after switch"
+                self.faults.report(
+                    &sidecar,
+                    error,
+                    "failed to append overlap sidecar after switch",
                 );
-                self.mark_degraded(sidecar.display().to_string(), &error);
                 self.resume_or_queue_sidecar(sidecar, daily, after)?;
                 return Ok(Progress::Failed);
             }
@@ -762,17 +783,18 @@ impl RotatingFile {
                 };
                 return Ok(());
             }
-            Err(error) => error!(
-                path = %sidecar.display(),
-                %error,
-                "failed to resume overlap sidecar after a failed merge"
+            Err(error) => self.faults.report(
+                &sidecar,
+                error,
+                "failed to resume overlap sidecar after a failed merge",
             ),
         }
         match merge_sidecar(&mut daily, &sidecar) {
             Ok(Merge::Appended) => {}
             Ok(Merge::Unterminated) => self.sidecar_unterminated(&sidecar),
             Err(error) => {
-                self.mark_degraded(sidecar.display().to_string(), &error);
+                self.faults
+                    .report(&sidecar, error, "failed to append overlap sidecar again");
                 self.pending_sidecars.push(PendingSidecar {
                     date: self.day.date,
                     path: sidecar,
@@ -810,12 +832,11 @@ impl RotatingFile {
                     Progress::Idle
                 }
                 Err(error) => {
-                    error!(
-                        path = %sidecar.path.display(),
-                        %error,
-                        "failed to append overlap sidecar after switch"
+                    self.faults.report(
+                        &sidecar.path,
+                        error,
+                        "failed to append queued overlap sidecar",
                     );
-                    self.mark_degraded(sidecar.path.display().to_string(), &error);
                     self.pending_sidecars.push(sidecar);
                     Progress::Failed
                 }
@@ -826,9 +847,11 @@ impl RotatingFile {
     }
 
     fn sidecar_unterminated(&mut self, sidecar: &Path) {
-        let error = "overlap sidecar does not end on a frame boundary; left on disk unmerged";
-        error!(path = %sidecar.display(), "{error}");
-        self.mark_degraded(sidecar.display().to_string(), error);
+        self.faults.report(
+            sidecar,
+            "it does not end on a frame boundary",
+            "overlap sidecar left on disk unmerged",
+        );
     }
 
     fn holds_sidecars(&self) -> bool {
@@ -870,21 +893,28 @@ impl RotatingFile {
     /// readable up to where it stops. A sidecar keeps the batch: the switch
     /// writes the records it lacks to the daily file.
     fn abandon_encoder(&mut self, error: &io::Error) {
-        let target = match mem::replace(&mut self.sink, Sink::Closed) {
+        match mem::replace(&mut self.sink, Sink::Closed) {
             Sink::Sidecar { path, .. } => {
-                let target = path.display().to_string();
+                self.faults.report(
+                    &path,
+                    error,
+                    "failed to write the overlap sidecar; leaving it on disk unfinished",
+                );
                 self.sink = Sink::SealedSidecar(path);
-                target
             }
             _ => {
                 let lost = self.batch.len();
                 self.batch.clear();
                 let daily = day_file(&self.prefix, self.day.date, format_args!(""));
-                format!("{} ({lost} batched bytes not recorded)", daily.display())
+                self.faults.report(
+                    &daily,
+                    error,
+                    &format!(
+                        "failed to write the daily file; leaving it unfinished, {lost} batched bytes lost"
+                    ),
+                );
             }
-        };
-        error!(file = %target, %error, "write failed; dropped the unfinished zstd frame");
-        self.mark_degraded(target, error);
+        }
     }
 
     /// Drop from the batch the records an unfinished sidecar already holds.
@@ -902,13 +932,15 @@ impl RotatingFile {
             Ok(None) => "its last record is not in the batch".to_owned(),
             Err(error) => format!("it cannot be decoded: {error}"),
         };
-        let error = format!(
-            "rewriting all {} batched bytes after the unfinished overlap sidecar; \
-             some may be recorded twice, as {unknown}",
-            self.batch.len()
+        self.faults.report(
+            sidecar,
+            unknown,
+            &format!(
+                "rewriting all {} batched bytes after the unfinished overlap sidecar; \
+                 some may be recorded twice",
+                self.batch.len()
+            ),
         );
-        warn!(path = %sidecar.display(), "{error}");
-        self.mark_degraded(sidecar.display().to_string(), error);
     }
 
     /// Flush the batch, finish the open zstd frame, end the file with its
@@ -941,15 +973,6 @@ impl RotatingFile {
         })?;
         self.batch.clear();
         seal(&mut file, &self.prefix)
-    }
-
-    fn mark_degraded(&mut self, target: String, error: impl fmt::Display) {
-        self.degraded = true;
-        self.quality.report(QualityEvent::StorageDegraded {
-            at_ns: QualityEvent::now_ns(),
-            target,
-            error: error.to_string(),
-        });
     }
 }
 
@@ -1013,15 +1036,15 @@ impl Writer {
             if file.holds_sidecars() {
                 info!(%symbol, "closing before switch; leaving overlap sidecar on disk");
             }
-            match finalized {
-                Ok(()) if file.degraded => {
-                    error!(%symbol, "file closed, but an earlier rotation could not be finalized");
+            match (finalized, &file.faults.first) {
+                (Ok(()), Some(fault)) => {
+                    error!(%symbol, fault, "file closed, but storage degraded earlier");
                     first_error.get_or_insert(anyhow::anyhow!(
-                        "{symbol}: an earlier rotation could not be finalized"
+                        "{symbol}: storage degraded earlier: {fault}"
                     ));
                 }
-                Ok(()) => info!(%symbol, "file closed cleanly"),
-                Err(error) => {
+                (Ok(()), None) => info!(%symbol, "file closed cleanly"),
+                (Err(error), _) => {
                     error!(%symbol, %error, "failed to close file");
                     first_error.get_or_insert(error.into());
                 }
@@ -2001,16 +2024,19 @@ mod tests {
             Sink::Daily(ZstdEncoder::new(dev_null, ZSTD_LEVEL).unwrap());
         put(&mut writer, day_two(), b"b");
 
+        let daily = dir.join(DAY_ONE).display().to_string();
         assert!(
             matches!(
                 events.try_recv(),
-                Ok(QualityEvent::StorageDegraded { error, .. }) if error.contains("failed to sync")
+                Ok(QualityEvent::StorageDegraded { target, error, .. })
+                    if target == daily && error.contains("failed to sync")
             ),
-            "a failed fsync must be reported"
+            "a failed fsync must be reported against the file it failed on"
         );
+        let error = writer.close().unwrap_err().to_string();
         assert!(
-            writer.close().is_err(),
-            "close must not report a clean exit"
+            error.contains("storage degraded earlier") && error.contains(&daily),
+            "close must not report a clean exit, and says why: {error}"
         );
         fs::remove_dir_all(&dir).unwrap();
     }
