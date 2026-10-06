@@ -8,7 +8,7 @@
 //! a sequence id, even on messages that carry none (Binance `forceOrder`).
 //! That is a measured property of each feed, not a law. Binance spot stamps
 //! `E` per connection (a few percent of events over two days of measurement),
-//! so the Binance worker hashes with `E` cut out ([`Dedup::is_duplicate_key`]);
+//! so the Binance worker hashes with `E` cut out ([`Dedup::is_duplicate_by`]);
 //! Binance SBE stamps `eventTime` likewise. To check a new feed, run two
 //! connections for a minute and confirm the row count does not double.
 //!
@@ -85,6 +85,11 @@ impl Dedup {
     }
 
     /// Enabled only when more than one connection can deliver the same message.
+    ///
+    /// A session handover overlaps two sockets on one connection too, so a few
+    /// messages a day are recorded twice at `-c 1`. That is the cheaper error:
+    /// a repeat can be discarded when the recording is read; a message never
+    /// written cannot be recovered.
     pub fn for_connections(connections: usize) -> Self {
         if connections > 1 {
             Self::new(DEDUP_WINDOW, DEDUP_MAX_ENTRIES)
@@ -113,15 +118,17 @@ impl Dedup {
     /// True if this payload was already seen inside the window. A `false`
     /// return records it, so call this once per message.
     pub fn is_duplicate(&mut self, payload: &[u8]) -> bool {
-        self.is_duplicate_key(xxhash_rust::xxh3::xxh3_128(payload))
+        self.is_duplicate_by(|| xxhash_rust::xxh3::xxh3_128(payload))
     }
 
-    /// [`Self::is_duplicate`] on a key the caller hashed, for copies that
-    /// differ in a per-connection stamp the caller cuts out.
-    pub fn is_duplicate_key(&mut self, key: u128) -> bool {
+    /// [`Self::is_duplicate`] on a key `key` computes, for copies that differ
+    /// in a per-connection stamp it cuts out. It runs only while the filter
+    /// is enabled, so a single connection pays for no key.
+    pub fn is_duplicate_by(&mut self, key: impl FnOnce() -> u128) -> bool {
         if !self.enabled {
             return false;
         }
+        let key = key();
 
         self.since_clock_check += 1;
         if self.since_clock_check >= CLOCK_CHECK_INTERVAL || self.current.len() >= self.max_entries
@@ -212,8 +219,15 @@ mod tests {
     fn a_repeated_key_is_reported_once() {
         let mut dedup = Dedup::new(DEDUP_WINDOW, DEDUP_MAX_ENTRIES);
 
-        assert!(!dedup.is_duplicate_key(42));
-        assert!(dedup.is_duplicate_key(42));
+        assert!(!dedup.is_duplicate_by(|| 42));
+        assert!(dedup.is_duplicate_by(|| 42));
+    }
+
+    /// A single connection's filter never computes a key.
+    #[test]
+    fn a_disabled_filter_computes_no_key() {
+        let mut dedup = Dedup::disabled();
+        assert!(!dedup.is_duplicate_by(|| unreachable!("no key for a disabled filter")));
     }
 
     #[test]

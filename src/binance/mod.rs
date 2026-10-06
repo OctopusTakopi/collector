@@ -220,7 +220,7 @@ impl Consumer for Binance {
         if self
             .recorder
             .dedup
-            .is_duplicate_key(routing::binance_dedup_key(&data))
+            .is_duplicate_by(|| routing::binance_dedup_key(&data))
         {
             return Ok(());
         }
