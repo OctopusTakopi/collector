@@ -1,4 +1,6 @@
-use std::{io, num::NonZeroUsize, path::PathBuf, time::Duration};
+mod shutdown;
+
+use std::{num::NonZeroUsize, path::PathBuf, time::Duration};
 
 use anyhow::{Context as _, anyhow};
 use clap::{
@@ -6,10 +8,8 @@ use clap::{
     builder::{PossibleValuesParser, TypedValueParser},
 };
 use tokio::{
-    select, signal,
+    select,
     sync::{mpsc::channel, oneshot, watch},
-    task::{JoinError, JoinHandle},
-    time::timeout,
 };
 use tracing::{error, info};
 
@@ -20,11 +20,9 @@ use collector::{
     quality::{self, HandoverState, QualityEvent},
     readiness::Readiness,
 };
+use shutdown::{Hangup, drain, finish_or_abort, first_error, joined};
 
 const WRITER_QUEUE_CAPACITY: usize = 65_536;
-/// How long the collection may take to hand what it already received to the
-/// writer before it is aborted.
-const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long an exiting collector waits for the handover task to send its last
 /// reply or release the socket.
 const HANDOVER_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -84,28 +82,7 @@ fn exchange_parser() -> impl TypedValueParser<Value = ExchangeArg> {
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<(), anyhow::Error> {
     let args = Args::parse();
-
-    // Logs go to the tmux pane. Once tmux is gone every write fails (EIO), and
-    // tracing-subscriber's default `eprintln!` report of that panics on the
-    // same dead terminal, which `panic = "abort"` turns into a mid-shutdown
-    // kill. Drop failed log lines instead. Otherwise as `fmt::init()`.
-    {
-        use tracing_subscriber::{
-            filter::{LevelFilter, Targets},
-            layer::SubscriberExt,
-            util::SubscriberInitExt,
-        };
-        let targets = std::env::var("RUST_LOG")
-            .ok()
-            .and_then(|spec| spec.parse::<Targets>().ok())
-            .unwrap_or_else(|| Targets::new().with_default(LevelFilter::INFO));
-        tracing_subscriber::fmt()
-            .log_internal_errors(false)
-            .with_max_level(LevelFilter::TRACE)
-            .finish()
-            .with(targets)
-            .init();
-    }
+    init_tracing();
 
     let hangup = Hangup::inherited()?;
     if hangup == Hangup::Ignored {
@@ -219,7 +196,7 @@ async fn main() -> Result<(), anyhow::Error> {
     }
 
     let shutdown = select! {
-        result = shutdown_signal(hangup) => {
+        result = shutdown::signal(hangup) => {
             let signal = result?;
             info!(signal, "shutdown signal received");
             Shutdown::Signal
@@ -322,115 +299,27 @@ async fn main() -> Result<(), anyhow::Error> {
     ])
 }
 
-/// Gives `task` `grace` to finish, then aborts it. A task whose output was
-/// already taken is left alone: polling it again would panic.
-async fn finish_or_abort<T>(task: &mut JoinHandle<T>, grace: Duration) {
-    if task.is_finished() {
-        return;
-    }
-    if timeout(grace, &mut *task).await.is_err() {
-        task.abort();
-        let _ = task.await;
-    }
-}
-
-/// Asks the collection to stop reading and waits for it to hand what it
-/// already received to the writer, aborting it after [`DRAIN_TIMEOUT`].
-async fn drain(
-    shutdown_tx: &watch::Sender<bool>,
-    handle: &mut JoinHandle<anyhow::Result<()>>,
-) -> anyhow::Result<()> {
-    shutdown_tx.send_replace(true);
-    match timeout(DRAIN_TIMEOUT, &mut *handle).await {
-        Ok(result) => joined(result),
-        Err(_) => {
-            handle.abort();
-            let _ = handle.await;
-            // Exiting 0 here would make an incomplete dump look clean.
-            Err(anyhow!(
-                "collection task did not finish draining within {DRAIN_TIMEOUT:?}; \
-                 queued records were discarded"
-            ))
-        }
-    }
-}
-
-fn joined(result: Result<anyhow::Result<()>, JoinError>) -> anyhow::Result<()> {
-    result.unwrap_or_else(|error| Err(anyhow!("collection task failed: {error}")))
-}
-
-/// The first failure, in the order given; later ones are logged.
-fn first_error<const N: usize>(
-    results: [(&'static str, anyhow::Result<()>); N],
-) -> anyhow::Result<()> {
-    let mut first = Ok(());
-    for (what, result) in results {
-        match (&first, result) {
-            (_, Ok(())) => {}
-            (Ok(()), Err(error)) => first = Err(error),
-            (Err(_), Err(error)) => error!(%error, "the {what} also failed while shutting down"),
-        }
-    }
-    first
-}
-
-/// What SIGHUP does to the collector.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Hangup {
-    /// Drain and exit. `tmux kill-session` (run_collector.sh cold restart)
-    /// delivers SIGHUP; without a handler it kills the process before
-    /// buffered records are written, leaving every open daily file without
-    /// its zstd footer.
-    Drain,
-    /// Ignored when the process started (`nohup`). A handler would replace
-    /// that `SIG_IGN`, so none is registered.
-    Ignored,
-}
-
-impl Hangup {
-    /// SIGHUP's inherited disposition; call before any handler is registered.
-    fn inherited() -> io::Result<Self> {
-        // SAFETY: an all-zero `sigaction` is a valid value, and with a null
-        // `act` sigaction(2) only stores the current disposition in `old`.
-        let old = unsafe {
-            let mut old: libc::sigaction = std::mem::zeroed();
-            if libc::sigaction(libc::SIGHUP, std::ptr::null(), &mut old) != 0 {
-                return Err(io::Error::last_os_error());
-            }
-            old
-        };
-        Ok(Self::from_handler(old.sa_sigaction))
-    }
-
-    fn from_handler(handler: libc::sighandler_t) -> Self {
-        if handler == libc::SIG_IGN {
-            Self::Ignored
-        } else {
-            Self::Drain
-        }
-    }
-}
-
-async fn shutdown_signal(hangup: Hangup) -> io::Result<&'static str> {
-    let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())?;
-    let mut sighup = match hangup {
-        Hangup::Drain => Some(signal::unix::signal(signal::unix::SignalKind::hangup())?),
-        Hangup::Ignored => None,
+/// Logs go to the tmux pane. Once tmux is gone every write fails (EIO), and
+/// tracing-subscriber's default `eprintln!` report of that panics on the same
+/// dead terminal, which `panic = "abort"` turns into a mid-shutdown kill.
+/// Failed log lines are dropped instead. Otherwise as `fmt::init()`:
+/// `RUST_LOG` targets, `INFO` by default.
+fn init_tracing() {
+    use tracing_subscriber::{
+        filter::{LevelFilter, Targets},
+        layer::SubscriberExt,
+        util::SubscriberInitExt,
     };
-    let hangup = async {
-        match &mut sighup {
-            Some(sighup) => sighup.recv().await,
-            None => std::future::pending().await,
-        }
-    };
-    select! {
-        result = signal::ctrl_c() => {
-            result?;
-            Ok("SIGINT")
-        }
-        _ = sigterm.recv() => Ok("SIGTERM"),
-        _ = hangup => Ok("SIGHUP"),
-    }
+    let targets = std::env::var("RUST_LOG")
+        .ok()
+        .and_then(|spec| spec.parse::<Targets>().ok())
+        .unwrap_or_else(|| Targets::new().with_default(LevelFilter::INFO));
+    tracing_subscriber::fmt()
+        .log_internal_errors(false)
+        .with_max_level(LevelFilter::TRACE)
+        .finish()
+        .with(targets)
+        .init();
 }
 
 #[cfg(test)]
@@ -451,12 +340,6 @@ mod tests {
             assert_eq!(args.exchange.exchange, exchange);
             assert_eq!(args.connections, NonZeroUsize::MIN);
         }
-    }
-
-    #[test]
-    fn an_inherited_sig_ign_keeps_hangups_ignored() {
-        assert_eq!(Hangup::from_handler(libc::SIG_IGN), Hangup::Ignored);
-        assert_eq!(Hangup::from_handler(libc::SIG_DFL), Hangup::Drain);
     }
 
     #[test]
