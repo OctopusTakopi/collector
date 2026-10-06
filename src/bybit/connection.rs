@@ -58,7 +58,7 @@ pub(super) fn groups(topics: &[&str], symbols: &[String]) -> Arc<[Group]> {
 
 pub(super) async fn keep_connection(groups: Arc<[Group]>, slot: Slot) {
     let connection = slot.connection;
-    session::keep_subscribed("bybit", URL, IDLE_TIMEOUT, slot, |sender| {
+    session::keep_subscribed("bybit", URL, IDLE_TIMEOUT, slot, |_, sender| {
         let (retry_tx, retry_rx) = mpsc::unbounded_channel();
         (
             Subscriptions::new(connection, Arc::clone(&groups), retry_tx),

@@ -34,13 +34,19 @@ pub(super) async fn keep_connection(
         products = products.len(),
         connection, "connecting to the Kraken Futures websocket"
     );
-    session::keep_subscribed("krakenfutures", URL, IDLE_TIMEOUT, slot, |sender| {
-        let (announced, commands) = Announced::new(connection, &lifecycle);
-        (
-            Subscriptions::new(connection, feeds, Arc::clone(&products), announced),
-            control_loop(sender, feeds, Arc::clone(&products), commands),
-        )
-    })
+    session::keep_subscribed(
+        "krakenfutures",
+        URL,
+        IDLE_TIMEOUT,
+        slot,
+        |socket, sender| {
+            let (announced, commands) = Announced::new(socket, &lifecycle);
+            (
+                Subscriptions::new(connection, feeds, Arc::clone(&products), announced),
+                control_loop(sender, feeds, Arc::clone(&products), commands),
+            )
+        },
+    )
     .await;
 }
 
@@ -183,13 +189,20 @@ mod tests {
     use tokio::sync::mpsc::unbounded_channel;
 
     use super::*;
+    use crate::session::Socket;
 
     const FEEDS: &[&str] = &[BOOK, "trade", "ticker"];
 
     fn subscriptions() -> Subscriptions {
         let products: Arc<[String]> = Arc::from(["PF_XBTUSD".to_owned(), "PF_ETHUSD".to_owned()]);
         let (lifecycle, _) = unbounded_channel();
-        let (announced, _commands) = Announced::new(0, &lifecycle);
+        let (announced, _commands) = Announced::new(
+            Socket {
+                connection: 0,
+                session: 0,
+            },
+            &lifecycle,
+        );
         Subscriptions::new(0, FEEDS, products, announced)
     }
 

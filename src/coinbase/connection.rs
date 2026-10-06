@@ -39,8 +39,8 @@ pub(super) async fn keep_connection(
         products = products.len(),
         connection, "connecting to the Coinbase Exchange feed"
     );
-    session::keep_subscribed("coinbase", URL, IDLE_TIMEOUT, slot, |sender| {
-        let (announced, commands) = Announced::new(connection, &lifecycle);
+    session::keep_subscribed("coinbase", URL, IDLE_TIMEOUT, slot, |socket, sender| {
+        let (announced, commands) = Announced::new(socket, &lifecycle);
         (
             Subscriptions::new(connection, Arc::clone(&products), channels, announced),
             control_loop(sender, Arc::clone(&products), channels, commands),
@@ -199,16 +199,26 @@ fn control_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::Socket;
 
     const CHANNELS: &[&str] = &[BOOK, "matches", "ticker", "heartbeat"];
 
     fn subscriptions() -> (Subscriptions, UnboundedReceiver<Lifecycle>) {
         let (lifecycle_tx, mut lifecycle_rx) = tokio::sync::mpsc::unbounded_channel();
         let products: Arc<[String]> = Arc::from(["BTC-USD".to_owned(), "ETH-USD".to_owned()]);
-        let (announced, _commands) = Announced::new(3, &lifecycle_tx);
+        let (announced, _commands) = Announced::new(
+            Socket {
+                connection: 3,
+                session: 0,
+            },
+            &lifecycle_tx,
+        );
         assert!(matches!(
             lifecycle_rx.try_recv(),
-            Ok(Lifecycle::Opened { connection: 3, .. })
+            Ok(Lifecycle::Opened {
+                socket: Socket { connection: 3, .. },
+                ..
+            })
         ));
         (
             Subscriptions::new(3, products, CHANNELS, announced),
@@ -296,7 +306,9 @@ mod tests {
         drop(subscriptions);
         assert!(matches!(
             lifecycle.try_recv(),
-            Ok(Lifecycle::Closed { connection: 3 })
+            Ok(Lifecycle::Closed {
+                socket: Socket { connection: 3, .. }
+            })
         ));
     }
 

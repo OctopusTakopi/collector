@@ -93,13 +93,13 @@ impl Venue for KrakenSpot {
         let index = self.pairs.iter().position(|known| known == pair);
         let keep = match (routing::kraken_channel(&frame.data), index) {
             (Some("book"), Some(index)) => self.books.admit(
-                frame.socket.connection,
+                frame.socket,
                 index,
                 routing::kraken_snapshot(&frame.data),
                 frame.recv_time,
             ),
             (Some("ticker"), Some(index)) => {
-                self.books.leads(frame.socket.connection, index)
+                self.books.leads(frame.socket, index)
                     && !self.recorder.dedup.is_duplicate(&frame.data)
             }
             _ => !self.recorder.dedup.is_duplicate(&frame.data),
@@ -125,6 +125,7 @@ mod tests {
     use tokio::sync::mpsc::{Receiver, channel};
 
     use super::*;
+    use crate::session::Socket;
     use crate::{books::Announced, file::WriteRecord};
 
     fn kraken(connections: usize) -> (KrakenSpot, Receiver<WriteRecord>) {
@@ -156,7 +157,22 @@ mod tests {
     async fn one_connections_book_and_ticker_are_recorded() {
         let (mut kraken, mut writer_rx) = kraken(2);
         let lifecycle = kraken.books.lifecycle();
-        let _sessions = (Announced::new(0, &lifecycle), Announced::new(1, &lifecycle));
+        let _sessions = (
+            Announced::new(
+                Socket {
+                    connection: 0,
+                    session: 0,
+                },
+                &lifecycle,
+            ),
+            Announced::new(
+                Socket {
+                    connection: 1,
+                    session: 0,
+                },
+                &lifecycle,
+            ),
+        );
         let snapshot = Bytes::from_static(
             br#"{"channel":"book","type":"snapshot","data":[{"symbol":"BTC/USD","bids":[{"price":86100.0,"qty":0.5}],"asks":[],"checksum":1,"timestamp":"2026-10-05T12:17:56.551146Z"}]}"#,
         );

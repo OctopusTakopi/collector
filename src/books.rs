@@ -5,13 +5,14 @@
 //! connections' books cannot be merged frame by frame (both checked live
 //! 2026-10-05).
 //!
-//! So each product's book is recorded from one connection at a time, its
-//! leader, from that connection's snapshot on. When the leader's session
-//! ends, or its chain breaks, another connection subscribes the book again
-//! and its fresh snapshot restarts the recording; until one comes, the
-//! request is renewed. The same handover runs at the top of every hour, so
-//! every hour of a daily file starts from a snapshot. A lone connection leads
-//! alone, re-snapshotted only by its reconnects and its own breaks.
+//! So each product's book is recorded from one socket at a time, its leader,
+//! from that socket's snapshot on. When the leader's session ends, or its
+//! chain breaks, another connection subscribes the book again and its fresh
+//! snapshot restarts the recording; until one comes, the request is renewed.
+//! The same handover runs at the top of every hour, so every hour of a daily
+//! file starts from a snapshot. A lone connection leads alone, re-snapshotted
+//! only by its reconnects and its own breaks. A session that replaces the
+//! leader on its own slot takes the book over at its first snapshot.
 
 use std::{collections::VecDeque, time::Duration};
 
@@ -24,6 +25,7 @@ use tracing::{error, info, warn};
 
 use crate::{
     quality::{QualityEvent, QualityReporter},
+    session::{SessionId, Socket},
     ws::FrameSender,
 };
 
@@ -36,11 +38,11 @@ const RESNAPSHOT_TIMEOUT: SignedDuration = SignedDuration::from_secs(30);
 #[derive(Debug)]
 pub(crate) enum Lifecycle {
     Opened {
-        connection: usize,
+        socket: Socket,
         commands: UnboundedSender<Resnapshot>,
     },
     Closed {
-        connection: usize,
+        socket: Socket,
     },
 }
 
@@ -52,24 +54,21 @@ pub(crate) struct Resnapshot(pub(crate) usize);
 /// A session's side: announces the session, and its end once dropped, which
 /// is as soon as it ends.
 pub(crate) struct Announced {
-    connection: usize,
+    socket: Socket,
     lifecycle: UnboundedSender<Lifecycle>,
 }
 
 impl Announced {
-    /// Announces a session on `connection`; the receiver gets what the
-    /// consumer asks of it.
+    /// Announces a session on `socket`; the receiver gets what the consumer
+    /// asks of it.
     pub(crate) fn new(
-        connection: usize,
+        socket: Socket,
         lifecycle: &UnboundedSender<Lifecycle>,
     ) -> (Self, UnboundedReceiver<Resnapshot>) {
         let (commands, received) = unbounded_channel();
-        let _ = lifecycle.send(Lifecycle::Opened {
-            connection,
-            commands,
-        });
+        let _ = lifecycle.send(Lifecycle::Opened { socket, commands });
         let announced = Self {
-            connection,
+            socket,
             lifecycle: lifecycle.clone(),
         };
         (announced, received)
@@ -79,7 +78,7 @@ impl Announced {
 impl Drop for Announced {
     fn drop(&mut self) {
         let _ = self.lifecycle.send(Lifecycle::Closed {
-            connection: self.connection,
+            socket: self.socket,
         });
     }
 }
@@ -144,24 +143,31 @@ fn next_hour(now: Timestamp) -> Timestamp {
     Timestamp::from_second(second - second.rem_euclid(3_600) + 3_600).unwrap_or(Timestamp::MAX)
 }
 
-/// A fresh snapshot asked of a connection, and when to stop waiting for it.
+/// A fresh snapshot asked of a socket, and when to stop waiting for it.
 #[derive(Clone, Copy, Debug)]
 struct Pending {
-    connection: usize,
+    socket: Socket,
     due: Timestamp,
 }
 
-/// Which connection each product's book is recorded from. Products are
-/// indices into the venue's list.
+/// A connection slot's newest live session.
+struct Session {
+    id: SessionId,
+    commands: UnboundedSender<Resnapshot>,
+}
+
+/// Which socket each product's book is recorded from. Products are indices
+/// into the venue's list.
 pub(crate) struct Books {
     /// Each product's name in reports, `<venue>/<symbol>`.
     sources: Vec<String>,
-    leader: Vec<Option<usize>>,
+    leader: Vec<Option<Socket>>,
     pending: Vec<Option<Pending>>,
     /// Since when a book has gone unrecorded, its leader lost.
     unrecorded_since: Vec<Option<Timestamp>>,
-    /// Each connection's live session.
-    sessions: Vec<Option<UnboundedSender<Resnapshot>>>,
+    /// Each connection slot's newest live session: the one asked for
+    /// snapshots.
+    sessions: Vec<Option<Session>>,
     /// The earliest `due` of any pending request.
     next_due: Option<Timestamp>,
     next_handover: Timestamp,
@@ -184,7 +190,7 @@ impl Books {
             leader: vec![None; products],
             pending: vec![None; products],
             unrecorded_since: vec![None; products],
-            sessions: vec![None; connections],
+            sessions: std::iter::repeat_with(|| None).take(connections).collect(),
             next_due: None,
             next_handover: next_hour(now),
             quality,
@@ -216,7 +222,7 @@ impl Books {
             if let Some(leader) = self.leader[product]
                 && self.pending[product].is_none()
             {
-                self.ask(product, now, Some(leader), false);
+                self.ask(product, now, Some(leader.connection), false);
             }
         }
     }
@@ -233,10 +239,10 @@ impl Books {
             if self.leader[product].is_none() {
                 warn!(
                     book = %self.sources[product],
-                    connection = pending.connection,
+                    connection = pending.socket.connection,
                     "no snapshot after a re-subscribe; asking again"
                 );
-                self.ask(product, now, Some(pending.connection), true);
+                self.ask(product, now, Some(pending.socket.connection), true);
             }
         }
         self.reschedule();
@@ -244,31 +250,52 @@ impl Books {
 
     fn on_lifecycle(&mut self, event: Lifecycle, now: Timestamp) {
         match event {
-            Lifecycle::Opened {
-                connection,
-                commands,
-            } => {
-                if let Some(session) = self.sessions.get_mut(connection) {
-                    *session = Some(commands);
+            Lifecycle::Opened { socket, commands } => {
+                let Some(session) = self.sessions.get_mut(socket.connection) else {
+                    return;
+                };
+                *session = Some(Session {
+                    id: socket.session,
+                    commands,
+                });
+                // A replacement on the leader's own slot takes the book over
+                // at its first snapshot, while the leader keeps recording.
+                for product in 0..self.sources.len() {
+                    if self.leader[product].is_some_and(|leader| {
+                        leader.connection == socket.connection && leader.session < socket.session
+                    }) && self.pending[product].is_none()
+                    {
+                        self.pending[product] = Some(Pending {
+                            socket,
+                            due: now
+                                .checked_add(RESNAPSHOT_TIMEOUT)
+                                .unwrap_or(Timestamp::MAX),
+                        });
+                    }
                 }
+                self.reschedule();
             }
-            Lifecycle::Closed { connection } => {
-                if let Some(session) = self.sessions.get_mut(connection) {
+            Lifecycle::Closed { socket } => {
+                if let Some(session) = self.sessions.get_mut(socket.connection)
+                    && session
+                        .as_ref()
+                        .is_some_and(|live| live.id == socket.session)
+                {
                     *session = None;
                 }
                 for product in 0..self.sources.len() {
-                    if self.pending[product].is_some_and(|pending| pending.connection == connection)
-                    {
+                    if self.pending[product].is_some_and(|pending| pending.socket == socket) {
                         self.pending[product] = None;
                         if self.leader[product].is_none() {
-                            self.ask(product, now, Some(connection), false);
+                            self.ask(product, now, Some(socket.connection), false);
                         }
                     }
-                    if self.leader[product] == Some(connection) {
-                        self.lose(product, now, format!("leader connection {connection} lost"));
+                    if self.leader[product] == Some(socket) {
+                        let why = format!("leader connection {} lost", socket.connection);
+                        self.lose(product, now, why);
                         // A handover already asked for still brings a snapshot.
                         if self.pending[product].is_none() {
-                            self.ask(product, now, Some(connection), false);
+                            self.ask(product, now, Some(socket.connection), false);
                         }
                     }
                 }
@@ -277,40 +304,37 @@ impl Books {
         }
     }
 
-    /// Whether a book message from `connection` is recorded. A snapshot from
-    /// the connection asked for one, or any snapshot while the book has no
-    /// leader, makes that connection the leader.
+    /// Whether a book message from `socket` is recorded. A snapshot from the
+    /// socket asked for one, or any snapshot while the book has no leader,
+    /// makes that socket the leader.
     pub(crate) fn admit(
         &mut self,
-        connection: usize,
+        socket: Socket,
         product: usize,
         snapshot: bool,
         now: Timestamp,
     ) -> bool {
         if !snapshot {
-            return self.leader[product] == Some(connection);
+            return self.leader[product] == Some(socket);
         }
-        // A snapshot still queued from a session that has since ended
-        // starts nothing: its connection has nothing to follow it with.
-        if self
-            .sessions
-            .get(connection)
-            .is_none_or(|session| session.is_none())
-        {
+        // A snapshot still queued from a session that has since ended, or
+        // been replaced, starts nothing: nothing will follow it.
+        if !self.is_live(socket) {
             return false;
         }
         let leads = match self.leader[product] {
             Some(leader) => {
-                leader == connection
-                    || self.pending[product].is_some_and(|pending| pending.connection == connection)
+                leader == socket
+                    || self.pending[product].is_some_and(|pending| pending.socket == socket)
             }
             None => true,
         };
         if leads {
-            if self.leader[product] != Some(connection) {
+            if self.leader[product] != Some(socket) {
                 info!(
                     book = %self.sources[product],
-                    connection,
+                    connection = socket.connection,
+                    session = socket.session,
                     previous = ?self.leader[product],
                     "recording the book from a fresh snapshot"
                 );
@@ -319,10 +343,13 @@ impl Books {
                 let hole = now.duration_since(since);
                 self.report(
                     product,
-                    format!("book recorded again from connection {connection} after {hole:#}"),
+                    format!(
+                        "book recorded again from connection {} after {hole:#}",
+                        socket.connection
+                    ),
                 );
             }
-            self.leader[product] = Some(connection);
+            self.leader[product] = Some(socket);
             if self.pending[product].take().is_some() {
                 self.reschedule();
             }
@@ -330,26 +357,35 @@ impl Books {
         leads
     }
 
-    /// Whether `connection` speaks for `product` in its other unsequenced
+    /// Whether `socket` is its slot's newest live session.
+    fn is_live(&self, socket: Socket) -> bool {
+        self.sessions.get(socket.connection).is_some_and(|session| {
+            session
+                .as_ref()
+                .is_some_and(|live| live.id == socket.session)
+        })
+    }
+
+    /// Whether `socket` speaks for `product` in its other unsequenced
     /// streams: its book's leader, or anyone before the book has one.
-    pub(crate) fn leads(&self, connection: usize, product: usize) -> bool {
-        self.leader[product].is_none_or(|leader| leader == connection)
+    pub(crate) fn leads(&self, socket: Socket, product: usize) -> bool {
+        self.leader[product].is_none_or(|leader| leader == socket)
     }
 
     /// The leader's own chain broke: stop recording its book and ask for a
     /// fresh snapshot, from another connection first, since the one that
     /// broke may be the one falling behind.
-    pub(crate) fn broken(&mut self, connection: usize, product: usize, now: Timestamp) {
-        if self.leader[product] != Some(connection) {
+    pub(crate) fn broken(&mut self, socket: Socket, product: usize, now: Timestamp) {
+        if self.leader[product] != Some(socket) {
             return;
         }
         self.lose(
             product,
             now,
-            format!("chain broken on leader connection {connection}"),
+            format!("chain broken on leader connection {}", socket.connection),
         );
         self.pending[product] = None;
-        self.ask(product, now, Some(connection), true);
+        self.ask(product, now, Some(socket.connection), true);
     }
 
     fn lose(&mut self, product: usize, now: Timestamp, why: String) {
@@ -365,27 +401,30 @@ impl Books {
         );
     }
 
-    /// Asks a live connection other than `avoid` for a fresh snapshot of
-    /// `product`'s book, or `avoid` itself when `fall_back` and it is the only
-    /// one live. With nobody to ask, the next session's own subscribe brings
-    /// one.
+    /// Asks the newest session of a connection other than `avoid` for a
+    /// fresh snapshot of `product`'s book, or `avoid`'s when `fall_back` and
+    /// it is the only one live. With nobody to ask, the next session's own
+    /// subscribe brings one.
     fn ask(&mut self, product: usize, now: Timestamp, avoid: Option<usize>, fall_back: bool) {
         let candidates = (0..self.sessions.len())
             .filter(|&connection| Some(connection) != avoid)
             .chain(avoid.filter(|_| fall_back));
         let mut asked = None;
         for connection in candidates {
-            if let Some(Some(commands)) = self.sessions.get(connection)
-                && commands.send(Resnapshot(product)).is_ok()
+            if let Some(Some(session)) = self.sessions.get(connection)
+                && session.commands.send(Resnapshot(product)).is_ok()
             {
-                asked = Some(connection);
+                asked = Some(Socket {
+                    connection,
+                    session: session.id,
+                });
                 break;
             }
         }
         let due = now
             .checked_add(RESNAPSHOT_TIMEOUT)
             .unwrap_or(Timestamp::MAX);
-        self.pending[product] = asked.map(|connection| Pending { connection, due });
+        self.pending[product] = asked.map(|socket| Pending { socket, due });
         self.reschedule();
     }
 
@@ -424,56 +463,64 @@ mod tests {
         )
     }
 
+    /// Session `session` of connection slot `connection`.
+    const fn on(connection: usize, session: SessionId) -> Socket {
+        Socket {
+            connection,
+            session,
+        }
+    }
+
     impl Books {
-        /// Opens a session on `connection`; returns the guard that closes it
-        /// and what it is asked to do.
-        fn open(&self, connection: usize) -> (Announced, UnboundedReceiver<Resnapshot>) {
-            Announced::new(connection, &self.lifecycle_tx)
+        /// Opens a session on `socket`; returns the guard that closes it and
+        /// what it is asked to do.
+        fn open(&self, socket: Socket) -> (Announced, UnboundedReceiver<Resnapshot>) {
+            Announced::new(socket, &self.lifecycle_tx)
         }
 
-        fn snapshot(&mut self, connection: usize, time: &str) -> bool {
+        fn snapshot(&mut self, socket: Socket, time: &str) -> bool {
             self.catch_up(at(time));
-            self.admit(connection, 0, true, at(time))
+            self.admit(socket, 0, true, at(time))
         }
 
-        fn update(&mut self, connection: usize, time: &str) -> bool {
+        fn update(&mut self, socket: Socket, time: &str) -> bool {
             self.catch_up(at(time));
-            self.admit(connection, 0, false, at(time))
+            self.admit(socket, 0, false, at(time))
         }
     }
 
     #[test]
     fn the_first_snapshot_leads_and_other_books_are_dropped() {
         let mut books = books(2, QualityReporter::disabled());
-        let (_s0, _c0) = books.open(0);
-        let (_s1, _c1) = books.open(1);
+        let (_s0, _c0) = books.open(on(0, 0));
+        let (_s1, _c1) = books.open(on(1, 0));
 
-        assert!(books.snapshot(0, "2026-10-05T10:30:00Z"));
-        assert!(!books.snapshot(1, "2026-10-05T10:30:05Z"));
-        assert!(books.update(0, "2026-10-05T10:30:06Z"));
-        assert!(!books.update(1, "2026-10-05T10:30:06Z"));
-        assert!(books.leads(0, 0) && !books.leads(1, 0));
+        assert!(books.snapshot(on(0, 0), "2026-10-05T10:30:00Z"));
+        assert!(!books.snapshot(on(1, 0), "2026-10-05T10:30:05Z"));
+        assert!(books.update(on(0, 0), "2026-10-05T10:30:06Z"));
+        assert!(!books.update(on(1, 0), "2026-10-05T10:30:06Z"));
+        assert!(books.leads(on(0, 0), 0) && !books.leads(on(1, 0), 0));
     }
 
     #[test]
     fn before_any_snapshot_everyone_speaks_for_the_book() {
         let books = books(2, QualityReporter::disabled());
-        assert!(books.leads(0, 0) && books.leads(1, 0));
+        assert!(books.leads(on(0, 0), 0) && books.leads(on(1, 0), 0));
     }
 
     #[test]
     fn a_lost_leader_hands_the_book_over_at_a_fresh_snapshot() {
         let (quality, events) = QualityReporter::test_channel();
         let mut books = books(2, quality);
-        let (s0, _c0) = books.open(0);
-        let (_s1, mut c1) = books.open(1);
-        assert!(books.snapshot(0, "2026-10-05T10:30:00Z"));
+        let (s0, _c0) = books.open(on(0, 0));
+        let (_s1, mut c1) = books.open(on(1, 0));
+        assert!(books.snapshot(on(0, 0), "2026-10-05T10:30:00Z"));
 
         drop(s0);
-        assert!(!books.update(1, "2026-10-05T10:30:10Z"));
+        assert!(!books.update(on(1, 0), "2026-10-05T10:30:10Z"));
         assert_eq!(c1.try_recv(), Ok(Resnapshot(0)));
-        assert!(books.snapshot(1, "2026-10-05T10:30:10.8Z"));
-        assert!(books.update(1, "2026-10-05T10:30:11Z"));
+        assert!(books.snapshot(on(1, 0), "2026-10-05T10:30:10.8Z"));
+        assert!(books.update(on(1, 0), "2026-10-05T10:30:11Z"));
 
         let details: Vec<String> = std::iter::from_fn(|| events.try_recv().ok())
             .map(|event| match event {
@@ -498,14 +545,14 @@ mod tests {
     #[test]
     fn a_snapshot_from_an_ended_session_is_turned_away() {
         let mut books = books(2, QualityReporter::disabled());
-        let (s0, _c0) = books.open(0);
-        let (_s1, mut c1) = books.open(1);
-        assert!(books.snapshot(0, "2026-10-05T10:30:00Z"));
+        let (s0, _c0) = books.open(on(0, 0));
+        let (_s1, mut c1) = books.open(on(1, 0));
+        assert!(books.snapshot(on(0, 0), "2026-10-05T10:30:00Z"));
 
         drop(s0);
-        assert!(!books.snapshot(0, "2026-10-05T10:30:01Z"));
+        assert!(!books.snapshot(on(0, 0), "2026-10-05T10:30:01Z"));
         assert_eq!(c1.try_recv(), Ok(Resnapshot(0)));
-        assert!(books.snapshot(1, "2026-10-05T10:30:02Z"));
+        assert!(books.snapshot(on(1, 0), "2026-10-05T10:30:02Z"));
     }
 
     /// At the top of the hour another connection re-subscribes; the old
@@ -514,25 +561,25 @@ mod tests {
     fn the_hourly_handover_switches_leaders_without_a_hole() {
         let (quality, events) = QualityReporter::test_channel();
         let mut books = books(2, quality);
-        let (_s0, mut c0) = books.open(0);
-        let (_s1, mut c1) = books.open(1);
-        assert!(books.snapshot(0, "2026-10-05T10:30:00Z"));
-        assert!(books.update(0, "2026-10-05T10:59:59Z"));
+        let (_s0, mut c0) = books.open(on(0, 0));
+        let (_s1, mut c1) = books.open(on(1, 0));
+        assert!(books.snapshot(on(0, 0), "2026-10-05T10:30:00Z"));
+        assert!(books.update(on(0, 0), "2026-10-05T10:59:59Z"));
         assert!(c1.try_recv().is_err());
 
-        assert!(books.update(0, "2026-10-05T11:00:00Z"));
+        assert!(books.update(on(0, 0), "2026-10-05T11:00:00Z"));
         assert_eq!(c1.try_recv(), Ok(Resnapshot(0)));
-        assert!(books.update(0, "2026-10-05T11:00:00.5Z"));
-        assert!(books.snapshot(1, "2026-10-05T11:00:00.9Z"));
-        assert!(!books.update(0, "2026-10-05T11:00:01Z"));
-        assert!(books.update(1, "2026-10-05T11:00:01Z"));
+        assert!(books.update(on(0, 0), "2026-10-05T11:00:00.5Z"));
+        assert!(books.snapshot(on(1, 0), "2026-10-05T11:00:00.9Z"));
+        assert!(!books.update(on(0, 0), "2026-10-05T11:00:01Z"));
+        assert!(books.update(on(1, 0), "2026-10-05T11:00:01Z"));
         assert!(c0.try_recv().is_err(), "the leader is never asked");
         assert!(events.try_recv().is_err(), "a handover is not a hole");
 
         // The next one comes an hour later, back to connection 0.
-        assert!(books.update(1, "2026-10-05T11:59:59Z"));
+        assert!(books.update(on(1, 0), "2026-10-05T11:59:59Z"));
         assert!(c0.try_recv().is_err());
-        assert!(books.update(1, "2026-10-05T12:00:00Z"));
+        assert!(books.update(on(1, 0), "2026-10-05T12:00:00Z"));
         assert_eq!(c0.try_recv(), Ok(Resnapshot(0)));
     }
 
@@ -541,53 +588,53 @@ mod tests {
     #[test]
     fn a_lone_connection_leads_alone() {
         let mut books = books(1, QualityReporter::disabled());
-        let (s0, mut c0) = books.open(0);
-        assert!(books.snapshot(0, "2026-10-05T10:30:00Z"));
-        assert!(books.update(0, "2026-10-05T11:00:01Z"));
+        let (s0, mut c0) = books.open(on(0, 0));
+        assert!(books.snapshot(on(0, 0), "2026-10-05T10:30:00Z"));
+        assert!(books.update(on(0, 0), "2026-10-05T11:00:01Z"));
         assert!(c0.try_recv().is_err(), "a handover never asks the leader");
 
         drop(s0);
-        let (_s0, _c0) = books.open(0);
-        assert!(!books.update(0, "2026-10-05T11:00:05Z"));
-        assert!(books.snapshot(0, "2026-10-05T11:00:06Z"));
-        assert!(books.update(0, "2026-10-05T11:00:07Z"));
+        let (_s1, _c1) = books.open(on(0, 1));
+        assert!(!books.update(on(0, 1), "2026-10-05T11:00:05Z"));
+        assert!(books.snapshot(on(0, 1), "2026-10-05T11:00:06Z"));
+        assert!(books.update(on(0, 1), "2026-10-05T11:00:07Z"));
     }
 
     /// An unanswered request goes to another connection when there is one.
     #[test]
     fn an_unanswered_request_goes_elsewhere() {
         let mut books = books(3, QualityReporter::disabled());
-        let (s0, _c0) = books.open(0);
-        let (_s1, mut c1) = books.open(1);
-        let (_s2, mut c2) = books.open(2);
-        assert!(books.snapshot(0, "2026-10-05T10:30:00Z"));
+        let (s0, _c0) = books.open(on(0, 0));
+        let (_s1, mut c1) = books.open(on(1, 0));
+        let (_s2, mut c2) = books.open(on(2, 0));
+        assert!(books.snapshot(on(0, 0), "2026-10-05T10:30:00Z"));
         drop(s0);
-        assert!(!books.update(1, "2026-10-05T10:30:01Z"));
+        assert!(!books.update(on(1, 0), "2026-10-05T10:30:01Z"));
         assert_eq!(c1.try_recv(), Ok(Resnapshot(0)));
 
-        assert!(!books.update(2, "2026-10-05T10:30:30Z"));
+        assert!(!books.update(on(2, 0), "2026-10-05T10:30:30Z"));
         assert!(c2.try_recv().is_err(), "the request is not due yet");
-        assert!(!books.update(2, "2026-10-05T10:30:31Z"));
+        assert!(!books.update(on(2, 0), "2026-10-05T10:30:31Z"));
         assert_eq!(c2.try_recv(), Ok(Resnapshot(0)));
         assert!(c1.try_recv().is_err());
-        assert!(books.snapshot(2, "2026-10-05T10:30:32Z"));
+        assert!(books.snapshot(on(2, 0), "2026-10-05T10:30:32Z"));
     }
 
     /// A lone connection whose chain broke is asked again until it answers.
     #[test]
     fn a_lone_connection_is_asked_until_it_answers() {
         let mut books = books(1, QualityReporter::disabled());
-        let (_s0, mut c0) = books.open(0);
-        assert!(books.snapshot(0, "2026-10-05T10:30:00Z"));
-        books.broken(0, 0, at("2026-10-05T10:30:30Z"));
+        let (_s0, mut c0) = books.open(on(0, 0));
+        assert!(books.snapshot(on(0, 0), "2026-10-05T10:30:00Z"));
+        books.broken(on(0, 0), 0, at("2026-10-05T10:30:30Z"));
         assert_eq!(c0.try_recv(), Ok(Resnapshot(0)));
 
         for time in ["2026-10-05T10:31:00Z", "2026-10-05T10:31:30Z"] {
-            assert!(!books.update(0, time));
+            assert!(!books.update(on(0, 0), time));
             assert_eq!(c0.try_recv(), Ok(Resnapshot(0)), "{time}");
         }
-        assert!(books.snapshot(0, "2026-10-05T10:31:31Z"));
-        assert!(books.update(0, "2026-10-05T10:32:01Z"));
+        assert!(books.snapshot(on(0, 0), "2026-10-05T10:31:31Z"));
+        assert!(books.update(on(0, 0), "2026-10-05T10:32:01Z"));
         assert!(c0.try_recv().is_err(), "an answered request is not renewed");
     }
 
@@ -596,14 +643,14 @@ mod tests {
     #[test]
     fn an_unanswered_handover_lapses() {
         let mut books = books(2, QualityReporter::disabled());
-        let (_s0, mut c0) = books.open(0);
-        let (_s1, mut c1) = books.open(1);
-        assert!(books.snapshot(0, "2026-10-05T10:30:00Z"));
-        assert!(books.update(0, "2026-10-05T11:00:00Z"));
+        let (_s0, mut c0) = books.open(on(0, 0));
+        let (_s1, mut c1) = books.open(on(1, 0));
+        assert!(books.snapshot(on(0, 0), "2026-10-05T10:30:00Z"));
+        assert!(books.update(on(0, 0), "2026-10-05T11:00:00Z"));
         assert_eq!(c1.try_recv(), Ok(Resnapshot(0)));
 
-        assert!(books.update(0, "2026-10-05T11:00:31Z"));
-        assert!(books.update(0, "2026-10-05T11:30:00Z"));
+        assert!(books.update(on(0, 0), "2026-10-05T11:00:31Z"));
+        assert!(books.update(on(0, 0), "2026-10-05T11:30:00Z"));
         assert!(c0.try_recv().is_err() && c1.try_recv().is_err());
     }
 
@@ -613,25 +660,61 @@ mod tests {
     fn a_broken_leader_chain_is_re_snapshotted_elsewhere() {
         let (quality, events) = QualityReporter::test_channel();
         let mut books = books(2, quality);
-        let (_s0, mut c0) = books.open(0);
-        let (_s1, mut c1) = books.open(1);
-        assert!(books.snapshot(0, "2026-10-05T10:30:00Z"));
+        let (_s0, mut c0) = books.open(on(0, 0));
+        let (_s1, mut c1) = books.open(on(1, 0));
+        assert!(books.snapshot(on(0, 0), "2026-10-05T10:30:00Z"));
 
-        books.broken(1, 0, at("2026-10-05T10:30:01Z"));
+        books.broken(on(1, 0), 0, at("2026-10-05T10:30:01Z"));
         assert!(
-            books.update(0, "2026-10-05T10:30:01Z"),
+            books.update(on(0, 0), "2026-10-05T10:30:01Z"),
             "only the leader's breaks count"
         );
 
-        books.broken(0, 0, at("2026-10-05T10:30:02Z"));
-        assert!(!books.update(0, "2026-10-05T10:30:02Z"));
+        books.broken(on(0, 0), 0, at("2026-10-05T10:30:02Z"));
+        assert!(!books.update(on(0, 0), "2026-10-05T10:30:02Z"));
         assert_eq!(c1.try_recv(), Ok(Resnapshot(0)));
         assert!(c0.try_recv().is_err());
-        assert!(books.snapshot(1, "2026-10-05T10:30:03Z"));
+        assert!(books.snapshot(on(1, 0), "2026-10-05T10:30:03Z"));
         assert!(matches!(
             events.try_recv(),
             Ok(QualityEvent::FeedDegraded { detail, .. }) if detail.contains("chain broken")
         ));
+    }
+
+    /// A session replacing the leader on its own slot takes the book over
+    /// at its first snapshot, and the leader records until then: no hole.
+    #[test]
+    fn a_replacement_on_the_leaders_slot_takes_over_without_a_hole() {
+        let (quality, events) = QualityReporter::test_channel();
+        let mut books = books(1, quality);
+        let (old, _c0) = books.open(on(0, 0));
+        assert!(books.snapshot(on(0, 0), "2026-10-05T10:30:00Z"));
+
+        let (_new, _c1) = books.open(on(0, 1));
+        assert!(books.update(on(0, 0), "2026-10-05T10:30:01Z"));
+        assert!(!books.update(on(0, 1), "2026-10-05T10:30:01Z"));
+        assert!(books.snapshot(on(0, 1), "2026-10-05T10:30:02Z"));
+        assert!(!books.update(on(0, 0), "2026-10-05T10:30:03Z"));
+        assert!(books.update(on(0, 1), "2026-10-05T10:30:03Z"));
+
+        drop(old);
+        assert!(books.update(on(0, 1), "2026-10-05T10:30:04Z"));
+        assert!(events.try_recv().is_err(), "a replacement is not a hole");
+    }
+
+    /// Once replaced, a session is no longer its slot's: its end must not
+    /// forget the replacement, and its queued snapshot must not lead.
+    #[test]
+    fn a_replaced_sessions_end_and_snapshots_leave_its_successor_alone() {
+        let mut books = books(1, QualityReporter::disabled());
+        let (old, _c0) = books.open(on(0, 0));
+        let (_new, mut c1) = books.open(on(0, 1));
+        drop(old);
+
+        assert!(!books.snapshot(on(0, 0), "2026-10-05T10:30:00Z"));
+        assert!(books.snapshot(on(0, 1), "2026-10-05T10:30:01Z"));
+        books.broken(on(0, 1), 0, at("2026-10-05T10:30:02Z"));
+        assert_eq!(c1.try_recv(), Ok(Resnapshot(0)), "the newest is asked");
     }
 
     #[test]

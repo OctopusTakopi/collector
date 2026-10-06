@@ -69,7 +69,7 @@ pub(super) async fn keep_connection(
         subscribe_pace = ?pace,
         "connecting to the Hyperliquid websocket"
     );
-    session::keep_subscribed("hyperliquid", URL, IDLE_TIMEOUT, slot, |sender| {
+    session::keep_subscribed("hyperliquid", URL, IDLE_TIMEOUT, slot, |_, sender| {
         let (rejected_tx, rejected_rx) = mpsc::unbounded_channel();
         (
             Subscriptions::new(connection, Arc::clone(&subscriptions), rejected_tx),

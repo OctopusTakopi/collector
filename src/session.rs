@@ -287,15 +287,15 @@ where
 /// Keeps one connection slot of a venue that subscribes after connecting,
 /// reconnecting with backoff until the collector shuts down.
 ///
-/// `start` sets up each session from its write handle: the read-side protocol
-/// and the control loop (pings, subscriptions, retries) that writes for it.
-/// The control loop ending ends the session.
+/// `start` sets up each session from its socket and write handle: the
+/// read-side protocol and the control loop (pings, subscriptions, retries)
+/// that writes for it. The control loop ending ends the session.
 pub(crate) async fn keep_subscribed<P, C>(
     endpoint: &'static str,
     url: &str,
     idle_timeout: Duration,
     slot: Slot,
-    mut start: impl FnMut(FrameSender) -> (P, C),
+    mut start: impl FnMut(Socket, FrameSender) -> (P, C),
 ) where
     P: Protocol,
     C: Future<Output = ()>,
@@ -319,9 +319,13 @@ pub(crate) async fn keep_subscribed<P, C>(
             }
         };
         let opened = Instant::now();
-        let (mut protocol, control) = start(conn.sender());
-        let mut producer = slot.producer(endpoint, next_session);
+        let socket = Socket {
+            connection,
+            session: next_session,
+        };
         next_session += 1;
+        let (mut protocol, control) = start(socket, conn.sender());
+        let mut producer = slot.producer(endpoint, socket.session);
         let lost = match read(
             &mut conn,
             &mut protocol,

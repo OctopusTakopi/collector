@@ -20,7 +20,7 @@ use crate::{
     collection::{self, Context, Recorder, Venue},
     error::ConnectorError,
     routing,
-    session::{Frame, Slot},
+    session::{Frame, Slot, Socket},
 };
 
 pub(crate) use connection::BOOK;
@@ -88,15 +88,11 @@ impl Venue for KrakenFutures {
             .iter()
             .position(|product| product == product_id);
         let keep = match (routing::kraken_futures_book(&frame.data), index) {
-            (Some((_, seq, snapshot)), Some(index)) => self.book(
-                frame.socket.connection,
-                index,
-                seq,
-                snapshot,
-                frame.recv_time,
-            ),
+            (Some((_, seq, snapshot)), Some(index)) => {
+                self.book(frame.socket, index, seq, snapshot, frame.recv_time)
+            }
             (None, Some(index)) if routing::kraken_futures_feed(&frame.data) == Some("ticker") => {
-                self.books.leads(frame.socket.connection, index)
+                self.books.leads(frame.socket, index)
                     && !self.recorder.dedup.is_duplicate(&frame.data)
             }
             _ => !self.recorder.dedup.is_duplicate(&frame.data),
@@ -116,13 +112,13 @@ impl KrakenFutures {
     /// `seq` one above the last.
     fn book(
         &mut self,
-        connection: usize,
+        socket: Socket,
         product: usize,
         seq: i64,
         snapshot: bool,
         now: Timestamp,
     ) -> bool {
-        if !self.books.admit(connection, product, snapshot, now) {
+        if !self.books.admit(socket, product, snapshot, now) {
             return false;
         }
         match self.chain[product] {
@@ -131,12 +127,12 @@ impl KrakenFutures {
             last => {
                 tracing::warn!(
                     product = %self.products[product],
-                    connection,
+                    connection = socket.connection,
                     ?last,
                     seq,
                     "book chain broken on the leader"
                 );
-                self.books.broken(connection, product, now);
+                self.books.broken(socket, product, now);
                 self.chain[product] = None;
                 return false;
             }
@@ -216,7 +212,22 @@ mod tests {
     async fn one_connections_book_is_recorded() {
         let (mut kraken, mut writer_rx) = kraken(2);
         let lifecycle = kraken.books.lifecycle();
-        let _sessions = (Announced::new(0, &lifecycle), Announced::new(1, &lifecycle));
+        let _sessions = (
+            Announced::new(
+                Socket {
+                    connection: 0,
+                    session: 0,
+                },
+                &lifecycle,
+            ),
+            Announced::new(
+                Socket {
+                    connection: 1,
+                    session: 0,
+                },
+                &lifecycle,
+            ),
+        );
         for (connection, frame) in [
             (0, snapshot(100)),
             (0, delta(101)),
@@ -238,7 +249,13 @@ mod tests {
     async fn a_break_on_the_leader_waits_for_a_fresh_snapshot() {
         let (mut kraken, mut writer_rx) = kraken(1);
         let lifecycle = kraken.books.lifecycle();
-        let (_session, mut commands) = Announced::new(0, &lifecycle);
+        let (_session, mut commands) = Announced::new(
+            Socket {
+                connection: 0,
+                session: 0,
+            },
+            &lifecycle,
+        );
         for seq in [100, 101] {
             let frame = if seq == 100 {
                 snapshot(seq)

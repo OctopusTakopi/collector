@@ -89,12 +89,10 @@ impl Venue for Coinbase {
             .iter()
             .position(|product| product == product_id);
         let keep = match (route.kind, book) {
-            (kind @ ("snapshot" | "l2update"), Some(product)) => self.books.admit(
-                frame.socket.connection,
-                product,
-                kind == "snapshot",
-                frame.recv_time,
-            ),
+            (kind @ ("snapshot" | "l2update"), Some(product)) => {
+                self.books
+                    .admit(frame.socket, product, kind == "snapshot", frame.recv_time)
+            }
             _ => match routing::coinbase_sequence_key(&route) {
                 Some(key) => !self.recorder.dedup.is_duplicate_key(key),
                 None => !self.recorder.dedup.is_duplicate(&frame.data),
@@ -118,6 +116,7 @@ mod tests {
     use tokio::sync::mpsc::{Receiver, channel};
 
     use super::*;
+    use crate::session::Socket;
     use crate::{books::Announced, file::WriteRecord, quality::QualityReporter};
 
     const CHANNELS: &[&str] = &[BOOK, "matches", "ticker", "heartbeat"];
@@ -204,7 +203,22 @@ mod tests {
     async fn one_connections_book_is_recorded() {
         let (mut coinbase, mut writer_rx) = coinbase(2);
         let lifecycle = coinbase.books.lifecycle();
-        let _sessions = (Announced::new(0, &lifecycle), Announced::new(1, &lifecycle));
+        let _sessions = (
+            Announced::new(
+                Socket {
+                    connection: 0,
+                    session: 0,
+                },
+                &lifecycle,
+            ),
+            Announced::new(
+                Socket {
+                    connection: 1,
+                    session: 0,
+                },
+                &lifecycle,
+            ),
+        );
 
         coinbase.feed(0, SNAPSHOT).await;
         coinbase.feed(1, SNAPSHOT).await;

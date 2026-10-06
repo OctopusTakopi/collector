@@ -38,8 +38,8 @@ pub(super) async fn keep_connection(
         pairs = pairs.len(),
         connection, "connecting to the Kraken spot websocket"
     );
-    session::keep_subscribed("krakenspot", URL, IDLE_TIMEOUT, slot, |sender| {
-        let (announced, commands) = Announced::new(connection, &lifecycle);
+    session::keep_subscribed("krakenspot", URL, IDLE_TIMEOUT, slot, |socket, sender| {
+        let (announced, commands) = Announced::new(socket, &lifecycle);
         (
             Subscriptions::new(connection, channels, Arc::clone(&pairs), announced),
             control_loop(sender, channels, Arc::clone(&pairs), commands),
@@ -216,13 +216,20 @@ fn control_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::Socket;
 
     const CHANNELS: &[&str] = &["book", "trade", "ticker"];
 
     fn subscriptions() -> Subscriptions {
         let pairs: Arc<[String]> = Arc::from(["BTC/USD".to_owned(), "DOGE/USD".to_owned()]);
         let (lifecycle, _) = tokio::sync::mpsc::unbounded_channel();
-        let (announced, _commands) = Announced::new(0, &lifecycle);
+        let (announced, _commands) = Announced::new(
+            Socket {
+                connection: 0,
+                session: 0,
+            },
+            &lifecycle,
+        );
         Subscriptions::new(0, CHANNELS, pairs, announced)
     }
 
