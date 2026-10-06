@@ -1,6 +1,6 @@
 use std::{io, num::NonZeroUsize, path::PathBuf, time::Duration};
 
-use anyhow::anyhow;
+use anyhow::{Context as _, anyhow};
 use clap::{
     Parser, ValueEnum,
     builder::{PossibleValuesParser, TypedValueParser},
@@ -114,6 +114,11 @@ async fn main() -> Result<(), anyhow::Error> {
 
     let exchange = args.exchange.exchange;
     let connections = args.connections;
+    // Before the output directory, the quality log or the handover socket.
+    exchange
+        .check_listings(&args.symbols)
+        .await
+        .with_context(|| format!("cannot collect {}", args.exchange.name))?;
     let (readiness, ready_rx) = Readiness::new(exchange.required_sources(connections));
     if connections.get() > 1 {
         info!(

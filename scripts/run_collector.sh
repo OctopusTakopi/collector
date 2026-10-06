@@ -37,7 +37,11 @@ symbol_for() {
             fi
             echo "PF_${coin^^}USD"
             ;;
-        *) echo "${coin}usdt" ;;
+        binancespot | binancefutures | bybit) echo "${coin}usdt" ;;
+        *)
+            echo "Error: no symbol convention for $exchange." >&2
+            exit 1
+            ;;
     esac
 }
 

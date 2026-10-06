@@ -19,7 +19,7 @@ use crate::{
     error::ConnectorError,
     feed::{BackgroundResult, Feed},
     file::WriteRecord,
-    hyperliquid, kraken_futures, kraken_spot,
+    hyperliquid, kraken_futures, kraken_spot, listing,
     quality::QualityReporter,
     readiness::Readiness,
     session::{self, Frame, Protocol},
@@ -102,6 +102,12 @@ impl Exchange {
     /// endpoint worker [`Self::collect`] starts.
     pub fn required_sources(self, connections: NonZeroUsize) -> usize {
         self.workers().len() * connections.get()
+    }
+
+    /// Checks `symbols` against the venue's own listings, so that a symbol
+    /// it does not list stops the process before anything starts.
+    pub async fn check_listings(self, symbols: &[String]) -> anyhow::Result<()> {
+        listing::check(self, symbols).await
     }
 
     /// Records `symbols` until shutdown or a critical failure.
