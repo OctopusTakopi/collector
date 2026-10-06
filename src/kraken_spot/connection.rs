@@ -10,8 +10,8 @@ use tracing::{error, info, warn};
 
 use crate::{
     books::{self, Announced, Lifecycle, Resnapshot},
+    legacy::{self, Lost, Protocol, Slot},
     routing,
-    session::{self, Lost, Protocol, Slot},
     ws::FrameSender,
 };
 
@@ -38,7 +38,7 @@ pub(super) async fn keep_connection(
         pairs = pairs.len(),
         connection, "connecting to the Kraken spot websocket"
     );
-    session::keep_subscribed("krakenspot", URL, IDLE_TIMEOUT, slot, |socket, sender| {
+    legacy::keep_subscribed("krakenspot", URL, IDLE_TIMEOUT, slot, |socket, sender| {
         let (announced, commands) = Announced::new(socket, &lifecycle);
         (
             Subscriptions::new(connection, channels, Arc::clone(&pairs), announced),

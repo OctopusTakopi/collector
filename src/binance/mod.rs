@@ -3,26 +3,26 @@
 //! The three markets differ only in their [`Endpoint`]: URLs, how long the
 //! socket may stay silent, and how the depth stream signals a missed update.
 
-mod session;
+mod protocol;
 
-use std::{collections::HashMap, future::Future, sync::Arc, time::Duration};
+use std::{collections::HashMap, future::Future, time::Duration};
 
 use bytes::Bytes;
 use jiff::Timestamp;
-use rustls::ClientConfig;
 use tokio::task::JoinSet;
 use tracing::warn;
 
 use crate::{
-    collection::{self, Context, Recorder, Venue},
+    collection::{self, Consumer, Context, Recorder},
     error::ConnectorError,
     quality::{QualityEvent, QualityReporter},
     routing::{self, BinanceEvent},
-    session::{Frame, Slot},
+    session::Frame,
     snapshot::{Depth, Snapshots},
     symbol::Symbol,
     throttler::{self, Throttler},
 };
+use protocol::Stream;
 
 /// How a market's depth stream signals that an update was missed.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -152,7 +152,6 @@ pub(crate) async fn collect(
     streams: &[&str],
     symbols: &[String],
     cx: Context,
-    tls: Arc<ClientConfig>,
 ) -> anyhow::Result<()> {
     let mut recorder = Recorder::new(cx.writer_tx.clone(), symbols, cx.connections);
     let snapshots = Snapshots::new(
@@ -177,16 +176,19 @@ pub(crate) async fn collect(
             ))
         });
     }
-    let binance = Binance {
+    let stream = Stream {
         endpoint,
         url: stream_url(endpoint, streams, symbols),
+    };
+    let binance = Binance {
+        endpoint,
         recorder,
         prev_u: HashMap::new(),
         snapshots,
         recoveries: JoinSet::new(),
         quality: cx.quality.clone(),
     };
-    collection::run(binance, cx, tls, tasks).await
+    collection::run_slots(stream, binance, cx, tasks).await
 }
 
 fn stream_url(endpoint: &Endpoint, streams: &[&str], symbols: &[String]) -> String {
@@ -206,7 +208,6 @@ fn stream_url(endpoint: &Endpoint, streams: &[&str], symbols: &[String]) -> Stri
 /// The consumer of one Binance endpoint's queue.
 struct Binance {
     endpoint: &'static Endpoint,
-    url: String,
     recorder: Recorder,
     /// Highest depth update id seen per symbol.
     prev_u: HashMap<Symbol, i64>,
@@ -216,15 +217,7 @@ struct Binance {
     quality: QualityReporter,
 }
 
-impl Venue for Binance {
-    fn label(&self) -> &'static str {
-        self.endpoint.label
-    }
-
-    fn keep_connection(&self, slot: Slot) -> impl Future<Output = ()> + Send + 'static {
-        session::keep_connection(self.endpoint, self.url.clone(), slot)
-    }
-
+impl Consumer for Binance {
     async fn handle(&mut self, frame: Frame) -> Result<(), ConnectorError> {
         let Frame {
             recv_time, data, ..
@@ -394,7 +387,6 @@ mod tests {
         let symbols = ["BTCUSDT".to_owned()];
         let binance = Binance {
             endpoint,
-            url: stream_url(endpoint, &["$symbol@trade"], &symbols),
             recorder: Recorder::new(
                 writer_tx.clone(),
                 &symbols,

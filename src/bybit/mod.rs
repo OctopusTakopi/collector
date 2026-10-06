@@ -14,11 +14,12 @@ use tokio::task::JoinSet;
 use tracing::warn;
 
 use crate::{
-    collection::{self, Context, Recorder, Venue},
+    collection::{self, Consumer, Context, Recorder, Venue},
     error::ConnectorError,
+    legacy::Slot,
     quality::{QualityEvent, QualityReporter},
     routing::{BybitBookUpdate, BybitMessage},
-    session::{Frame, Slot},
+    session::Frame,
     snapshot::{Depth, Snapshots},
     symbol::Symbol,
     throttler::Throttler,
@@ -101,7 +102,9 @@ impl Venue for Bybit {
     fn keep_connection(&self, slot: Slot) -> impl Future<Output = ()> + Send + 'static {
         connection::keep_connection(Arc::clone(&self.groups), slot)
     }
+}
 
+impl Consumer for Bybit {
     async fn handle(&mut self, frame: Frame) -> Result<(), ConnectorError> {
         let Frame {
             recv_time, data, ..

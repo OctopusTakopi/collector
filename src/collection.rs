@@ -24,9 +24,10 @@ use crate::{
     feed::{BackgroundResult, Feed},
     file::WriteRecord,
     hyperliquid, kraken_futures, kraken_spot,
+    legacy::Slot,
     quality::QualityReporter,
     readiness::Readiness,
-    session::{Frame, Slot},
+    session::{self, Frame, Protocol},
     symbol::{Symbol, SymbolCache},
     ws,
 };
@@ -168,7 +169,7 @@ impl Worker {
     ) -> anyhow::Result<()> {
         match self {
             Self::Binance(endpoint, streams) => {
-                binance::collect(endpoint, &streams, symbols, cx, tls).await
+                binance::collect(endpoint, &streams, symbols, cx).await
             }
             Self::Bybit(topics) => bybit::collect(topics, symbols, cx, tls).await,
             Self::Hyperliquid(kinds) => hyperliquid::collect(kinds, symbols, cx, tls).await,
@@ -189,16 +190,19 @@ pub struct Context {
     pub readiness: Readiness,
 }
 
-/// A venue's half of the pipeline.
-pub(crate) trait Venue {
+/// The single owner of a collection's queue: records each frame, from
+/// whichever connection it came.
+pub(crate) trait Consumer {
+    fn handle(&mut self, frame: Frame) -> impl Future<Output = Result<(), ConnectorError>> + Send;
+}
+
+/// A venue still on [`crate::legacy`]'s reconnect loop.
+pub(crate) trait Venue: Consumer {
     /// Names the endpoint in logs and errors.
     fn label(&self) -> &'static str;
 
     /// Keeps one connection slot filled until the queue closes.
     fn keep_connection(&self, slot: Slot) -> impl Future<Output = ()> + Send + 'static;
-
-    /// Records one frame from any connection; the queue's only consumer.
-    fn handle(&mut self, frame: Frame) -> impl Future<Output = Result<(), ConnectorError>> + Send;
 }
 
 /// Consumer state every venue shares: duplicate suppression across redundant
@@ -242,7 +246,7 @@ impl Recorder {
 /// Runs `venue` until shutdown has drained its queue, or until a task in
 /// `tasks` or a connection supervisor fails.
 pub(crate) async fn run<V: Venue>(
-    mut venue: V,
+    venue: V,
     cx: Context,
     tls: Arc<ClientConfig>,
     mut tasks: JoinSet<BackgroundResult>,
@@ -269,13 +273,41 @@ pub(crate) async fn run<V: Venue>(
     // Only the connections may keep the queue open, or `Feed` never sees it
     // close.
     drop(tx);
+    let label = venue.label();
+    consume(venue, label, Feed::new(rx, cx.shutdown), tasks).await
+}
 
-    let mut feed = Feed::new(rx, cx.shutdown);
+/// Runs `protocol`'s connection slots, and `consumer` on the queue they
+/// share, until shutdown has drained it, or until a task in `tasks` or a
+/// slot supervisor fails.
+pub(crate) async fn run_slots<P: Protocol, C: Consumer>(
+    protocol: P,
+    consumer: C,
+    cx: Context,
+    mut tasks: JoinSet<BackgroundResult>,
+) -> anyhow::Result<()> {
+    let label = protocol.label();
+    let rx = session::spawn_slots(
+        &mut tasks,
+        Arc::new(protocol),
+        cx.connections.get(),
+        &cx.quality,
+        &cx.readiness,
+    );
+    consume(consumer, label, Feed::new(rx, cx.shutdown), tasks).await
+}
+
+async fn consume<C: Consumer>(
+    mut consumer: C,
+    label: &'static str,
+    mut feed: Feed<Frame>,
+    mut tasks: JoinSet<BackgroundResult>,
+) -> anyhow::Result<()> {
     while let Some(frame) = feed.recv(&mut tasks).await? {
-        match venue.handle(frame).await {
+        match consumer.handle(frame).await {
             Ok(()) => {}
             Err(ConnectorError::WriterClosed) => return Err(ConnectorError::WriterClosed.into()),
-            Err(error) => error!(endpoint = venue.label(), %error, "could not record a frame"),
+            Err(error) => error!(endpoint = label, %error, "could not record a frame"),
         }
     }
     Ok(())

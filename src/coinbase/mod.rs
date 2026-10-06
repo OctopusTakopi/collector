@@ -16,10 +16,11 @@ use tokio::task::JoinSet;
 
 use crate::{
     books::Books,
-    collection::{self, Context, Recorder, Venue},
+    collection::{self, Consumer, Context, Recorder, Venue},
     error::ConnectorError,
+    legacy::Slot,
     routing,
-    session::{Frame, Slot},
+    session::Frame,
 };
 
 pub(crate) use connection::BOOK;
@@ -77,7 +78,9 @@ impl Venue for Coinbase {
             slot,
         )
     }
+}
 
+impl Consumer for Coinbase {
     async fn handle(&mut self, frame: Frame) -> Result<(), ConnectorError> {
         self.books.catch_up(frame.recv_time);
         let route = routing::coinbase_route(&frame.data)?;

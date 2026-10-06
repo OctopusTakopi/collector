@@ -9,8 +9,8 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tracing::{debug, error, info, warn};
 
 use crate::{
+    legacy::{self, Lost, Protocol, Slot},
     routing,
-    session::{self, Lost, Protocol, Slot},
     ws::FrameSender,
 };
 
@@ -69,7 +69,7 @@ pub(super) async fn keep_connection(
         subscribe_pace = ?pace,
         "connecting to the Hyperliquid websocket"
     );
-    session::keep_subscribed("hyperliquid", URL, IDLE_TIMEOUT, slot, |_, sender| {
+    legacy::keep_subscribed("hyperliquid", URL, IDLE_TIMEOUT, slot, |_, sender| {
         let (rejected_tx, rejected_rx) = mpsc::unbounded_channel();
         (
             Subscriptions::new(connection, Arc::clone(&subscriptions), rejected_tx),

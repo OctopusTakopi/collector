@@ -8,10 +8,11 @@ use rustls::ClientConfig;
 use tokio::task::JoinSet;
 
 use crate::{
-    collection::{self, Context, Recorder, Venue},
+    collection::{self, Consumer, Context, Recorder, Venue},
     error::ConnectorError,
+    legacy::Slot,
     routing::HyperliquidMessage,
-    session::{Frame, Slot},
+    session::Frame,
 };
 
 /// Websocket subscriptions Hyperliquid allows per IP, across all connections.
@@ -56,7 +57,9 @@ impl Venue for Hyperliquid {
     fn keep_connection(&self, slot: Slot) -> impl Future<Output = ()> + Send + 'static {
         connection::keep_connection(Arc::clone(&self.subscriptions), self.pace, slot)
     }
+}
 
+impl Consumer for Hyperliquid {
     async fn handle(&mut self, frame: Frame) -> Result<(), ConnectorError> {
         let Frame {
             recv_time, data, ..

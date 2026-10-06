@@ -10,7 +10,7 @@ use tracing::{error, info, warn};
 
 use crate::{
     books::{self, Announced, Lifecycle, Resnapshot},
-    session::{self, Lost, Protocol, Slot},
+    legacy::{self, Lost, Protocol, Slot},
     ws::FrameSender,
 };
 
@@ -34,7 +34,7 @@ pub(super) async fn keep_connection(
         products = products.len(),
         connection, "connecting to the Kraken Futures websocket"
     );
-    session::keep_subscribed(
+    legacy::keep_subscribed(
         "krakenfutures",
         URL,
         IDLE_TIMEOUT,

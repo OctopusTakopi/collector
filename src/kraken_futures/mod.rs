@@ -17,10 +17,11 @@ use tokio::task::JoinSet;
 
 use crate::{
     books::Books,
-    collection::{self, Context, Recorder, Venue},
+    collection::{self, Consumer, Context, Recorder, Venue},
     error::ConnectorError,
+    legacy::Slot,
     routing,
-    session::{Frame, Slot, Socket},
+    session::{Frame, Socket},
 };
 
 pub(crate) use connection::BOOK;
@@ -78,7 +79,9 @@ impl Venue for KrakenFutures {
             slot,
         )
     }
+}
 
+impl Consumer for KrakenFutures {
     async fn handle(&mut self, frame: Frame) -> Result<(), ConnectorError> {
         self.books.catch_up(frame.recv_time);
         let product_id = routing::kraken_futures_product(&frame.data)
