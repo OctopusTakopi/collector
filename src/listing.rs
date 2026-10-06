@@ -193,17 +193,13 @@ fn preview(body: &[u8]) -> String {
     String::from_utf8_lossy(&body[..body.len().min(256)]).into_owned()
 }
 
-/// `exchangeInfo?symbol=`: the symbol, or `-1121 Invalid symbol`.
+/// `exchangeInfo?symbol=`: the symbol, or a 400 refusing the request
+/// itself, which asking again cannot change: `-1121 Invalid symbol`, or
+/// `-1100` for one with characters no symbol has.
 fn binance_spot(symbol: &str, status: u16, body: &[u8]) -> Answer {
-    #[derive(Deserialize)]
-    struct Error {
-        code: i64,
-    }
     match status {
         200..=299 => Ok(Vec::new()),
-        400 if serde_json::from_slice::<Error>(body).is_ok_and(|error| error.code == -1121) => {
-            Ok(vec![format!("{symbol} ({})", preview(body))])
-        }
+        400 => Ok(vec![format!("{symbol} ({})", preview(body))]),
         _ => Err(anyhow!("exchangeInfo answered {status}: {}", preview(body))),
     }
 }
@@ -287,11 +283,11 @@ fn hyperliquid(coins: &[String], meta: &[u8], spot_meta: &[u8]) -> Answer {
         .collect())
 }
 
-/// `products/<id>`: the product, or `404 NotFound`.
+/// `products/<id>`: the product, or `404 NotFound`, malformed ids too.
 fn coinbase(product: &str, status: u16, body: &[u8]) -> Answer {
     match status {
         200..=299 => Ok(Vec::new()),
-        404 => Ok(vec![format!("{product} ({})", preview(body))]),
+        400 | 404 => Ok(vec![format!("{product} ({})", preview(body))]),
         _ => Err(anyhow!("products answered {status}: {}", preview(body))),
     }
 }
@@ -377,8 +373,12 @@ mod tests {
             unlisted,
             [r#"FOOBAR ({"code":-1121,"msg":"Invalid symbol."})"#]
         );
+        assert_eq!(
+            binance_spot("BTC!USDT", 400, br#"{"code":-1100}"#).unwrap(),
+            [r#"BTC!USDT ({"code":-1100})"#]
+        );
         assert!(binance_spot("BTCUSDT", 418, br#"{"code":-1003}"#).is_err());
-        assert!(binance_spot("BTCUSDT", 400, br#"{"code":-1100}"#).is_err());
+        assert!(binance_spot("BTCUSDT", 502, b"<html>").is_err());
     }
 
     #[test]
