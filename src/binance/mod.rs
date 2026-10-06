@@ -5,7 +5,7 @@
 
 mod protocol;
 
-use std::{collections::HashMap, future::Future, time::Duration};
+use std::{collections::HashMap, time::Duration};
 
 use bytes::Bytes;
 use jiff::Timestamp;
@@ -18,9 +18,9 @@ use crate::{
     quality::{QualityEvent, QualityReporter},
     routing::{self, BinanceEvent},
     session::Frame,
-    snapshot::{Depth, Snapshots},
+    snapshot::{Depth, FetchError, Repairs, Snapshots},
     symbol::Symbol,
-    throttler::{self, Throttler},
+    throttler,
 };
 use protocol::Stream;
 
@@ -34,6 +34,7 @@ pub enum DepthContinuity {
 }
 
 /// Static description of one Binance market endpoint.
+#[derive(Clone, Copy)]
 pub struct Endpoint {
     pub label: &'static str,
     /// Combined-stream URL prefix; the `a/b/c` stream list is appended.
@@ -147,20 +148,24 @@ pub(crate) async fn collect(
     cx: Context,
 ) -> anyhow::Result<()> {
     let mut recorder = Recorder::new(cx.writer_tx.clone(), symbols, cx.connections);
-    let snapshots = Snapshots::new(endpoint, endpoint.snapshot_budget, cx.writer_tx.clone())?;
+    let books = symbols
+        .iter()
+        .map(|symbol| recorder.symbols.resolve(symbol))
+        .collect();
+    let (snapshots, repairs) = Snapshots::new(
+        *endpoint,
+        endpoint.snapshot_budget,
+        books,
+        cx.writer_tx.clone(),
+    )?;
     let mut tasks = JoinSet::new();
     // Snapshots seed and repair the depth stream. A worker without one (USD-M's
     // `/market` half) would only spend weight its sibling already spends.
     if streams.iter().any(|stream| stream.contains("@depth")) {
-        let symbols = symbols
-            .iter()
-            .map(|symbol| recorder.symbols.resolve(symbol))
-            .collect();
-        let snapshots = snapshots.clone();
         tasks.spawn(async move {
-            snapshots.periodically(symbols).await;
+            snapshots.run().await;
             Err(anyhow::anyhow!(
-                "{} periodic depth-snapshot task exited",
+                "{} depth-snapshot task exited",
                 endpoint.label
             ))
         });
@@ -173,8 +178,7 @@ pub(crate) async fn collect(
         endpoint,
         recorder,
         prev_u: HashMap::new(),
-        snapshots,
-        recoveries: JoinSet::new(),
+        repairs,
         quality: cx.quality.clone(),
     };
     collection::run_slots(stream, binance, cx, tasks).await
@@ -200,9 +204,8 @@ struct Binance {
     recorder: Recorder,
     /// Highest depth update id seen per symbol.
     prev_u: HashMap<Symbol, i64>,
-    snapshots: Snapshots<Endpoint>,
-    /// Snapshots fetched to repair a depth gap.
-    recoveries: JoinSet<()>,
+    /// Asks for the snapshots that repair a depth gap.
+    repairs: Repairs,
     quality: QualityReporter,
 }
 
@@ -287,7 +290,7 @@ impl Binance {
             source: format!("{}/{symbol}", self.endpoint.label),
             detail: format!("depth continuity break after update {after}"),
         });
-        self.snapshots.repair(&mut self.recoveries, symbol);
+        self.repairs.request(symbol);
     }
 }
 
@@ -310,49 +313,51 @@ impl Depth for Endpoint {
         self.depth_weight
     }
 
-    fn fetch(
-        &self,
-        client: reqwest::Client,
-        throttler: Throttler,
-        symbol: Symbol,
-    ) -> impl Future<Output = anyhow::Result<Bytes>> + Send + use<> {
-        let (label, depth_url) = (self.label, self.depth_url);
-        async move {
-            let response = client
-                .get(format!("{depth_url}{}&limit=1000", symbol.to_uppercase()))
-                .header("Accept", "application/json")
-                .send()
-                .await?;
-            let status = response.status();
-            let retry_after = response
-                .headers()
-                .get(reqwest::header::RETRY_AFTER)
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_owned);
-            let body = response.bytes().await?;
-            if !status.is_success() {
-                // 418 is a ban and 429 the warning before one; recording it
-                // gates every later request, not just this one.
-                if matches!(status.as_u16(), 418 | 429) {
-                    throttler.note_ban(throttler::ban_expiry(
-                        retry_after.as_deref(),
-                        &body,
-                        Timestamp::now(),
-                    ));
+    async fn fetch(&self, client: &reqwest::Client, symbol: &Symbol) -> Result<Bytes, FetchError> {
+        let label = self.label;
+        let response = client
+            .get(format!(
+                "{}{}&limit=1000",
+                self.depth_url,
+                symbol.to_uppercase()
+            ))
+            .header("Accept", "application/json")
+            .send()
+            .await?;
+        let status = response.status();
+        let retry_after = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let body = response.bytes().await?;
+        if !status.is_success() {
+            // The Binance error code is what tells a bad symbol from a ban.
+            let error = anyhow::anyhow!(
+                "{label} depth snapshot returned {status}: {}",
+                preview(&body)
+            );
+            // 418 is a ban and 429 the warning before one; recorded, it holds
+            // every later request, not just this one.
+            return Err(if matches!(status.as_u16(), 418 | 429) {
+                FetchError::Banned {
+                    until: throttler::ban_expiry(retry_after.as_deref(), &body, Timestamp::now()),
+                    error,
                 }
-                // The Binance error code is what tells a bad symbol from a ban.
-                anyhow::bail!(
-                    "{label} depth snapshot returned {status}: {}",
-                    preview(&body)
-                );
-            }
-            // Recorded as a book, an error or a proxy's page under 200 would
-            // read as one to every tool downstream.
-            if !is_book(&body) {
-                anyhow::bail!("{label} depth snapshot is not a book: {}", preview(&body));
-            }
-            Ok(body)
+            } else {
+                FetchError::Failed(error)
+            });
         }
+        // Recorded as a book, an error or a proxy's page under 200 would
+        // read as one to every tool downstream.
+        if !is_book(&body) {
+            return Err(anyhow::anyhow!(
+                "{label} depth snapshot is not a book: {}",
+                preview(&body)
+            )
+            .into());
+        }
+        Ok(body)
     }
 }
 
@@ -386,27 +391,30 @@ mod tests {
     };
 
     /// A consumer for BTCUSDT on `endpoint`, behind `connections` redundant
-    /// connections, and the writer queue it records into.
+    /// connections, its snapshot task, never run, and the writer queue it
+    /// records into.
     fn binance(
         endpoint: &'static Endpoint,
         connections: usize,
-    ) -> (Binance, Receiver<WriteRecord>) {
+    ) -> (Binance, Snapshots<Endpoint>, Receiver<WriteRecord>) {
         let (writer_tx, writer_rx) = channel(16);
         let symbols = ["BTCUSDT".to_owned()];
+        let mut recorder = Recorder::new(
+            writer_tx.clone(),
+            &symbols,
+            NonZeroUsize::new(connections).unwrap(),
+        );
+        let books = vec![recorder.symbols.resolve("BTCUSDT")];
+        // No budget: a repair must never issue a live request from a test.
+        let (snapshots, repairs) = Snapshots::new(*endpoint, 0, books, writer_tx).unwrap();
         let binance = Binance {
             endpoint,
-            recorder: Recorder::new(
-                writer_tx.clone(),
-                &symbols,
-                NonZeroUsize::new(connections).unwrap(),
-            ),
+            recorder,
             prev_u: HashMap::new(),
-            // No budget: a gap must never issue a live request from a test.
-            snapshots: Snapshots::new(endpoint, 0, writer_tx).unwrap(),
-            recoveries: JoinSet::new(),
+            repairs,
             quality: QualityReporter::disabled(),
         };
-        (binance, writer_rx)
+        (binance, snapshots, writer_rx)
     }
 
     impl Binance {
@@ -508,7 +516,7 @@ mod tests {
     /// `ps` (pair) and `st` (1 = USD-M, 2 = COIN-M).
     #[tokio::test]
     async fn routes_force_order_by_stream_symbol() {
-        let (mut binance, mut writer_rx) = binance(&TEST_FUTURES, 1);
+        let (mut binance, _snapshots, mut writer_rx) = binance(&TEST_FUTURES, 1);
         let raw = br#"{"stream":"btcusdt@forceOrder","data":{"e":"forceOrder","E":1790900158064,"o":{"s":"BTCUSDT","S":"BUY","o":"LIMIT","f":"IOC","q":"0.025","p":"85224.70","ap":"84896.00","X":"FILLED","l":"0.025","z":"0.025","T":1790900157118,"ps":"BTCUSDT","st":1}}}"#;
 
         binance.feed(raw).await.unwrap();
@@ -522,7 +530,7 @@ mod tests {
     /// Spot's bookTicker carries no `e`; it must still be recorded.
     #[tokio::test]
     async fn spot_book_ticker_without_event_type_is_recorded() {
-        let (mut binance, mut writer_rx) = binance(&TEST_SPOT, 1);
+        let (mut binance, _snapshots, mut writer_rx) = binance(&TEST_SPOT, 1);
         let raw = br#"{"stream":"btcusdt@bookTicker","data":{"u":400900217,"s":"BTCUSDT","b":"25.35","B":"31.21","a":"25.36","A":"40.66"}}"#;
 
         binance.feed(raw).await.unwrap();
@@ -534,14 +542,14 @@ mod tests {
     #[tokio::test]
     async fn first_depth_update_is_not_treated_as_a_gap() {
         for endpoint in [&TEST_SPOT, &TEST_FUTURES] {
-            let (mut binance, mut writer_rx) = binance(endpoint, 1);
+            let (mut binance, snapshots, mut writer_rx) = binance(endpoint, 1);
             let raw = br#"{"stream":"btcusdt@depth","data":{"e":"depthUpdate","E":1,"s":"BTCUSDT","U":2,"u":3,"pu":1,"b":[],"a":[]}}"#;
 
             binance.feed(raw).await.unwrap();
 
             assert_eq!(written(&mut writer_rx).len(), 1);
             assert_eq!(binance.prev_u.len(), 1, "{}", endpoint.label);
-            assert!(binance.recoveries.is_empty(), "{}", endpoint.label);
+            assert_eq!(snapshots.asked(), 0, "{}", endpoint.label);
         }
     }
 
@@ -554,14 +562,14 @@ mod tests {
         let raw = br#"{"stream":"btcusdt@depth","data":{"e":"depthUpdate","E":2,"s":"BTCUSDT","U":4,"u":5,"pu":9,"b":[],"a":[]}}"#;
 
         for (endpoint, expect_snapshot) in [(&TEST_SPOT, false), (&TEST_FUTURES, true)] {
-            let (mut binance, _writer_rx) = binance(endpoint, 1);
+            let (mut binance, snapshots, _writer_rx) = binance(endpoint, 1);
             binance.feed(seed).await.unwrap();
-            assert!(binance.recoveries.is_empty());
+            assert_eq!(snapshots.asked(), 0);
 
             binance.feed(raw).await.unwrap();
 
             assert_eq!(
-                !binance.recoveries.is_empty(),
+                snapshots.asked() != 0,
                 expect_snapshot,
                 "{} should{} have detected a gap",
                 endpoint.label,
@@ -575,7 +583,7 @@ mod tests {
     /// re-stamped and must be suppressed instead of recorded twice.
     #[tokio::test]
     async fn an_e_stamped_second_copy_is_suppressed() {
-        let (mut binance, mut writer_rx) = binance(&TEST_SPOT, 2);
+        let (mut binance, _snapshots, mut writer_rx) = binance(&TEST_SPOT, 2);
         let first = br#"{"stream":"btcusdt@trade","data":{"e":"trade","E":1785671271715,"s":"BTCUSDT","t":6551542138,"p":"63160.00","q":"0.12","T":1785671271715,"m":false,"M":true}}"#;
         let second = br#"{"stream":"btcusdt@trade","data":{"e":"trade","E":1785671271716,"s":"BTCUSDT","t":6551542138,"p":"63160.00","q":"0.12","T":1785671271715,"m":false,"M":true}}"#;
 
@@ -602,7 +610,7 @@ mod tests {
     /// check, or its stale `pu` would report a gap on every message.
     #[tokio::test]
     async fn a_second_connections_copy_is_neither_written_nor_read_as_a_gap() {
-        let (mut binance, mut writer_rx) = binance(&TEST_FUTURES, 2);
+        let (mut binance, snapshots, mut writer_rx) = binance(&TEST_FUTURES, 2);
 
         for frame in DEPTH {
             binance.feed(frame).await.unwrap();
@@ -614,10 +622,7 @@ mod tests {
             DEPTH.len(),
             "each frame is recorded once"
         );
-        assert!(
-            binance.recoveries.is_empty(),
-            "no gap should have been reported"
-        );
+        assert_eq!(snapshots.asked(), 0, "no gap should have been reported");
         assert_eq!(binance.prev_u["btcusdt"], 9);
     }
 
@@ -625,7 +630,7 @@ mod tests {
     /// hole, because the other covers the frames it missed.
     #[tokio::test]
     async fn a_reconnect_on_one_connection_leaves_no_gap() {
-        let (mut binance, mut writer_rx) = binance(&TEST_FUTURES, 2);
+        let (mut binance, snapshots, mut writer_rx) = binance(&TEST_FUTURES, 2);
 
         for frame in &DEPTH[..2] {
             binance.feed(frame).await.unwrap();
@@ -641,10 +646,7 @@ mod tests {
             DEPTH.len(),
             "the stream is complete"
         );
-        assert!(
-            binance.recoveries.is_empty(),
-            "no gap, so no recovery snapshot"
-        );
+        assert_eq!(snapshots.asked(), 0, "no gap, so no recovery snapshot");
     }
 
     /// A frame that arrives after a later one costs one gap, for the moment
@@ -652,23 +654,19 @@ mod tests {
     /// and must not rewind the mark.
     #[tokio::test]
     async fn a_straggler_fills_a_hole_rather_than_reporting_another() {
-        let (mut binance, _writer_rx) = binance(&TEST_FUTURES, 2);
+        let (mut binance, snapshots, _writer_rx) = binance(&TEST_FUTURES, 2);
 
         binance.feed(DEPTH[0]).await.unwrap();
         binance.feed(DEPTH[2]).await.unwrap();
         assert_eq!(binance.prev_u["btcusdt"], 7);
-        assert_eq!(
-            binance.recoveries.len(),
-            1,
-            "the skipped update is a real hole"
-        );
+        assert_eq!(snapshots.asked(), 1, "the skipped update is a real hole");
 
         binance.feed(DEPTH[1]).await.unwrap();
         assert_eq!(binance.prev_u["btcusdt"], 7, "the mark only moves forward");
 
         binance.feed(DEPTH[3]).await.unwrap();
         assert_eq!(
-            binance.recoveries.len(),
+            snapshots.asked(),
             1,
             "already-covered updates must not each fetch a snapshot"
         );
@@ -678,7 +676,7 @@ mod tests {
     /// stream, or every later update reads as a hole forever.
     #[tokio::test]
     async fn a_restarted_book_resyncs_instead_of_wedging() {
-        let (mut binance, _writer_rx) = binance(&TEST_FUTURES, 2);
+        let (mut binance, snapshots, _writer_rx) = binance(&TEST_FUTURES, 2);
         // Parked in the billions, as Binance ids really are.
         binance
             .prev_u
@@ -693,16 +691,16 @@ mod tests {
             "the mark follows the restarted stream"
         );
         assert!(
-            binance.recoveries.len() <= 1,
+            snapshots.asked() <= 1,
             "one resync, not a snapshot per update: {}",
-            binance.recoveries.len()
+            snapshots.asked()
         );
     }
 
     /// A single connection cannot produce a duplicate, so nothing is filtered.
     #[tokio::test]
     async fn a_single_connection_records_every_frame_it_receives() {
-        let (mut binance, mut writer_rx) = binance(&TEST_FUTURES, 1);
+        let (mut binance, _snapshots, mut writer_rx) = binance(&TEST_FUTURES, 1);
 
         for frame in DEPTH {
             binance.feed(frame).await.unwrap();
@@ -713,7 +711,7 @@ mod tests {
 
     #[tokio::test]
     async fn control_frames_without_data_are_ignored() {
-        let (mut binance, mut writer_rx) = binance(&TEST_SPOT, 1);
+        let (mut binance, _snapshots, mut writer_rx) = binance(&TEST_SPOT, 1);
 
         binance.feed(br#"{"result":null,"id":1}"#).await.unwrap();
 
@@ -722,7 +720,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_depth_update_without_its_continuity_id_is_an_error() {
-        let (mut binance, mut writer_rx) = binance(&TEST_FUTURES, 1);
+        let (mut binance, _snapshots, mut writer_rx) = binance(&TEST_FUTURES, 1);
         binance.feed(DEPTH[0]).await.unwrap();
 
         let error = binance

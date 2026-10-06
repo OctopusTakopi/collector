@@ -3,7 +3,7 @@
 
 mod protocol;
 
-use std::{collections::HashMap, future::Future, time::Duration};
+use std::{collections::HashMap, time::Duration};
 
 use bytes::Bytes;
 use jiff::Timestamp;
@@ -18,9 +18,8 @@ use crate::{
     quality::{QualityEvent, QualityReporter},
     routing::{BybitBookUpdate, BybitMessage},
     session::Frame,
-    snapshot::{Depth, Snapshots},
+    snapshot::{Depth, FetchError, Repairs, Snapshots},
     symbol::Symbol,
-    throttler::Throttler,
 };
 
 /// Topic prefix of the full-depth book: deltas only, every 200 ms, with no
@@ -54,19 +53,17 @@ pub(crate) async fn collect(
     cx: Context,
 ) -> anyhow::Result<()> {
     let mut recorder = Recorder::new(cx.writer_tx.clone(), symbols, cx.connections);
-    let snapshots = Snapshots::new(&FullBook, SNAPSHOT_RATE_LIMIT, cx.writer_tx.clone())?;
+    let books = symbols
+        .iter()
+        .map(|symbol| recorder.symbols.resolve(symbol))
+        .collect();
+    let (snapshots, repairs) =
+        Snapshots::new(FullBook, SNAPSHOT_RATE_LIMIT, books, cx.writer_tx.clone())?;
     let mut tasks = JoinSet::new();
     if topics.iter().any(|topic| topic.starts_with(FULL_BOOK)) {
-        let symbols = symbols
-            .iter()
-            .map(|symbol| recorder.symbols.resolve(symbol))
-            .collect();
-        let snapshots = snapshots.clone();
         tasks.spawn(async move {
-            snapshots.periodically(symbols).await;
-            Err(anyhow::anyhow!(
-                "bybit periodic full-orderbook snapshot task exited"
-            ))
+            snapshots.run().await;
+            Err(anyhow::anyhow!("bybit full-orderbook snapshot task exited"))
         });
     }
     let linear = protocol::Linear {
@@ -75,8 +72,7 @@ pub(crate) async fn collect(
     let bybit = Bybit {
         recorder,
         full_book_u: HashMap::new(),
-        snapshots,
-        repairs: JoinSet::new(),
+        repairs,
         quality: cx.quality.clone(),
     };
     collection::run_slots(linear, bybit, cx, tasks).await
@@ -87,9 +83,8 @@ struct Bybit {
     recorder: Recorder,
     /// Highest full-book update id seen per symbol.
     full_book_u: HashMap<Symbol, u64>,
-    snapshots: Snapshots<FullBook>,
-    /// Snapshots fetched to repair a full-book break.
-    repairs: JoinSet<()>,
+    /// Asks for the snapshots that repair a full-book break.
+    repairs: Repairs,
     quality: QualityReporter,
 }
 
@@ -144,7 +139,7 @@ impl Bybit {
         if reset {
             *mark = u;
             warn!(%symbol, previous, "bybit full orderbook reset; fetching a snapshot");
-            self.snapshots.repair(&mut self.repairs, symbol);
+            self.repairs.request(symbol);
         } else if u > previous.saturating_add(1) {
             *mark = u;
             warn!(%symbol, previous, u, "bybit full orderbook missed updates; fetching a snapshot");
@@ -153,7 +148,7 @@ impl Bybit {
                 source: format!("bybit/{symbol}"),
                 detail: format!("full orderbook gap after update {previous}"),
             });
-            self.snapshots.repair(&mut self.repairs, symbol);
+            self.repairs.request(symbol);
         } else {
             // In order, or a straggler from a lagging connection: forward only,
             // or the next in-order frame would read as a gap.
@@ -176,34 +171,30 @@ impl Depth for FullBook {
         1
     }
 
-    fn fetch(
-        &self,
-        client: reqwest::Client,
-        throttler: Throttler,
-        symbol: Symbol,
-    ) -> impl Future<Output = anyhow::Result<Bytes>> + Send + use<> {
-        async move {
-            let response = client
-                .get(format!("{FULL_BOOK_URL}{}", symbol.to_uppercase()))
-                .header("Accept", "application/json")
-                .send()
-                .await?;
-            let status = response.status().as_u16();
-            let body = response.bytes().await?;
-            let Some(refusal) = refusal(status, &body) else {
-                return Ok(body);
-            };
-            if let Refusal::RateLimited(backoff) = refusal
-                && let Ok(until) = Timestamp::now().checked_add(backoff)
-            {
-                throttler.note_ban(until);
-            }
-            let preview = &body[..body.len().min(1024)];
-            anyhow::bail!(
-                "bybit full orderbook returned {status}: {}",
-                String::from_utf8_lossy(preview)
-            );
-        }
+    async fn fetch(&self, client: &reqwest::Client, symbol: &Symbol) -> Result<Bytes, FetchError> {
+        let response = client
+            .get(format!("{FULL_BOOK_URL}{}", symbol.to_uppercase()))
+            .header("Accept", "application/json")
+            .send()
+            .await?;
+        let status = response.status().as_u16();
+        let body = response.bytes().await?;
+        let Some(refusal) = refusal(status, &body) else {
+            return Ok(body);
+        };
+        let error = anyhow::anyhow!(
+            "bybit full orderbook returned {status}: {}",
+            String::from_utf8_lossy(&body[..body.len().min(1024)])
+        );
+        Err(match refusal {
+            Refusal::RateLimited(backoff) => FetchError::Banned {
+                until: Timestamp::now()
+                    .checked_add(backoff)
+                    .unwrap_or(Timestamp::MAX),
+                error,
+            },
+            Refusal::Rejected => FetchError::Failed(error),
+        })
     }
 }
 
@@ -247,22 +238,29 @@ mod tests {
     use super::*;
     use crate::file::WriteRecord;
 
-    fn bybit(connections: usize, quality: QualityReporter) -> (Bybit, Receiver<WriteRecord>) {
+    /// A consumer for BTCUSDT, its snapshot task, never run, and the writer
+    /// queue it records into.
+    fn bybit(
+        connections: usize,
+        quality: QualityReporter,
+    ) -> (Bybit, Snapshots<FullBook>, Receiver<WriteRecord>) {
         let (writer_tx, writer_rx) = channel(16);
         let symbols = ["BTCUSDT".to_owned()];
+        let mut recorder = Recorder::new(
+            writer_tx.clone(),
+            &symbols,
+            NonZeroUsize::new(connections).unwrap(),
+        );
+        let books = vec![recorder.symbols.resolve("BTCUSDT")];
+        // No budget: a repair must never issue a live request from a test.
+        let (snapshots, repairs) = Snapshots::new(FullBook, 0, books, writer_tx).unwrap();
         let bybit = Bybit {
-            recorder: Recorder::new(
-                writer_tx.clone(),
-                &symbols,
-                NonZeroUsize::new(connections).unwrap(),
-            ),
+            recorder,
             full_book_u: HashMap::new(),
-            // No budget: a repair must never issue a live request from a test.
-            snapshots: Snapshots::new(&FullBook, 0, writer_tx).unwrap(),
-            repairs: JoinSet::new(),
+            repairs,
             quality,
         };
-        (bybit, writer_rx)
+        (bybit, snapshots, writer_rx)
     }
 
     /// A full-book delta for BTCUSDT with update id `u`.
@@ -290,7 +288,7 @@ mod tests {
 
     #[tokio::test]
     async fn routes_all_liquidation_by_topic_symbol() {
-        let (mut bybit, mut writer_rx) = bybit(1, QualityReporter::disabled());
+        let (mut bybit, _snapshots, mut writer_rx) = bybit(1, QualityReporter::disabled());
         let data = Bytes::from_static(
             br#"{"topic":"allLiquidation.BTCUSDT","type":"snapshot","ts":1739502303204,"data":[{"T":1739502302929,"s":"BTCUSDT","S":"Sell","v":"2.5","p":"95000"}]}"#,
         );
@@ -308,7 +306,7 @@ mod tests {
 
     #[tokio::test]
     async fn redundant_copies_are_recorded_once() {
-        let (mut bybit, mut writer_rx) = bybit(2, QualityReporter::disabled());
+        let (mut bybit, _snapshots, mut writer_rx) = bybit(2, QualityReporter::disabled());
         let trade = Bytes::from_static(
             br#"{"topic":"publicTrade.BTCUSDT","ts":1,"data":[{"i":"7","p":"95000","v":"1"}]}"#,
         );
@@ -324,24 +322,24 @@ mod tests {
     /// not a repair, initialises each book.
     #[tokio::test]
     async fn an_unbroken_full_book_fetches_nothing() {
-        let (mut bybit, mut writer_rx) = bybit(1, QualityReporter::disabled());
+        let (mut bybit, snapshots, mut writer_rx) = bybit(1, QualityReporter::disabled());
 
         bybit.feed_full_book(10..15).await;
 
         assert_eq!(bybit.mark(), Some(14));
-        assert!(bybit.repairs.is_empty());
+        assert_eq!(snapshots.asked(), 0);
         assert_eq!(std::iter::from_fn(|| writer_rx.try_recv().ok()).count(), 5);
     }
 
     #[tokio::test]
     async fn a_skipped_update_is_repaired_and_reported() {
         let (quality, events) = QualityReporter::test_channel();
-        let (mut bybit, _writer_rx) = bybit(1, quality);
+        let (mut bybit, snapshots, _writer_rx) = bybit(1, quality);
 
         bybit.feed_full_book([10, 11, 13]).await;
 
         assert_eq!(bybit.mark(), Some(13));
-        assert_eq!(bybit.repairs.len(), 1);
+        assert_eq!(snapshots.asked(), 1);
         assert!(matches!(
             events.try_recv().unwrap(),
             QualityEvent::FeedDegraded { source, detail, .. }
@@ -353,47 +351,47 @@ mod tests {
     /// mark must follow the restarted ids instead of reading them as stale.
     #[tokio::test]
     async fn a_reset_fetches_a_snapshot_and_restarts_the_mark() {
-        let (mut bybit, _writer_rx) = bybit(1, QualityReporter::disabled());
+        let (mut bybit, snapshots, _writer_rx) = bybit(1, QualityReporter::disabled());
 
         bybit.feed_full_book([5_000_000, 5_000_001, 1]).await;
         assert_eq!(bybit.mark(), Some(1));
-        assert_eq!(bybit.repairs.len(), 1);
+        assert_eq!(snapshots.asked(), 1);
 
         bybit.feed_full_book([1, 2, 3]).await;
         assert_eq!(bybit.mark(), Some(3));
-        assert_eq!(bybit.repairs.len(), 1, "a repeated u=1 and its successors");
+        assert_eq!(snapshots.asked(), 1, "a repeated u=1 and its successors");
     }
 
     /// A reset whose `u=1` frame never arrived is still recognised.
     #[tokio::test]
     async fn a_reset_without_its_first_frame_is_recognised() {
-        let (mut bybit, _writer_rx) = bybit(1, QualityReporter::disabled());
+        let (mut bybit, snapshots, _writer_rx) = bybit(1, QualityReporter::disabled());
 
         bybit.feed_full_book([5_000_000, 3]).await;
 
         assert_eq!(bybit.mark(), Some(3));
-        assert_eq!(bybit.repairs.len(), 1);
+        assert_eq!(snapshots.asked(), 1);
     }
 
     /// A frame a lagging connection delivers late covers ground already held:
     /// no repair, and no rewind that would make the next frame a gap.
     #[tokio::test]
     async fn a_straggler_neither_rewinds_nor_repairs() {
-        let (mut bybit, _writer_rx) = bybit(2, QualityReporter::disabled());
+        let (mut bybit, snapshots, _writer_rx) = bybit(2, QualityReporter::disabled());
 
         bybit.feed_full_book([10, 12]).await;
-        assert_eq!(bybit.repairs.len(), 1, "the hole was real when 12 arrived");
+        assert_eq!(snapshots.asked(), 1, "the hole was real when 12 arrived");
         bybit.feed_full_book([11, 13]).await;
 
         assert_eq!(bybit.mark(), Some(13));
-        assert_eq!(bybit.repairs.len(), 1);
+        assert_eq!(snapshots.asked(), 1);
     }
 
     /// Only the full book is checked; the bounded books carry their own
     /// snapshots on the socket.
     #[tokio::test]
     async fn other_books_leave_the_mark_alone() {
-        let (mut bybit, _writer_rx) = bybit(1, QualityReporter::disabled());
+        let (mut bybit, _snapshots, _writer_rx) = bybit(1, QualityReporter::disabled());
 
         bybit
             .feed(Bytes::from_static(
@@ -407,7 +405,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_full_book_frame_without_an_id_is_still_recorded() {
-        let (mut bybit, mut writer_rx) = bybit(1, QualityReporter::disabled());
+        let (mut bybit, _snapshots, mut writer_rx) = bybit(1, QualityReporter::disabled());
         let frame = Bytes::from_static(
             br#"{"topic":"orderbook.full.BTCUSDT","ts":1,"type":"delta","data":{"s":"BTCUSDT","b":[],"a":[]}}"#,
         );

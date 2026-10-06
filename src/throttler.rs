@@ -3,22 +3,15 @@
 //! Binance charges a spot `depth?limit=1000` 50 of an IP's 6000 a minute.
 //! Requests during a ban are what stretch Binance's two minutes into days,
 //! and the window cannot see a ban earned by a previous run or another
-//! process on the host.
+//! process on the host. Owned by the one task that sends the requests.
 
-use std::{
-    collections::VecDeque,
-    future::Future,
-    sync::{
-        Arc,
-        atomic::{AtomicI64, Ordering},
-    },
-};
+use std::{collections::VecDeque, time::Duration};
 
 use jiff::{SignedDuration, Timestamp};
-use tokio::sync::Mutex;
+use tokio::time::Instant;
 use tracing::{error, warn};
 
-const WINDOW_NANOS: i64 = 60_000_000_000;
+const WINDOW: Duration = Duration::from_secs(60);
 
 /// How long to sit out a rate-limit reply whose expiry cannot be read.
 const UNREADABLE_BAN: SignedDuration = SignedDuration::from_mins(2);
@@ -56,13 +49,13 @@ fn stated_expiry(body: &[u8]) -> Option<Timestamp> {
     Timestamp::from_millisecond(digits.parse().ok()?).ok()
 }
 
-#[derive(Clone)]
 pub struct Throttler {
     venue: &'static str,
-    /// `(epoch ns, weight)` of the requests in the last minute, oldest first.
-    spent: Arc<Mutex<VecDeque<(i64, u32)>>>,
-    /// When an observed ban lifts, in epoch nanoseconds; 0 when not banned.
-    banned_until: Arc<AtomicI64>,
+    /// When each request of the last minute went, and its weight, oldest
+    /// first.
+    spent: VecDeque<(Instant, u32)>,
+    /// When an observed ban lifts.
+    banned_until: Option<Instant>,
     weight_per_minute: u32,
 }
 
@@ -72,17 +65,20 @@ impl Throttler {
     pub fn new(venue: &'static str, weight_per_minute: u32) -> Self {
         Self {
             venue,
-            spent: Default::default(),
-            banned_until: Arc::new(AtomicI64::new(0)),
+            spent: VecDeque::new(),
+            banned_until: None,
             weight_per_minute,
         }
     }
 
     /// Records a ban, keeping the latest expiry seen: a second ban while one is
     /// in force is an escalation, never a reprieve.
-    pub fn note_ban(&self, until: Timestamp) {
-        let until_nanos = until.as_nanosecond() as i64;
-        if self.banned_until.fetch_max(until_nanos, Ordering::Relaxed) < until_nanos {
+    pub fn note_ban(&mut self, until: Timestamp) {
+        let remaining =
+            Duration::try_from(until.duration_since(Timestamp::now())).unwrap_or(Duration::ZERO);
+        let lifts = Instant::now() + remaining;
+        if self.banned_until.is_none_or(|current| current < lifts) {
+            self.banned_until = Some(lifts);
             error!(
                 venue = self.venue,
                 until = %until,
@@ -91,38 +87,37 @@ impl Throttler {
         }
     }
 
-    /// Runs `fut` unless the IP is banned or `weight` no longer fits in the
-    /// last minute's allowance.
-    pub async fn execute<Fut, T>(&self, weight: u32, fut: Fut) -> Option<T>
-    where
-        Fut: Future<Output = T>,
-    {
-        let now = Timestamp::now().as_nanosecond() as i64;
-        let banned_until = self.banned_until.load(Ordering::Relaxed);
-        if banned_until > now {
-            warn!(
-                venue = self.venue,
-                remaining_secs = (banned_until - now) / 1_000_000_000,
-                "skipping request: this IP is still banned"
-            );
+    /// The earliest a request of `weight` may go: now, once a ban lifts, or
+    /// once enough of the last minute's weight has aged out of the window.
+    /// `None` if never: it outweighs the whole allowance.
+    pub fn next_slot(&mut self, weight: u32) -> Option<Instant> {
+        if weight > self.weight_per_minute {
             return None;
         }
+        let now = Instant::now();
+        while self
+            .spent
+            .front()
+            .is_some_and(|&(at, _)| at + WINDOW <= now)
         {
-            let mut spent = self.spent.lock().await;
-            // Pushed in time order, so the expired ones are at the front.
-            while spent
-                .front()
-                .is_some_and(|&(at, _)| at <= now - WINDOW_NANOS)
-            {
-                spent.pop_front();
-            }
-            let in_window: u32 = spent.iter().map(|&(_, weight)| weight).sum();
-            if in_window + weight > self.weight_per_minute {
-                return None;
-            }
-            spent.push_back((now, weight));
+            self.spent.pop_front();
         }
-        Some(fut.await)
+        let in_window: u32 = self.spent.iter().map(|&(_, weight)| weight).sum();
+        let mut excess = (in_window + weight).saturating_sub(self.weight_per_minute);
+        let mut slot = now;
+        for &(at, spent) in &self.spent {
+            if excess == 0 {
+                break;
+            }
+            slot = at + WINDOW;
+            excess = excess.saturating_sub(spent);
+        }
+        Some(self.banned_until.map_or(slot, |until| slot.max(until)))
+    }
+
+    /// Records a request of `weight` sent now.
+    pub fn spend(&mut self, weight: u32) {
+        self.spent.push_back((Instant::now(), weight));
     }
 }
 
@@ -168,54 +163,70 @@ mod tests {
     /// An unreadable rate-limit reply must still stop the requests.
     #[test]
     fn an_unreadable_reply_still_backs_off() {
-        let until = ban_expiry(Some("-5"), b"{}", now());
-
-        assert_eq!(until, now().checked_add(UNREADABLE_BAN).unwrap());
+        for (retry_after, body) in [
+            (None, &b"{}"[..]),
+            (Some("soon"), b"nothing here"),
+            (None, b"banned until soon"),
+            (Some("-5"), b"{}"),
+        ] {
+            assert_eq!(
+                ban_expiry(retry_after, body, now()),
+                now().checked_add(UNREADABLE_BAN).unwrap(),
+                "{retry_after:?} {body:?}"
+            );
+        }
     }
 
-    /// Once a ban is recorded, nothing is sent until it lifts.
-    #[tokio::test]
-    async fn a_recorded_ban_stops_every_request() {
-        let throttler = Throttler::new("test", 100);
-        assert_eq!(throttler.execute(1, async { 1 }).await, Some(1));
+    /// The budget is weight, not calls: one heavy request can use up what a
+    /// call-counting limiter would have allowed many of, and the next waits
+    /// for the first to age out of the window.
+    #[tokio::test(start_paused = true)]
+    async fn a_spent_budget_frees_up_as_requests_age_out() {
+        let mut throttler = Throttler::new("test", 100);
+        let start = Instant::now();
+        assert_eq!(throttler.next_slot(50), Some(start));
+        throttler.spend(50);
+        tokio::time::advance(Duration::from_secs(10)).await;
+        assert_eq!(
+            throttler.next_slot(50),
+            Some(start + Duration::from_secs(10))
+        );
+        throttler.spend(50);
+
+        assert_eq!(throttler.next_slot(1), Some(start + WINDOW));
+        assert_eq!(
+            throttler.next_slot(51),
+            Some(start + Duration::from_secs(10) + WINDOW)
+        );
+    }
+
+    /// A request larger than the whole allowance can never go. Zero allows
+    /// nothing.
+    #[test]
+    fn a_request_heavier_than_the_budget_never_goes() {
+        assert_eq!(Throttler::new("test", 100).next_slot(250), None);
+        assert_eq!(Throttler::new("test", 0).next_slot(1), None);
+    }
+
+    /// Once a ban is recorded, nothing goes until it lifts, however much
+    /// budget is left; a second, shorter ban does not shorten it.
+    #[tokio::test(start_paused = true)]
+    async fn a_ban_holds_every_request_and_is_never_shortened() {
+        let mut throttler = Throttler::new("test", 100);
+        let start = Instant::now();
 
         throttler.note_ban(
             Timestamp::now()
                 .checked_add(SignedDuration::from_hours(24))
                 .unwrap(),
         );
-
-        assert_eq!(
-            throttler.execute(1, async { 2 }).await,
-            None,
-            "a banned IP must not be sent to, however much budget is left"
+        throttler.note_ban(
+            Timestamp::now()
+                .checked_add(SignedDuration::from_mins(1))
+                .unwrap(),
         );
-    }
 
-    /// A second ban while one is in force is an escalation, not a reprieve.
-    #[tokio::test]
-    async fn a_ban_is_never_shortened() {
-        let throttler = Throttler::new("test", 100);
-        let now = Timestamp::now();
-
-        throttler.note_ban(now.checked_add(SignedDuration::from_hours(24)).unwrap());
-        throttler.note_ban(now.checked_add(SignedDuration::from_mins(1)).unwrap());
-
-        assert_eq!(throttler.execute(1, async { 1 }).await, None);
-    }
-
-    /// The budget is weight, not calls: one heavy request can exhaust what a
-    /// call-counting limiter would have allowed many of. Zero allows nothing.
-    #[tokio::test]
-    async fn heavy_requests_exhaust_the_budget_early() {
-        let throttler = Throttler::new("test", 100);
-        assert_eq!(throttler.execute(50, async { 1 }).await, Some(1));
-        assert_eq!(throttler.execute(50, async { 2 }).await, Some(2));
-        assert_eq!(throttler.execute(1, async { 3 }).await, None);
-
-        assert_eq!(
-            Throttler::new("test", 0).execute(1, async { 1 }).await,
-            None
-        );
+        let slot = throttler.next_slot(1).unwrap();
+        assert!(slot - start > Duration::from_secs(23 * 60 * 60), "{slot:?}");
     }
 }
