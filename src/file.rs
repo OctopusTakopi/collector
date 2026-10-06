@@ -236,6 +236,8 @@ fn ends_on_frame_boundary(file: &File) -> io::Result<bool> {
 }
 
 fn rollback_append(daily: &mut File, start: u64) -> io::Result<()> {
+    #[cfg(test)]
+    fault::check(fault::Step::Rollback)?;
     daily.set_len(start)?;
     daily.seek(SeekFrom::Start(start))?;
     daily.sync_all()
@@ -382,15 +384,29 @@ enum Merge {
     Unterminated,
 }
 
+/// Why a finished sidecar was not appended.
+#[derive(Debug, thiserror::Error)]
+enum Unmerged {
+    /// Reading the sidecar or appending it failed, and the append was rolled
+    /// back: the daily file is as it was.
+    #[error(transparent)]
+    Failed(io::Error),
+    /// The append failed and so did its rollback: the daily file may end
+    /// mid-frame. It must not be written again before a fresh lock verifies
+    /// it, and sets it aside if it is torn.
+    #[error(transparent)]
+    Torn(io::Error),
+}
+
 /// Append a finished sidecar and a fresh trailer to the locked daily file,
 /// fsync, and delete the sidecar. A failed append is rolled back, so the daily
-/// file never ends mid-frame.
-fn merge_sidecar(daily: &mut File, sidecar: &Path) -> io::Result<Merge> {
-    let mut source = File::open(sidecar)?;
-    if !ends_cleanly(&source)? {
+/// file never ends mid-frame unless that fails too.
+fn merge_sidecar(daily: &mut File, sidecar: &Path) -> Result<Merge, Unmerged> {
+    let mut source = File::open(sidecar).map_err(Unmerged::Failed)?;
+    if !ends_cleanly(&source).map_err(Unmerged::Failed)? {
         return Ok(Merge::Unterminated);
     }
-    let start = daily.metadata()?.len();
+    let start = daily.metadata().map_err(Unmerged::Failed)?.len();
     let appended = (|| {
         #[cfg(test)]
         fault::check(fault::Step::Append)?;
@@ -400,11 +416,11 @@ fn merge_sidecar(daily: &mut File, sidecar: &Path) -> io::Result<Merge> {
     })();
     if let Err(error) = appended {
         return Err(match rollback_append(daily, start) {
-            Ok(()) => error,
-            Err(rollback) => io::Error::new(
+            Ok(()) => Unmerged::Failed(error),
+            Err(rollback) => Unmerged::Torn(io::Error::new(
                 error.kind(),
                 format!("{error}; also failed to roll back partial append: {rollback}"),
-            ),
+            )),
         });
     }
     match fs::remove_file(sidecar) {
@@ -422,9 +438,10 @@ fn merge_sidecar(daily: &mut File, sidecar: &Path) -> io::Result<Merge> {
 }
 
 /// Merge a finished sidecar into its day's file; `None` while another writer
-/// still holds that file.
-fn merge_into_daily(prefix: &Path, date: Date, sidecar: &Path) -> io::Result<Option<Merge>> {
-    let Some(mut daily) = try_lock_daily(prefix, date)? else {
+/// still holds that file. The lock is released either way, so the next one
+/// verifies the file again.
+fn merge_into_daily(prefix: &Path, date: Date, sidecar: &Path) -> Result<Option<Merge>, Unmerged> {
+    let Some(mut daily) = try_lock_daily(prefix, date).map_err(Unmerged::Failed)? else {
         return Ok(None);
     };
     merge_sidecar(&mut daily, sidecar).map(Some)
@@ -750,14 +767,22 @@ impl RotatingFile {
         match merge_sidecar(&mut daily, &sidecar) {
             Ok(Merge::Appended) => {}
             Ok(Merge::Unterminated) => self.sidecar_unterminated(&sidecar),
-            Err(error) => {
+            Err(unmerged) => {
                 self.faults.report(
                     &sidecar,
-                    error,
+                    &unmerged,
                     "failed to append overlap sidecar after switch",
                 );
-                self.resume_or_queue_sidecar(sidecar, daily, after)?;
-                return Ok(Progress::Failed);
+                let daily = match unmerged {
+                    Unmerged::Failed(_) => Some(daily),
+                    // Released: the fresh lock would otherwise be refused as
+                    // this process's own.
+                    Unmerged::Torn(_) => {
+                        drop(daily);
+                        None
+                    }
+                };
+                return self.resume_or_queue_sidecar(sidecar, daily, after);
             }
         }
         self.continue_in(daily, after)?;
@@ -766,22 +791,28 @@ impl RotatingFile {
 
     /// After a failed append of a finished sidecar: reopen it, so the day's
     /// records keep going there and a later switch retries the append.
-    /// Failing that, retry the append through the daily file still locked
-    /// here — not through a fresh lock, which would verify it again — and
-    /// queue the sidecar until this run releases that file if it fails again.
+    /// Failing that, retry the append through `daily`, the daily file still
+    /// locked here, not through a fresh lock, which would verify it again;
+    /// should that fail too, queue the sidecar until this run releases the
+    /// daily file. A daily file whose append could not be rolled back is
+    /// never written again through the same lock: the sidecar is queued and
+    /// the day's file taken afresh, which verifies it.
+    ///
+    /// `Done` only if the retry appended the sidecar or found it
+    /// unterminated; resumed or queued, it is `Failed`, for the backoff.
     fn resume_or_queue_sidecar(
         &mut self,
         sidecar: PathBuf,
-        mut daily: File,
+        daily: Option<File>,
         after: AfterSwitch,
-    ) -> io::Result<()> {
+    ) -> io::Result<Progress> {
         match reopen_sidecar(&sidecar) {
             Ok(encoder) => {
                 self.sink = Sink::Sidecar {
                     encoder,
                     path: sidecar,
                 };
-                return Ok(());
+                return Ok(Progress::Failed);
             }
             Err(error) => self.faults.report(
                 &sidecar,
@@ -789,19 +820,56 @@ impl RotatingFile {
                 "failed to resume overlap sidecar after a failed merge",
             ),
         }
-        match merge_sidecar(&mut daily, &sidecar) {
-            Ok(Merge::Appended) => {}
-            Ok(Merge::Unterminated) => self.sidecar_unterminated(&sidecar),
+        let daily = match daily {
+            Some(mut daily) => match merge_sidecar(&mut daily, &sidecar) {
+                Ok(merge) => {
+                    if let Merge::Unterminated = merge {
+                        self.sidecar_unterminated(&sidecar);
+                    }
+                    self.continue_in(daily, after)?;
+                    return Ok(Progress::Done);
+                }
+                Err(unmerged) => {
+                    self.faults.report(
+                        &sidecar,
+                        &unmerged,
+                        "failed to append overlap sidecar again",
+                    );
+                    match unmerged {
+                        Unmerged::Failed(_) => Some(daily),
+                        Unmerged::Torn(_) => {
+                            drop(daily);
+                            None
+                        }
+                    }
+                }
+            },
+            None => None,
+        };
+        self.pending_sidecars.push(PendingSidecar {
+            date: self.day.date,
+            path: sidecar,
+        });
+        match daily {
+            Some(daily) => self.continue_in(daily, after)?,
+            None => self.take_daily_afresh(after)?,
+        }
+        Ok(Progress::Failed)
+    }
+
+    /// After a torn append: the day's file through a fresh lock, which
+    /// verifies it and sets it aside if it is torn. Without one nothing is
+    /// written until a switch.
+    fn take_daily_afresh(&mut self, after: AfterSwitch) -> io::Result<()> {
+        self.sink = Sink::Closed;
+        match try_lock_daily(&self.prefix, self.day.date) {
+            Ok(Some(daily)) => self.continue_in(daily, after),
+            Ok(None) => Ok(()),
             Err(error) => {
-                self.faults
-                    .report(&sidecar, error, "failed to append overlap sidecar again");
-                self.pending_sidecars.push(PendingSidecar {
-                    date: self.day.date,
-                    path: sidecar,
-                });
+                self.daily_unusable(self.day.date, &error);
+                Ok(())
             }
         }
-        self.continue_in(daily, after)
     }
 
     fn continue_in(&mut self, daily: File, after: AfterSwitch) -> io::Result<()> {
@@ -831,10 +899,10 @@ impl RotatingFile {
                     self.pending_sidecars.push(sidecar);
                     Progress::Idle
                 }
-                Err(error) => {
+                Err(unmerged) => {
                     self.faults.report(
                         &sidecar.path,
-                        error,
+                        unmerged,
                         "failed to append queued overlap sidecar",
                     );
                     self.pending_sidecars.push(sidecar);
@@ -1070,8 +1138,9 @@ mod fault {
         Flush,
         Finish,
         Sync,
+        Rollback,
     }
-    const STEPS: usize = 8;
+    const STEPS: usize = 9;
 
     thread_local! {
         static ARMED: Cell<[u32; STEPS]> = const { Cell::new([0; STEPS]) };
@@ -1674,6 +1743,96 @@ mod tests {
             assert!(text.contains(record), "{record} missing: {text}");
         }
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// An append whose rollback failed too may have left the daily file
+    /// ending mid-frame: nothing is written to it through that lock again.
+    /// The sidecar is resumed, and the next switch takes the daily file
+    /// through a fresh lock, which verifies it.
+    #[test]
+    fn a_daily_file_whose_append_could_not_be_rolled_back_is_not_written_again() {
+        let dir = test_dir("merge-torn");
+        let mut incumbent = writer(&dir, "incumbent");
+        put(&mut incumbent, day_one(), br#"{"n":1}"#);
+        let mut challenger = writer(&dir, "challenger");
+        put(&mut challenger, day_one(), br#"{"n":2}"#);
+        incumbent.close().unwrap();
+        fault::arm(fault::Step::Append, 1);
+        fault::arm(fault::Step::Rollback, 1);
+
+        put(&mut challenger, day_one(), br#"{"n":3}"#);
+        assert!(
+            matches!(challenger.files["btcusdt"].sink, Sink::Sidecar { .. }),
+            "resumed, not written to the daily file"
+        );
+        let locks = fault::calls(fault::Step::Lock);
+        challenger.files.get_mut("btcusdt").unwrap().retry = Backoff::default();
+        put(&mut challenger, day_one(), br#"{"n":4}"#);
+        assert_eq!(fault::calls(fault::Step::Lock) - locks, 1, "taken afresh");
+        assert!(matches!(challenger.files["btcusdt"].sink, Sink::Daily(_)));
+        challenger.close().unwrap_err();
+        assert_eq!(names(&dir), [DAY_ONE]);
+        let text = decoded(dir.join(DAY_ONE));
+        for record in [r#"{"n":1}"#, r#"{"n":2}"#, r#"{"n":3}"#, r#"{"n":4}"#] {
+            assert!(text.contains(record), "{record} missing: {text}");
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Torn and not resumable: the sidecar is queued and the day goes on in
+    /// the daily file taken afresh, which takes the sidecar at close.
+    #[test]
+    fn a_torn_append_whose_sidecar_cannot_resume_takes_the_daily_file_afresh() {
+        let dir = test_dir("merge-torn-queued");
+        let mut incumbent = writer(&dir, "incumbent");
+        put(&mut incumbent, day_one(), br#"{"n":1}"#);
+        let mut challenger = writer(&dir, "challenger");
+        put(&mut challenger, day_one(), br#"{"n":2}"#);
+        incumbent.close().unwrap();
+        fault::arm(fault::Step::Append, 1);
+        fault::arm(fault::Step::Rollback, 1);
+        fault::arm(fault::Step::Resume, 1);
+        let locks = fault::calls(fault::Step::Lock);
+
+        put(&mut challenger, day_one(), br#"{"n":3}"#);
+        assert_eq!(
+            fault::calls(fault::Step::Lock) - locks,
+            2,
+            "locked to switch, then afresh after the torn append"
+        );
+        let file = &challenger.files["btcusdt"];
+        assert!(matches!(file.sink, Sink::Daily(_)));
+        assert_eq!(file.pending_sidecars.len(), 1);
+        challenger.close().unwrap_err();
+        assert_eq!(names(&dir), [DAY_ONE]);
+        let text = decoded(dir.join(DAY_ONE));
+        for record in [r#"{"n":1}"#, r#"{"n":2}"#, r#"{"n":3}"#] {
+            assert!(text.contains(record), "{record} missing: {text}");
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A resumed or queued sidecar backs the switch off; one that the retry
+    /// through the held lock appended does not.
+    #[test]
+    fn only_a_sidecar_left_behind_backs_the_switch_off() {
+        for (resume_fails, expect) in [(false, Progress::Failed), (true, Progress::Done)] {
+            let dir = test_dir("merge-progress");
+            let mut incumbent = writer(&dir, "incumbent");
+            put(&mut incumbent, day_one(), br#"{"n":1}"#);
+            let mut challenger = writer(&dir, "challenger");
+            put(&mut challenger, day_one(), br#"{"n":2}"#);
+            incumbent.close().unwrap();
+            fault::arm(fault::Step::Append, 1);
+            if resume_fails {
+                fault::arm(fault::Step::Resume, 1);
+            }
+
+            let file = challenger.files.get_mut("btcusdt").unwrap();
+            assert_eq!(file.switch_to_daily(AfterSwitch::Continue).unwrap(), expect);
+            challenger.close().unwrap_err();
+            fs::remove_dir_all(&dir).unwrap();
+        }
     }
 
     #[test]
