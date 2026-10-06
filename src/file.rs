@@ -708,7 +708,16 @@ impl RotatingFile {
         self.batch
             .put_slice(itoa.format(timestamp.as_nanosecond()).as_bytes());
         self.batch.put_u8(b' ');
-        self.batch.put(data);
+        // A raw newline would end the record early. JSON allows one only as
+        // whitespace between tokens, where a space means the same.
+        if data.contains(&b'\n') {
+            self.batch.extend(
+                data.iter()
+                    .map(|&byte| if byte == b'\n' { b' ' } else { byte }),
+            );
+        } else {
+            self.batch.put(data);
+        }
         self.batch.put_u8(b'\n');
         if self.batch.len() >= ZSTD_BATCH_BYTES {
             self.flush_batch()?;
@@ -1420,6 +1429,23 @@ mod tests {
         writer.close().unwrap();
 
         assert_eq!(names(&dir), ["purr%2Fusdc_20270115.zst"]);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A body pretty-printed over lines, as some REST answers are, stays one
+    /// record.
+    #[test]
+    fn a_newline_in_a_body_does_not_end_its_record() {
+        let dir = test_dir("newline");
+        let mut writer = writer(&dir, "newline");
+        put(&mut writer, day_one(), b"{\n  \"a\": 1\n}");
+        put(&mut writer, day_one(), b"{\"b\":2}");
+        writer.close().unwrap();
+
+        assert_eq!(
+            decoded(dir.join(DAY_ONE)),
+            format!("{DAY_ONE_NS} {{   \"a\": 1 }}\n{DAY_ONE_NS} {{\"b\":2}}\n")
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 
