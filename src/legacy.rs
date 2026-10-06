@@ -107,8 +107,6 @@ pub(crate) enum Lost {
     ClosedByServer,
     #[error("the websocket writer stopped")]
     WriterStopped,
-    #[error("a subscription was rejected without a req_id")]
-    Unsubscribed,
     #[error("{0:#}")]
     Io(anyhow::Error),
 }
@@ -316,7 +314,7 @@ pub(crate) mod tests {
             self.controls += 1;
             match payload {
                 b"#ack" => self.acked = true,
-                b"#bye" => return Err(Lost::Unsubscribed),
+                b"#bye" => return Err(Lost::ClosedByServer),
                 _ => {}
             }
             Ok(())
@@ -443,7 +441,7 @@ pub(crate) mod tests {
         harness.send("#bye").await;
 
         let (end, _) = harness.session.await.unwrap();
-        assert!(matches!(end, End::Lost(Lost::Unsubscribed)));
+        assert!(matches!(end, End::Lost(Lost::ClosedByServer)));
         assert!(!harness.ready.borrow().ready());
     }
 

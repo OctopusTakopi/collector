@@ -182,6 +182,8 @@ pub(crate) enum Verdict {
     Continue,
     /// Open a replacement; this session keeps delivering meanwhile.
     Relieve(Reason),
+    /// Drop this socket and reconnect.
+    End(Loss),
 }
 
 /// Why a session asked for its replacement.
@@ -210,6 +212,9 @@ pub(crate) enum Loss {
     ClosedByServer,
     #[error("the websocket writer stopped")]
     WriterStopped,
+    /// The venue rejected a request in a way only a fresh connection cures.
+    #[error("the venue rejected a request: {0}")]
+    Rejected(String),
     #[error("not every request was answered within {0:?}")]
     Unanswered(Duration),
     #[error("{0:#}")]
@@ -613,11 +618,14 @@ where
             _ => Verdict::Continue,
         };
 
-        if let Verdict::Relieve(reason) = verdict
-            && !relieved
-        {
-            relieved = true;
-            slot.request_replacement(socket.session, reason);
+        match verdict {
+            Verdict::Continue => {}
+            Verdict::Relieve(reason) => {
+                if !std::mem::replace(&mut relieved, true) {
+                    slot.request_replacement(socket.session, reason);
+                }
+            }
+            Verdict::End(loss) => return SessionEnd::Lost(loss),
         }
         settled = settled || session.settled();
         // After the frame, so an answer arriving on the deadline still counts.
@@ -968,8 +976,8 @@ pub(crate) mod tests {
     }
 
     /// Text frames starting with `#` are protocol: `#relieve` asks for a
-    /// replacement, `#ack` answers one of `pending` requests and `#reject`
-    /// answers one with a rejection. Anything else is data.
+    /// replacement, `#bye` gives up, `#ack` answers one of `pending` requests
+    /// and `#reject` answers one with a rejection. Anything else is data.
     #[derive(Default)]
     struct Script {
         pending: usize,
@@ -984,6 +992,7 @@ pub(crate) mod tests {
         fn on_control(&mut self, text: &[u8]) -> Verdict {
             match text {
                 b"#relieve" => return Verdict::Relieve(Reason::ServerShutdown),
+                b"#bye" => return Verdict::End(Loss::Rejected("bye".to_owned())),
                 b"#ack" => self.pending = self.pending.saturating_sub(1),
                 b"#reject" => {
                     self.pending = self.pending.saturating_sub(1);
@@ -1290,6 +1299,19 @@ pub(crate) mod tests {
             harness.session.await.unwrap(),
             SessionEnd::Lost(Loss::Idle(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn a_session_that_gives_up_is_lost() {
+        let mut harness = Harness::start(None);
+
+        harness.send("#bye").await;
+
+        assert!(matches!(
+            harness.session.await.unwrap(),
+            SessionEnd::Lost(Loss::Rejected(_))
+        ));
+        assert!(!harness.ready.borrow().ready());
     }
 
     #[tokio::test]

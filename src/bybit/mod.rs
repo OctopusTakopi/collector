@@ -1,22 +1,20 @@
 //! Bybit linear perpetuals over the v5 public websocket, with REST snapshots
 //! seeding the full-depth book.
 
-mod connection;
+mod protocol;
 
-use std::{collections::HashMap, future::Future, sync::Arc, time::Duration};
+use std::{collections::HashMap, future::Future, time::Duration};
 
 use bytes::Bytes;
 use jiff::Timestamp;
-use rustls::ClientConfig;
 use serde::Deserialize;
 use serde_json::value::RawValue;
 use tokio::task::JoinSet;
 use tracing::warn;
 
 use crate::{
-    collection::{self, Consumer, Context, Recorder, Venue},
+    collection::{self, Consumer, Context, Recorder},
     error::ConnectorError,
-    legacy::Slot,
     quality::{QualityEvent, QualityReporter},
     routing::{BybitBookUpdate, BybitMessage},
     session::Frame,
@@ -53,7 +51,6 @@ pub(crate) async fn collect(
     topics: &[&str],
     symbols: &[String],
     cx: Context,
-    tls: Arc<ClientConfig>,
 ) -> anyhow::Result<()> {
     let mut recorder = Recorder::new(cx.writer_tx.clone(), symbols, cx.connections);
     let snapshots = Snapshots::new(&FullBook, SNAPSHOT_RATE_LIMIT, cx.writer_tx.clone())?;
@@ -71,20 +68,21 @@ pub(crate) async fn collect(
             ))
         });
     }
+    let linear = protocol::Linear {
+        groups: protocol::groups(topics, symbols),
+    };
     let bybit = Bybit {
-        groups: connection::groups(topics, symbols),
         recorder,
         full_book_u: HashMap::new(),
         snapshots,
         repairs: JoinSet::new(),
         quality: cx.quality.clone(),
     };
-    collection::run(bybit, cx, tls, tasks).await
+    collection::run_slots(linear, bybit, cx, tasks).await
 }
 
 /// The consumer of Bybit's queue, which carries market data only.
 struct Bybit {
-    groups: Arc<[connection::Group]>,
     recorder: Recorder,
     /// Highest full-book update id seen per symbol.
     full_book_u: HashMap<Symbol, u64>,
@@ -92,16 +90,6 @@ struct Bybit {
     /// Snapshots fetched to repair a full-book break.
     repairs: JoinSet<()>,
     quality: QualityReporter,
-}
-
-impl Venue for Bybit {
-    fn label(&self) -> &'static str {
-        "bybit"
-    }
-
-    fn keep_connection(&self, slot: Slot) -> impl Future<Output = ()> + Send + 'static {
-        connection::keep_connection(Arc::clone(&self.groups), slot)
-    }
 }
 
 impl Consumer for Bybit {
@@ -257,7 +245,6 @@ mod tests {
         let (writer_tx, writer_rx) = channel(16);
         let symbols = ["BTCUSDT".to_owned()];
         let bybit = Bybit {
-            groups: connection::groups(&["publicTrade.$symbol"], &symbols),
             recorder: Recorder::new(
                 writer_tx.clone(),
                 &symbols,
