@@ -128,6 +128,9 @@ async fn main() -> Result<(), anyhow::Error> {
     }
 
     std::fs::create_dir_all(&args.path)?;
+    exchange
+        .claim(std::path::Path::new(&args.path))
+        .with_context(|| format!("cannot record {} into {}", exchange.as_str(), args.path))?;
     let run_id = format!(
         "{}-{}",
         jiff::Timestamp::now().as_nanosecond(),

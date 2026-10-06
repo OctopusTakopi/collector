@@ -50,7 +50,11 @@ use std::{
 
 use anyhow::{Context as _, Result};
 use clap::{Parser, ValueEnum};
-use collector::routing::{binance_dedup_key, coinbase_route, coinbase_sequence_key};
+use collector::{
+    collection::Exchange,
+    marker::Marked,
+    routing::{binance_dedup_key, coinbase_route, coinbase_sequence_key},
+};
 use jiff::{Span, Timestamp, civil, tz::TimeZone};
 use serde::Deserialize;
 use serde::de::{self, IgnoredAny, SeqAccess, Visitor};
@@ -86,7 +90,8 @@ struct Args {
     #[arg(long)]
     filter: Option<String>,
 
-    /// Exchange family to apply to every file instead of guessing from paths.
+    /// Exchange family to apply to every file instead of each directory's
+    /// `_exchange` marker, or a guess from its path where it has none.
     #[arg(long, value_enum)]
     exchange: Option<Family>,
 
@@ -104,16 +109,36 @@ struct Args {
     fail_on_gaps: bool,
 }
 
+/// How a directory's records are checked. `--exchange` also takes the
+/// collector's own exchange names.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, ValueEnum)]
 enum Family {
+    #[value(alias = "binancespot")]
     BinanceSpot,
+    #[value(alias = "binancefuturesum", alias = "binancefuturescm")]
     BinanceFutures,
     Bybit,
     Hyperliquid,
     Coinbase,
+    #[value(alias = "krakenspot")]
     KrakenSpot,
+    #[value(alias = "krakenfutures")]
     KrakenFutures,
     Generic,
+}
+
+impl From<Exchange> for Family {
+    fn from(exchange: Exchange) -> Self {
+        match exchange {
+            Exchange::BinanceSpot => Self::BinanceSpot,
+            Exchange::BinanceFuturesUm | Exchange::BinanceFuturesCm => Self::BinanceFutures,
+            Exchange::Bybit => Self::Bybit,
+            Exchange::Hyperliquid => Self::Hyperliquid,
+            Exchange::Coinbase => Self::Coinbase,
+            Exchange::KrakenSpot => Self::KrakenSpot,
+            Exchange::KrakenFutures => Self::KrakenFutures,
+        }
+    }
 }
 
 /// The `--exchange` value, e.g. `binance-spot`.
@@ -127,6 +152,28 @@ impl fmt::Display for Family {
 }
 
 impl Family {
+    /// `dir`'s family: its marker's exchange, or a guess from its path;
+    /// `None` for a directory another collector recorded, which this one
+    /// cannot decode.
+    fn of(dir: &Path) -> Option<Family> {
+        match Marked::read(dir) {
+            Ok(Marked::Exchange(exchange)) => return Some(exchange.into()),
+            Ok(Marked::Foreign(name)) => {
+                eprintln!(
+                    "note: skipped {}: it holds {name} recordings",
+                    dir.display()
+                );
+                return None;
+            }
+            Ok(Marked::Unmarked) => {}
+            Err(error) => eprintln!("note: cannot read the marker of {}: {error}", dir.display()),
+        }
+        // The absolute path: a relative root such as `.` names no venue.
+        Some(Family::guess(
+            &fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf()),
+        ))
+    }
+
     /// Guess the family from directory names such as
     /// `raw/binance/futures/um`, `raw/bybit`, `raw/hyperliquid`,
     /// `raw/kraken/futures`.
@@ -228,9 +275,14 @@ fn discover(roots: &[PathBuf]) -> Result<Vec<Series>> {
         );
     }
 
+    let mut families: HashMap<PathBuf, Option<Family>> = HashMap::new();
     let mut series: Vec<Series> = map
         .into_iter()
-        .map(|((dir, symbol), mut files)| {
+        .filter_map(|((dir, symbol), mut files)| {
+            let key = format!("{}/{symbol}", dir.display());
+            let family = (*families
+                .entry(dir)
+                .or_insert_with_key(|dir| Family::of(dir)))?;
             files.sort_by(|a, b| {
                 (a.date, a.segment_start_ns, &a.run_id, &a.path).cmp(&(
                     b.date,
@@ -239,11 +291,7 @@ fn discover(roots: &[PathBuf]) -> Result<Vec<Series>> {
                     &b.path,
                 ))
             });
-            Series {
-                key: format!("{}/{symbol}", dir.display()),
-                family: Family::guess(&dir),
-                files,
-            }
+            Some(Series { key, family, files })
         })
         .collect();
     series.sort_by(|a, b| a.key.cmp(&b.key));
@@ -2071,6 +2119,62 @@ mod tests {
         ] {
             assert_eq!(Family::guess(Path::new(dir)), family, "{dir}");
         }
+    }
+
+    /// The marker names a directory's family over its path; an sbe-collector
+    /// directory is skipped; an unmarked one is guessed from its absolute
+    /// path.
+    #[test]
+    fn a_directory_is_known_by_its_marker_before_its_path() {
+        let root = test_dir("family");
+        let marked = |name: &str, marker: &str| {
+            let dir = root.join(name);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join(collector::marker::MARKER), marker).unwrap();
+            dir
+        };
+        assert_eq!(
+            Family::of(&marked("bybit", "coinbase\n")),
+            Some(Family::Coinbase)
+        );
+        assert_eq!(
+            Family::of(&marked("cm", "binancefuturescm\n")),
+            Some(Family::BinanceFutures)
+        );
+        assert_eq!(Family::of(&marked("sbe", "binancesbespot\n")), None);
+
+        let unmarked = root.join("kraken/spot");
+        fs::create_dir_all(&unmarked).unwrap();
+        fs::create_dir_all(root.join("coinbase")).unwrap();
+        assert_eq!(Family::of(&unmarked), Some(Family::KrakenSpot));
+        // Read as written, `kraken` would win.
+        assert_eq!(
+            Family::of(&unmarked.join("../../coinbase")),
+            Some(Family::Coinbase)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A directory another collector recorded is left out of the scan.
+    #[test]
+    fn foreign_directories_are_not_scanned() {
+        let root = test_dir("foreign");
+        write_zst(&root.join("json/btcusdt_20261007.zst"), b"");
+        write_zst(&root.join("sbe/btcusdt_20261007.zst"), b"");
+        fs::write(
+            root.join("sbe").join(collector::marker::MARKER),
+            "binancesbespot\n",
+        )
+        .unwrap();
+
+        let series = discover(std::slice::from_ref(&root)).unwrap();
+        let keys: Vec<&str> = series.iter().map(|s| s.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            [format!("{}/json/btcusdt", root.display())],
+            "only the JSON directory"
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     /// Trades are checked by id; a `last_match` repeating a recorded trade is

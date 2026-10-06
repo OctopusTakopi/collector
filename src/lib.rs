@@ -15,6 +15,7 @@ mod hyperliquid;
 mod kraken_futures;
 mod kraken_spot;
 mod listing;
+pub mod marker;
 pub mod quality;
 pub mod readiness;
 pub mod routing;

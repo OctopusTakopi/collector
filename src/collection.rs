@@ -48,6 +48,20 @@ pub enum Exchange {
 }
 
 impl Exchange {
+    /// The canonical command-line name, which an alias resolves to.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::BinanceSpot => "binancespot",
+            Self::BinanceFuturesUm => "binancefuturesum",
+            Self::BinanceFuturesCm => "binancefuturescm",
+            Self::Bybit => "bybit",
+            Self::Hyperliquid => "hyperliquid",
+            Self::Coinbase => "coinbase",
+            Self::KrakenSpot => "krakenspot",
+            Self::KrakenFutures => "krakenfutures",
+        }
+    }
+
     /// Streams, topics or subscription types, with `$symbol` placeholders
     /// where the venue names the symbol in them.
     pub fn streams(self) -> &'static [&'static str] {
@@ -303,5 +317,13 @@ mod tests {
             assert_eq!(Exchange::from_str(name, false), Ok(exchange), "{name}");
         }
         assert!(Exchange::from_str("Binance", false).is_err());
+    }
+
+    /// The marker stores the canonical name, so it must parse back.
+    #[test]
+    fn canonical_names_are_the_cli_spelling() {
+        for exchange in Exchange::value_variants() {
+            assert_eq!(Exchange::from_str(exchange.as_str(), false), Ok(*exchange));
+        }
     }
 }
