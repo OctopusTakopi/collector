@@ -654,10 +654,18 @@ where
                 slot.quality.report(QualityEvent::FeedDegraded {
                     at_ns: QualityEvent::now_ns(),
                     source: slot.source.to_string(),
-                    detail: "the venue rejected some subscriptions; the session stays unready"
+                    detail: "the venue rejected some subscriptions; the session is unready \
+                             until they are accepted"
                         .to_owned(),
                 });
             }
+        } else if std::mem::take(&mut reported_incomplete) {
+            // A retry was accepted: a later rejection is reported again.
+            info!(
+                endpoint = %slot.source,
+                session = socket.session,
+                "every subscription is accepted now; the feed is complete again"
+            );
         }
         if retiring {
             break true;
@@ -1017,8 +1025,9 @@ pub(crate) mod tests {
     }
 
     /// Text frames starting with `#` are protocol: `#relieve` asks for a
-    /// replacement, `#bye` gives up, `#ack` answers one of `pending` requests
-    /// and `#reject` answers one with a rejection. Anything else is data.
+    /// replacement, `#bye` gives up, `#ack` answers one of `pending` requests,
+    /// `#reject` answers one with a rejection and `#accept` accepts what was
+    /// rejected, as a retry can. Anything else is data.
     #[derive(Default)]
     struct Script {
         pending: usize,
@@ -1039,6 +1048,7 @@ pub(crate) mod tests {
                     self.pending = self.pending.saturating_sub(1);
                     self.rejected = true;
                 }
+                b"#accept" => self.rejected = false,
                 _ => {}
             }
             Verdict::Continue
@@ -1582,6 +1592,43 @@ pub(crate) mod tests {
             .filter(|event| matches!(event, QualityEvent::FeedDegraded { .. }))
             .count();
         assert_eq!(incomplete, 1);
+    }
+
+    /// A retry accepted makes the session complete again, and live; a
+    /// rejection after that is a new loss, reported again.
+    #[tokio::test(start_paused = true)]
+    async fn a_rejection_after_the_feed_recovered_is_reported_again() {
+        let mut harness = Harness::with(
+            Script {
+                pending: 1,
+                ..Script::default()
+            },
+            requests(&["sub"]),
+            None,
+            16,
+        );
+        harness.expect_text("sub").await;
+        let degraded = |harness: &Harness| {
+            harness
+                .quality
+                .try_iter()
+                .filter(|event| matches!(event, QualityEvent::FeedDegraded { .. }))
+                .count()
+        };
+
+        harness.send("#reject").await;
+        assert!(!harness.ready_after_ping().await);
+        assert_eq!(degraded(&harness), 1);
+
+        harness.send("#accept").await;
+        harness.send("market").await;
+        assert!(matches!(harness.events.recv().await, Some(Event::Live(7))));
+        assert!(harness.data.recv().await.is_some());
+        assert!(harness.ready_after_ping().await);
+
+        harness.send("#reject").await;
+        assert!(!harness.ready_after_ping().await);
+        assert_eq!(degraded(&harness), 1, "the new loss is reported");
     }
 
     /// A shed frame never reached the queue, so it proves nothing: it must
