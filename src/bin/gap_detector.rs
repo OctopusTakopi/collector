@@ -165,24 +165,29 @@ impl Family {
             Ok(Marked::Unmarked) => {}
             Err(error) => eprintln!("note: cannot read the marker of {}: {error}", dir.display()),
         }
-        // The absolute path: a relative root such as `.` names no venue.
+        // The absolute path: a relative root such as `.` names no venue. A
+        // symlink counts by its own name, not its target's.
         Some(Family::guess(
-            &fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf()),
+            &std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf()),
         ))
     }
 
     /// Guess the family from directory names such as
     /// `raw/binance/futures/um`, `raw/bybit`, `raw/hyperliquid`,
-    /// `raw/kraken/futures`.
+    /// `raw/kraken/futures`; the venue named nearest the directory wins, and
+    /// `..` is taken by name.
     fn guess(dir: &Path) -> Family {
-        let comps: Vec<String> = dir
-            .components()
-            .filter_map(|c| match c {
-                std::path::Component::Normal(s) => Some(s.to_string_lossy().into_owned()),
-                _ => None,
-            })
-            .collect();
-        for (i, comp) in comps.iter().enumerate() {
+        let mut comps: Vec<String> = Vec::new();
+        for component in dir.components() {
+            match component {
+                std::path::Component::Normal(s) => comps.push(s.to_string_lossy().into_owned()),
+                std::path::Component::ParentDir => {
+                    comps.pop();
+                }
+                _ => {}
+            }
+        }
+        for (i, comp) in comps.iter().enumerate().rev() {
             match comp.as_str() {
                 "hyperliquid" => return Family::Hyperliquid,
                 "bybit" => return Family::Bybit,
@@ -230,8 +235,9 @@ struct Series {
 
 /// Discover daily files, handover sidecars, and legacy segmented zstd files
 /// under the roots and group them into per-(directory, symbol) series in
-/// recording order.
-fn discover(roots: &[PathBuf]) -> Result<Vec<Series>> {
+/// recording order. `exchange`, when given, is every directory's family, its
+/// marker unread.
+fn discover(roots: &[PathBuf], exchange: Option<Family>) -> Result<Vec<Series>> {
     let mut map: BTreeMap<(PathBuf, String), Vec<DatedFile>> = BTreeMap::new();
     let mut stack: Vec<PathBuf> = Vec::new();
     for root in roots {
@@ -279,7 +285,7 @@ fn discover(roots: &[PathBuf]) -> Result<Vec<Series>> {
             let key = format!("{}/{symbol}", dir.display());
             let family = (*families
                 .entry(dir)
-                .or_insert_with_key(|dir| Family::of(dir)))?;
+                .or_insert_with_key(|dir| exchange.or_else(|| Family::of(dir))))?;
             files.sort_by(|a, b| {
                 (a.date, a.segment_start_ns, &a.run_id, &a.path).cmp(&(
                     b.date,
@@ -1806,14 +1812,9 @@ fn min_gap_ns(args: &Args) -> i64 {
 }
 
 fn select_series(args: &Args) -> Result<Vec<Series>> {
-    let mut series = discover(&args.paths)?;
+    let mut series = discover(&args.paths, args.exchange)?;
     if let Some(filter) = &args.filter {
         series.retain(|s| s.key.contains(filter));
-    }
-    if let Some(family) = args.exchange {
-        for s in &mut series {
-            s.family = family;
-        }
     }
     Ok(series)
 }
@@ -2150,7 +2151,7 @@ mod tests {
         fs::create_dir_all(&unmarked).unwrap();
         fs::create_dir_all(root.join("coinbase")).unwrap();
         assert_eq!(Family::of(&unmarked), Some(Family::KrakenSpot));
-        // Read as written, `kraken` would win.
+        // `..` taken by name: `kraken` is no longer on the path.
         assert_eq!(
             Family::of(&unmarked.join("../../coinbase")),
             Some(Family::Coinbase)
@@ -2170,12 +2171,72 @@ mod tests {
         )
         .unwrap();
 
-        let series = discover(std::slice::from_ref(&root)).unwrap();
+        let series = discover(std::slice::from_ref(&root), None).unwrap();
         let keys: Vec<&str> = series.iter().map(|s| s.key.as_str()).collect();
         assert_eq!(
             keys,
             [format!("{}/json/btcusdt", root.display())],
             "only the JSON directory"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// `--exchange` applies to every directory instead of its marker, one
+    /// sbe-collector recorded included.
+    #[test]
+    fn the_exchange_given_applies_over_every_marker() {
+        let root = test_dir("exchange-given");
+        for (dir, marker) in [("json", "coinbase\n"), ("sbe", "binancesbespot\n")] {
+            write_zst(&root.join(dir).join("btcusdt_20261007.zst"), b"");
+            fs::write(root.join(dir).join(collector::marker::MARKER), marker).unwrap();
+        }
+
+        let args = Args::try_parse_from([
+            "gap_detector",
+            root.to_str().unwrap(),
+            "--exchange",
+            "binancespot",
+        ])
+        .unwrap();
+        let series = select_series(&args).unwrap();
+        let families: Vec<(String, Family)> =
+            series.iter().map(|s| (s.key.clone(), s.family)).collect();
+        assert_eq!(
+            families,
+            [
+                (
+                    format!("{}/json/btcusdt", root.display()),
+                    Family::BinanceSpot
+                ),
+                (
+                    format!("{}/sbe/btcusdt", root.display()),
+                    Family::BinanceSpot
+                ),
+            ]
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// An unmarked directory is guessed from its path as named, symlinks
+    /// unresolved; the venue named nearest it wins.
+    #[test]
+    fn the_venue_nearest_an_unmarked_directory_names_it() {
+        for (dir, family) in [
+            ("/data/bybit/raw/coinbase", Family::Coinbase),
+            (
+                "/data/kraken/archive/binance/futures/um",
+                Family::BinanceFutures,
+            ),
+            ("/data/raw/kraken/spot/../futures", Family::KrakenFutures),
+        ] {
+            assert_eq!(Family::guess(Path::new(dir)), family, "{dir}");
+        }
+        let root = test_dir("symlink");
+        fs::create_dir_all(root.join("binance/spot")).unwrap();
+        std::os::unix::fs::symlink(root.join("binance/spot"), root.join("hyperliquid")).unwrap();
+        assert_eq!(
+            Family::of(&root.join("hyperliquid")),
+            Some(Family::Hyperliquid)
         );
         fs::remove_dir_all(root).unwrap();
     }
