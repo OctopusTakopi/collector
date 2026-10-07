@@ -1,7 +1,7 @@
 use std::{
     fs::{File, TryLockError},
     io,
-    os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt},
+    os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -567,15 +567,35 @@ async fn accept_ready_challenger(
 /// second would unlink the listener the first had just bound: an orphan no
 /// later challenger can reach, beside a second incumbent. Older binaries do
 /// not take it.
-async fn selecting(path: &Path) -> anyhow::Result<File> {
+///
+/// `flock` needs no write access, so an existing lock file is opened
+/// read-only, and a missing one is created 0600 like the socket. One this
+/// process cannot open at all, such as one a `sudo` run left behind, is done
+/// without, as older binaries do, rather than failing the handover.
+async fn selecting(path: &Path) -> anyhow::Result<Option<File>> {
     let mut name = path.as_os_str().to_owned();
     name.push(".lock");
-    let lock = File::options()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&name)
-        .with_context(|| format!("cannot open {}", Path::new(&name).display()))?;
+    let name = Path::new(&name);
+    let opened = match File::open(name) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => File::options()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .mode(0o600)
+            .open(name),
+        opened => opened,
+    };
+    let lock = match opened {
+        Ok(lock) => lock,
+        Err(error) => {
+            tracing::warn!(
+                path = %name.display(),
+                %error,
+                "cannot open the role-selection lock; choosing a role without it"
+            );
+            return Ok(None);
+        }
+    };
     timeout(HANDSHAKE_TIMEOUT, async {
         loop {
             match lock.try_lock() {
@@ -587,7 +607,7 @@ async fn selecting(path: &Path) -> anyhow::Result<File> {
     })
     .await
     .map_err(|_| anyhow!("timed out waiting to choose a role at {}", path.display()))??;
-    Ok(lock)
+    Ok(Some(lock))
 }
 
 async fn select_role(path: &Path) -> anyhow::Result<Role> {
@@ -1142,6 +1162,30 @@ mod tests {
         assert_eq!(deadlines[0], deadlines[1]);
         drop(listener);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Choosing a role needs neither write nor read access to the
+    /// role-selection lock, which is created private.
+    #[tokio::test]
+    async fn choosing_a_role_needs_no_access_to_the_lock_file() {
+        let dir = test_dir("lock-access");
+        let path = dir.join("collector.sock");
+        let mut lock = path.as_os_str().to_owned();
+        lock.push(".lock");
+        let lock = PathBuf::from(lock);
+
+        drop(select_role(&path).await.unwrap());
+        let mode = std::fs::metadata(&lock).unwrap().permissions().mode();
+        assert_eq!(mode & 0o077, 0, "{mode:o}");
+        // Each incumbent leaves its socket stale for the next to clear.
+        for mode in [0o400, 0o000] {
+            std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert!(
+                matches!(select_role(&path).await, Ok(Role::Incumbent(_))),
+                "lock mode {mode:o}"
+            );
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[tokio::test]
