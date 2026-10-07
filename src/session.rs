@@ -380,11 +380,12 @@ impl Slot {
 /// on a frame boundary: after a whole frame, never after a cancelled `read`.
 ///
 /// The replacement only sees events from its own subscription on, so this
-/// backlog may exist nowhere else. The zero timeout takes what is buffered and
-/// stops the instant the socket would block; cancelling `read` mid-frame there
-/// is sound only because the connection is closed next. `deadline` is checked
-/// rather than wrapped around the drain, so the counts survive a saturated
-/// queue eating the budget.
+/// backlog may exist nowhere else. The zero timeout still waits for the next
+/// timer tick, about a millisecond, so on a busy socket the drain takes what
+/// arrives meanwhile too and is bounded by `deadline`, not by the backlog at
+/// retirement; cancelling `read` mid-frame there is sound only because the
+/// connection is closed next. `deadline` is checked rather than wrapped around
+/// the drain, so the counts survive a saturated queue eating the budget.
 async fn drain_buffered<T, S>(
     conn: &mut Connection<S>,
     session: &mut T,
@@ -576,8 +577,8 @@ where
             None => break false,
         };
 
-        // Checked between reads, not raced in the `select!`, which would
-        // cancel `read` mid-frame.
+        // Checked when a frame arrives, so on a quiet socket the relief can
+        // come up to `idle_timeout` late.
         if !relieved
             && slot
                 .max_age
@@ -888,7 +889,8 @@ async fn keep_connection<P: Protocol>(
                     Some(Event::Relieve(from, reason)) if from == socket.session => {
                         break Step::Relieved(reason);
                     }
-                    // A session asks once, so this is a relieved one repeating.
+                    // From a session that asked, then ended before its ask
+                    // was read: it is replaced already.
                     Some(Event::Relieve(from, _)) => {
                         debug!(endpoint = %slot.source, session = from, "ignoring a stale relieve");
                     }
@@ -945,7 +947,11 @@ async fn keep_connection<P: Protocol>(
                     still_delivering = handover.waiting(),
                     "websocket session ended"
                 );
-                backoff.wait(Some(lifetime)).await;
+                // An unanswered session outlives `SETTLED` on its deadline
+                // alone, so its lifetime proves nothing about the venue.
+                backoff
+                    .wait((!matches!(loss, Loss::Unanswered(_))).then_some(lifetime))
+                    .await;
             }
         }
     }
