@@ -2,7 +2,7 @@ mod shutdown;
 
 use std::{num::NonZeroUsize, path::PathBuf, time::Duration};
 
-use anyhow::{Context as _, anyhow};
+use anyhow::{Context as _, anyhow, bail};
 use clap::{
     Parser, ValueEnum,
     builder::{PossibleValuesParser, TypedValueParser},
@@ -91,6 +91,14 @@ async fn main() -> Result<(), anyhow::Error> {
 
     let exchange = args.exchange.exchange;
     let connections = args.connections;
+    // A symbol given twice is subscribed twice, and Bybit answers the second
+    // "already subscribed": the session never settles.
+    if let Some((first, again)) = duplicate(exchange, &args.symbols) {
+        bail!(
+            "cannot collect {}: {again} is given twice, first as {first}",
+            args.exchange.name
+        );
+    }
     // Before the output directory, the quality log or the handover socket.
     exchange
         .check_listings(&args.symbols)
@@ -310,6 +318,21 @@ async fn main() -> Result<(), anyhow::Error> {
     ])
 }
 
+/// The first symbol given twice, with its first spelling. Names compare as
+/// the venue reads them: case aside, except Hyperliquid's (`kPEPE` is not
+/// `KPEPE`).
+fn duplicate(exchange: Exchange, symbols: &[String]) -> Option<(&str, &str)> {
+    symbols.iter().enumerate().find_map(|(index, again)| {
+        symbols[..index]
+            .iter()
+            .find(|first| match exchange {
+                Exchange::Hyperliquid => first == &again,
+                _ => first.eq_ignore_ascii_case(again),
+            })
+            .map(|first| (first.as_str(), again.as_str()))
+    })
+}
+
 /// Logs go to the tmux pane. Once tmux is gone every write fails (EIO), and
 /// tracing-subscriber's default `eprintln!` report of that panics on the same
 /// dead terminal, which `panic = "abort"` turns into a mid-shutdown kill.
@@ -351,6 +374,38 @@ mod tests {
             assert_eq!(args.exchange.exchange, exchange);
             assert_eq!(args.connections, NonZeroUsize::MIN);
         }
+    }
+
+    /// A symbol given twice is found, case aside, except on Hyperliquid,
+    /// whose names are case-sensitive.
+    #[test]
+    fn a_symbol_given_twice_is_found() {
+        let symbols = |names: &[&str]| -> Vec<String> {
+            names.iter().map(|name| (*name).to_owned()).collect()
+        };
+        assert_eq!(
+            duplicate(Exchange::Bybit, &symbols(&["btcusdt", "ethusdt"])),
+            None
+        );
+        assert_eq!(
+            duplicate(
+                Exchange::Bybit,
+                &symbols(&["btcusdt", "ethusdt", "BTCUSDT"])
+            ),
+            Some(("btcusdt", "BTCUSDT"))
+        );
+        assert_eq!(
+            duplicate(Exchange::Coinbase, &symbols(&["BTC-USD", "BTC-USD"])),
+            Some(("BTC-USD", "BTC-USD"))
+        );
+        assert_eq!(
+            duplicate(Exchange::Hyperliquid, &symbols(&["kPEPE", "KPEPE"])),
+            None
+        );
+        assert_eq!(
+            duplicate(Exchange::Hyperliquid, &symbols(&["BTC", "ETH", "BTC"])),
+            Some(("BTC", "BTC"))
+        );
     }
 
     #[test]
