@@ -11,8 +11,7 @@
 //! snapshot restarts the recording; until one comes, the request is renewed.
 //! The same handover runs at the top of every hour, so every hour of a daily
 //! file starts from a snapshot. A lone connection leads alone, re-snapshotted
-//! only by its reconnects and its own breaks. A session that replaces the
-//! leader on its own slot takes the book over at its first snapshot.
+//! only by its reconnects and its own breaks.
 
 use std::sync::Arc;
 
@@ -222,22 +221,6 @@ impl Books {
                     id: socket.session,
                     resubscriber,
                 });
-                // A replacement on the leader's own slot takes the book over
-                // at its first snapshot, while the leader keeps recording.
-                for product in 0..self.sources.len() {
-                    if self.leader[product].is_some_and(|leader| {
-                        leader.connection == socket.connection && leader.session < socket.session
-                    }) && self.pending[product].is_none()
-                    {
-                        self.pending[product] = Some(Pending {
-                            socket,
-                            due: now
-                                .checked_add(RESNAPSHOT_TIMEOUT)
-                                .unwrap_or(Timestamp::MAX),
-                        });
-                    }
-                }
-                self.reschedule();
             }
             Lifecycle::Closed { socket } => {
                 if let Some(session) = self.sessions.get_mut(socket.connection)
@@ -682,27 +665,6 @@ mod tests {
             events.try_recv(),
             Ok(QualityEvent::FeedDegraded { detail, .. }) if detail.contains("chain broken")
         ));
-    }
-
-    /// A session replacing the leader on its own slot takes the book over
-    /// at its first snapshot, and the leader records until then: no hole.
-    #[test]
-    fn a_replacement_on_the_leaders_slot_takes_over_without_a_hole() {
-        let (quality, events) = QualityReporter::test_channel();
-        let mut books = books(1, quality);
-        let (old, _c0) = books.open(on(0, 0));
-        assert!(books.snapshot(on(0, 0), "2026-10-05T10:30:00Z"));
-
-        let (_new, _c1) = books.open(on(0, 1));
-        assert!(books.update(on(0, 0), "2026-10-05T10:30:01Z"));
-        assert!(!books.update(on(0, 1), "2026-10-05T10:30:01Z"));
-        assert!(books.snapshot(on(0, 1), "2026-10-05T10:30:02Z"));
-        assert!(!books.update(on(0, 0), "2026-10-05T10:30:03Z"));
-        assert!(books.update(on(0, 1), "2026-10-05T10:30:03Z"));
-
-        drop(old);
-        assert!(books.update(on(0, 1), "2026-10-05T10:30:04Z"));
-        assert!(events.try_recv().is_err(), "a replacement is not a hole");
     }
 
     /// Once replaced, a session is no longer its slot's: its end must not
