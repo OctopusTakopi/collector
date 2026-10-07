@@ -37,7 +37,7 @@ symbol_for() {
             fi
             echo "PF_${coin^^}USD"
             ;;
-        binancespot | binancefutures | bybit) echo "${coin}usdt" ;;
+        binance | binancespot | binancefutures | binancefuturesum | bybit) echo "${coin}usdt" ;;
         *)
             echo "Error: no symbol convention for $exchange." >&2
             exit 1
@@ -58,6 +58,12 @@ if [ ! -x "$COLLECTOR_EXE" ]; then
     echo "Error: $COLLECTOR_EXE is missing or not executable." >&2
     exit 1
 fi
+
+# An exchange without a symbol convention stops the script here, while the
+# running collectors are still left alone.
+for MAP in "${MAPPINGS[@]}"; do
+    symbol_for "${MAP%%:*}" "${COINS[0]}" >/dev/null
+done
 
 # Kill the current session and any this script created under an older name, so
 # a rename cannot leave two collectors writing the same files.
