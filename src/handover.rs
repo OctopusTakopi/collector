@@ -144,6 +144,10 @@ enum Challenge {
 /// handed to a ready challenger, or the handover fails. On shutdown the
 /// incumbent releases the socket at once, so a replacement started right away
 /// takes over instead of waiting for a drain it would outlive.
+///
+/// `claim` runs once this process holds the role, bound afresh or won from
+/// the incumbent; a failure is reported, and collection goes on.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     path: PathBuf,
     identity: Identity,
@@ -152,6 +156,7 @@ pub async fn run(
     takeover_tx: mpsc::Sender<TakeoverRequest>,
     mut shutdown: watch::Receiver<bool>,
     quality: QualityReporter,
+    claim: impl FnOnce() -> anyhow::Result<()> + Send,
 ) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -170,6 +175,18 @@ pub async fn run(
     else {
         return Ok(());
     };
+    if let Err(error) = claim() {
+        tracing::error!(
+            output = %identity.output,
+            error = format!("{error:#}"),
+            "cannot claim the output directory; collecting anyway"
+        );
+        quality.report(QualityEvent::StorageDegraded {
+            at_ns: QualityEvent::now_ns(),
+            target: identity.output.clone(),
+            error: format!("{error:#}"),
+        });
+    }
     server_loop(
         bound,
         &path,
@@ -904,6 +921,7 @@ mod tests {
                 takeover_tx,
                 shutdown_rx,
                 QualityReporter::disabled(),
+                || Ok(()),
             ));
             timeout(Duration::from_secs(2), async {
                 while !path.exists() {
@@ -959,6 +977,7 @@ mod tests {
             takeover_tx,
             shutdown_rx,
             quality,
+            || Ok(()),
         );
         tokio::spawn(async move {
             let _live = (source, takeovers, shutdown);
@@ -1066,6 +1085,7 @@ mod tests {
             takeover_tx,
             shutdown_rx,
             quality,
+            || Ok(()),
         ));
 
         // Acknowledge the challenger, then vanish without unlinking.
@@ -1107,6 +1127,7 @@ mod tests {
             takeover_tx,
             shutdown_rx,
             QualityReporter::disabled(),
+            || unreachable!("a challenger turned away must not claim the directory"),
         )
         .await
         .unwrap_err();
@@ -1114,6 +1135,52 @@ mod tests {
         assert!(error.to_string().contains("rejected"));
         assert!(fixture.takeovers.try_recv().is_err());
         assert!(!fixture.incumbent.is_finished());
+    }
+
+    /// A process that binds the socket holds the role, so it claims the
+    /// directory; a claim that fails is reported, and the incumbent carries
+    /// on.
+    #[tokio::test]
+    async fn a_failed_claim_is_reported_and_the_incumbent_carries_on() {
+        let dir = test_dir("claim");
+        let path = dir.join("collector.sock");
+        let (quality, events) = QualityReporter::test_channel();
+        let (_readiness, ready) = Readiness::new(1);
+        let (takeover_tx, _takeovers) = mpsc::channel(1);
+        let (_shutdown, shutdown_rx) = watch::channel(false);
+        let incumbent = tokio::spawn(run(
+            path.clone(),
+            test_identity(&dir),
+            "old".to_owned(),
+            ready,
+            takeover_tx,
+            shutdown_rx,
+            quality,
+            || Err(anyhow!("read-only file system")),
+        ));
+
+        let reported = timeout(Duration::from_secs(2), async {
+            loop {
+                match events.try_recv() {
+                    Ok(event) => break event,
+                    Err(_) => tokio::task::yield_now().await,
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            matches!(
+                &reported,
+                QualityEvent::StorageDegraded { target, error, .. }
+                    if *target == dir.display().to_string() && error.contains("read-only")
+            ),
+            "{reported:?}"
+        );
+        wait_for_listener(&path).await;
+        assert!(!incumbent.is_finished());
+        incumbent.abort();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A challenger keeps the readiness deadline its first acknowledgement
@@ -1202,6 +1269,7 @@ mod tests {
             takeover_tx,
             shutdown_rx,
             QualityReporter::disabled(),
+            || Ok(()),
         ));
         // Time to connect and be acknowledged; it then waits for readiness.
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1243,6 +1311,7 @@ mod tests {
                     takeover_tx,
                     shutdown_rx,
                     QualityReporter::disabled(),
+                    || Ok(()),
                 ))
             });
             Self {

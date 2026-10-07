@@ -104,10 +104,12 @@ async fn main() -> Result<(), anyhow::Error> {
         );
     }
 
-    std::fs::create_dir_all(&args.path)?;
+    // Refused before anything is created; an unmarked directory is marked
+    // only by its incumbent, once this process is one.
     exchange
-        .claim(std::path::Path::new(&args.path))
+        .check_marker(std::path::Path::new(&args.path))
         .with_context(|| format!("cannot record {} into {}", exchange.as_str(), args.path))?;
+    std::fs::create_dir_all(&args.path)?;
     let run_id = format!(
         "{}-{}",
         jiff::Timestamp::now().as_nanosecond(),
@@ -130,6 +132,14 @@ async fn main() -> Result<(), anyhow::Error> {
         connections: connections.get(),
         output: std::fs::canonicalize(&args.path)?.display().to_string(),
     };
+    let claim = {
+        let dir = PathBuf::from(&args.path);
+        move || {
+            exchange.claim(&dir).with_context(|| {
+                format!("cannot mark {} as {}'s", dir.display(), exchange.as_str())
+            })
+        }
+    };
     let (takeover_tx, mut takeover_rx) = tokio::sync::mpsc::channel(1);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut handover_handle = tokio::spawn(handover::run(
@@ -140,6 +150,7 @@ async fn main() -> Result<(), anyhow::Error> {
         takeover_tx,
         shutdown_rx.clone(),
         quality.clone(),
+        claim,
     ));
     let (writer_tx, mut writer_rx) = channel::<file::WriteRecord>(WRITER_QUEUE_CAPACITY);
     let mut handle = tokio::spawn(exchange.collect(

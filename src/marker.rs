@@ -1,9 +1,9 @@
 //! The file naming a directory's exchange. Every collector writes to a
-//! directory of its own: the first to start there names its exchange in the
-//! marker, and one for another exchange is refused, so two venues, or the
-//! JSON and the SBE collectors, never append to one symbol's file. The tools
-//! read a directory's venue from the marker instead of guessing it from the
-//! path.
+//! directory of its own: the first to hold its handover role names its
+//! exchange in the marker, and one for another exchange is refused, so two
+//! venues, or the JSON and the SBE collectors, never append to one symbol's
+//! file. The tools read a directory's venue from the marker instead of
+//! guessing it from the path.
 
 use std::{
     fs::File,
@@ -22,8 +22,8 @@ pub const MARKER: &str = "_exchange";
 /// What a directory's marker says.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Marked {
-    /// No marker, or an empty one: a claim still being written, or one a
-    /// crash cut short.
+    /// No marker, or an empty one: an older binary's claim still being
+    /// written, or one a crash cut short.
     Unmarked,
     Exchange(Exchange),
     /// An exchange this collector does not record, such as sbe-collector's
@@ -50,28 +50,65 @@ impl Marked {
 }
 
 impl Exchange {
+    /// Refuses `dir` if its marker names anything else. Only reads: an
+    /// unmarked directory is marked by [`Self::claim`], once this process is
+    /// its incumbent.
+    pub fn check_marker(self, dir: &Path) -> io::Result<()> {
+        self.marked_for(dir)?;
+        Ok(())
+    }
+
     /// Marks `dir` as this exchange's, or confirms it already is. Refuses a
     /// directory marked for anything else.
     pub fn claim(self, dir: &Path) -> io::Result<()> {
-        let path = dir.join(MARKER);
-        let mut file = match File::options().write(true).create_new(true).open(&path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                match Marked::read(dir)? {
-                    Marked::Exchange(marked) if marked == self => return Ok(()),
-                    Marked::Exchange(marked) => return Err(refused(dir, marked.as_str(), self)),
-                    Marked::Foreign(name) => return Err(refused(dir, &name, self)),
-                    // Empty: finish the claim. A concurrent one, a handover's
-                    // other process, writes the same line.
-                    Marked::Unmarked => File::options().write(true).truncate(true).open(&path)?,
-                }
-            }
-            Err(error) => return Err(error),
-        };
-        writeln!(file, "{}", self.as_str())?;
-        file.sync_all()?;
+        if self.marked_for(dir)? {
+            return Ok(());
+        }
+        let staged = dir.join(format!(
+            ".{MARKER}.{}.{}",
+            std::process::id(),
+            self.as_str()
+        ));
+        let linked = self.link_staged(dir, &staged);
+        // Gone already where it replaced an empty marker; a leftover only
+        // litters.
+        let _ = std::fs::remove_file(&staged);
+        linked?;
         // Persist the directory entry too.
         File::open(dir)?.sync_all()
+    }
+
+    /// Whether `dir` is marked for this exchange already; an error if it is
+    /// marked for anything else.
+    fn marked_for(self, dir: &Path) -> io::Result<bool> {
+        match Marked::read(dir)? {
+            Marked::Unmarked => Ok(false),
+            Marked::Exchange(marked) if marked == self => Ok(true),
+            Marked::Exchange(marked) => Err(refused(dir, marked.as_str(), self)),
+            Marked::Foreign(name) => Err(refused(dir, &name, self)),
+        }
+    }
+
+    /// Writes the name whole to `staged`, then links it into place as the
+    /// marker: a reader never sees it half written, and of claims racing,
+    /// only one links.
+    fn link_staged(self, dir: &Path, staged: &Path) -> io::Result<()> {
+        let mut file = File::create(staged)?;
+        writeln!(file, "{}", self.as_str())?;
+        file.sync_all()?;
+        let path = dir.join(MARKER);
+        match std::fs::hard_link(staged, &path) {
+            // Claimed meanwhile, or empty: a claim an older binary's crash
+            // cut short, replaced whole.
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                if self.marked_for(dir)? {
+                    Ok(())
+                } else {
+                    std::fs::rename(staged, &path)
+                }
+            }
+            linked => linked,
+        }
     }
 }
 
@@ -113,6 +150,11 @@ mod tests {
             "binancefuturesum\n",
             "the canonical name, whatever alias was typed"
         );
+        let names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, [MARKER], "nothing staged is left behind");
         assert_eq!(
             Marked::read(&dir).unwrap(),
             Marked::Exchange(Exchange::BinanceFuturesUm)
@@ -155,6 +197,60 @@ mod tests {
             "{error}"
         );
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The check up front only reads: it refuses a directory marked for
+    /// another exchange, and leaves an unmarked one, or one not made yet,
+    /// unmarked.
+    #[test]
+    fn the_check_refuses_another_exchange_and_writes_nothing() {
+        let dir = test_dir("check");
+        Exchange::Coinbase.check_marker(&dir).unwrap();
+        Exchange::Coinbase
+            .check_marker(&dir.join("not-yet"))
+            .unwrap();
+        assert_eq!(Marked::read(&dir).unwrap(), Marked::Unmarked);
+        assert!(!dir.join("not-yet").exists());
+
+        Exchange::KrakenSpot.claim(&dir).unwrap();
+        Exchange::KrakenSpot.check_marker(&dir).unwrap();
+        let error = Exchange::Coinbase.check_marker(&dir).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "{} holds krakenspot recordings, not coinbase",
+                dir.display()
+            )
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Two exchanges claiming one directory at once: exactly one wins, and
+    /// the marker it leaves is whole.
+    #[test]
+    fn of_two_exchanges_claiming_at_once_only_one_wins() {
+        for round in 0..10 {
+            let dir = test_dir(&format!("race-{round}"));
+            let barrier = std::sync::Barrier::new(2);
+            let (dir_ref, barrier) = (&dir, &barrier);
+            let won = std::thread::scope(|scope| {
+                [Exchange::KrakenSpot, Exchange::Coinbase]
+                    .map(|exchange| {
+                        scope.spawn(move || {
+                            barrier.wait();
+                            exchange.claim(dir_ref).is_ok()
+                        })
+                    })
+                    .map(|claim| claim.join().unwrap())
+            });
+            let marker = std::fs::read_to_string(dir.join(MARKER)).unwrap();
+            match won {
+                [true, false] => assert_eq!(marker, "krakenspot\n"),
+                [false, true] => assert_eq!(marker, "coinbase\n"),
+                both => panic!("round {round}: {both:?}, marker {marker:?}"),
+            }
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     /// A claim a crash cut short is finished by the next one.
