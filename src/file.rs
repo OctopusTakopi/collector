@@ -666,7 +666,12 @@ impl RotatingFile {
         }
         let file = File::options().create_new(true).write(true).open(&path)?;
         lock_exclusively(&file, &path)?;
-        sync_dir(&path)?;
+        // Created, locked and writable: only its directory entry's durability
+        // is in doubt, which is no reason to stop recording.
+        if let Err(error) = sync_dir(&path) {
+            self.faults
+                .report(&path, &error, "cannot sync the new sidecar's directory");
+        }
         Ok(Sink::Sidecar {
             encoder: ZstdEncoder::new(file, ZSTD_LEVEL)?,
             path,
@@ -2338,6 +2343,37 @@ mod tests {
         challenger.close().unwrap();
         assert_eq!(synced() - before, 3, "the merged sidecar's removal");
         assert_eq!(names(&dir), [DAY_ONE]);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A new sidecar whose directory entry cannot be synced is still created,
+    /// locked and writable: the fault is reported, and recording goes on.
+    #[test]
+    fn a_sidecar_whose_directory_cannot_be_synced_is_written_anyway() {
+        let dir = test_dir("sidecar-sync-dir");
+        let mut incumbent = writer(&dir, "incumbent");
+        put(&mut incumbent, day_one(), br#"{"n":1}"#);
+        let (quality, events) = QualityReporter::test_channel();
+        let mut challenger = Writer::new(&dir, "challenger", quality);
+        fault::arm(fault::Step::SyncDir, 1);
+
+        put(&mut challenger, day_one(), br#"{"n":2}"#);
+        assert!(matches!(
+            challenger.files["btcusdt"].sink,
+            Sink::Sidecar { .. }
+        ));
+        let degraded = events
+            .try_iter()
+            .filter(|event| matches!(event, QualityEvent::StorageDegraded { .. }))
+            .count();
+        assert_eq!(degraded, 1);
+        incumbent.close().unwrap();
+        challenger.close().unwrap_err();
+        assert_eq!(names(&dir), [DAY_ONE]);
+        let text = decoded(dir.join(DAY_ONE));
+        for record in [r#"{"n":1}"#, r#"{"n":2}"#] {
+            assert!(text.contains(record), "{record} missing: {text}");
+        }
         fs::remove_dir_all(&dir).unwrap();
     }
 
