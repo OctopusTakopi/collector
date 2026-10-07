@@ -381,10 +381,10 @@ where
 #[derive(Debug, thiserror::Error)]
 pub enum ConnectError {
     /// The venue answered the upgrade with a client error that no wait cures:
-    /// it refuses the request itself, a stream name or a credential.
+    /// it refuses the request itself, such as a stream name.
     #[error(
-        "the venue refused the connection with HTTP {status} ({reason}): check the symbols, \
-         the streams and any credentials"
+        "the venue refused the connection with HTTP {status} ({reason}): check the symbols \
+         and the streams"
     )]
     Refused { status: u16, reason: String },
     #[error("{0:#}")]
