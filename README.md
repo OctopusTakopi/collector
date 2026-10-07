@@ -46,13 +46,16 @@ What we added on top of the original process:
 * A `_quality_<run-id>.jsonl` next to the data, created at start: frames shed
   under backpressure, feeds degraded (rejected subscriptions, depth gaps),
   storage faults, and the handover's steps.
-* An `_exchange` file naming the directory's exchange, written on first start.
-  A collector for any other exchange, sbe-collector's included, refuses the
-  directory, so two venues never append to one symbol's file.
-* Symbols are checked against the venue's REST listing at startup. One the
-  venue says it does not list stops the process with the venue's answer,
+* An `_exchange` file naming the directory's exchange, written by the first
+  collector to hold the directory's handover role. A collector for any other
+  exchange, sbe-collector's included, is refused before it creates anything,
+  so two venues never append to one symbol's file.
+* Symbols are checked against the venue's REST listing at startup. A symbol
+  given twice, or one the venue says it does not list, stops the process
   before anything is created; a venue that cannot answer is asked again for
-  up to two minutes.
+  up to two minutes, unless it answers 418 or 429: asking again would
+  escalate the ban, and the websocket needs no REST, so the symbols are
+  recorded unchecked.
 * `gap_detector`, which scans a directory tree for recv-time holes and venue
   sequence breaks.
 
@@ -154,8 +157,8 @@ cargo build --release --bin gap_detector
 Open files will be reported as an unterminated zstd stream. That is the writer
 still holding them, not a corrupt record. `bad lines` should be 0. Each
 directory is checked as the exchange its `_exchange` file names, or guessed
-from its path without one; `--exchange` overrides. A directory sbe-collector
-recorded is skipped.
+from its path without one. A directory sbe-collector recorded is skipped.
+`--exchange` decides every directory instead, its marker unread.
 
 ```sh
 zstd -dc /data/raw/binance/spot/btcusdt_20260821.zst | head
