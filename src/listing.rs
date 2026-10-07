@@ -31,10 +31,19 @@ const KRAKEN_SPOT: &str = "https://api.kraken.com/0/public/AssetPairs?pair=";
 const KRAKEN_FUTURES: &str = "https://futures.kraken.com/derivatives/api/v3/instruments";
 
 /// What a venue said of the symbols: the ones it does not list, each with
-/// its reason. An `Err` is no answer at all, worth asking again.
+/// its reason. An `Err` is no answer at all, worth asking again, unless it is
+/// [`Barred`].
 type Answer = anyhow::Result<Vec<String>>;
 
-/// Checks `symbols` against `exchange`'s listings.
+/// The venue turned this IP away, banned or rate-limited: asking again is what
+/// escalates a ban, so it is not asked again.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct Barred(String);
+
+/// Checks `symbols` against `exchange`'s listings. A venue that turns this IP
+/// away leaves them unchecked: the websocket needs no REST, and stopping the
+/// recorder over a REST ban would cost the recording.
 pub(crate) async fn check(exchange: Exchange, symbols: &[String]) -> anyhow::Result<()> {
     // Coinbase answers 400 to a request without one.
     let client = reqwest::Client::builder()
@@ -46,7 +55,18 @@ pub(crate) async fn check(exchange: Exchange, symbols: &[String]) -> anyhow::Res
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(30))
         .build()?;
-    let unlisted = patiently(PATIENCE, || unlisted(&client, exchange, symbols)).await?;
+    let unlisted = match patiently(PATIENCE, || unlisted(&client, exchange, symbols)).await {
+        Ok(unlisted) => unlisted,
+        Err(error) if error.is::<Barred>() => {
+            warn!(
+                exchange = exchange.as_str(),
+                %error,
+                "the venue turned this IP away; recording the symbols unchecked"
+            );
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
     if unlisted.is_empty() {
         Ok(())
     } else {
@@ -66,6 +86,7 @@ where
     loop {
         match ask().await {
             Ok(unlisted) => return Ok(unlisted),
+            Err(error) if error.is::<Barred>() => return Err(error),
             Err(error) if Instant::now() + delay < deadline => {
                 warn!(%error, ?delay, "cannot read the venue's listings; asking again");
                 tokio::time::sleep(delay).await;
@@ -184,9 +205,21 @@ async fn ok(response: reqwest::Response) -> anyhow::Result<Vec<u8>> {
     let url = response.url().clone();
     let body = response.bytes().await?;
     if !status.is_success() {
-        bail!("{url} answered {status}: {}", preview(&body));
+        return Err(no_listing(
+            status.as_u16(),
+            format!("{url} answered {status}: {}", preview(&body)),
+        ));
     }
     Ok(body.to_vec())
+}
+
+/// An answer that is not the listing: [`Barred`] for a 418 or a 429, else
+/// no answer.
+fn no_listing(status: u16, answer: String) -> anyhow::Error {
+    match status {
+        418 | 429 => Barred(answer).into(),
+        _ => anyhow!(answer),
+    }
 }
 
 fn preview(body: &[u8]) -> String {
@@ -200,7 +233,10 @@ fn binance_spot(symbol: &str, status: u16, body: &[u8]) -> Answer {
     match status {
         200..=299 => Ok(Vec::new()),
         400 => Ok(vec![format!("{symbol} ({})", preview(body))]),
-        _ => Err(anyhow!("exchangeInfo answered {status}: {}", preview(body))),
+        _ => Err(no_listing(
+            status,
+            format!("exchangeInfo answered {status}: {}", preview(body)),
+        )),
     }
 }
 
@@ -288,7 +324,10 @@ fn coinbase(product: &str, status: u16, body: &[u8]) -> Answer {
     match status {
         200..=299 => Ok(Vec::new()),
         400 | 404 => Ok(vec![format!("{product} ({})", preview(body))]),
-        _ => Err(anyhow!("products answered {status}: {}", preview(body))),
+        _ => Err(no_listing(
+            status,
+            format!("products answered {status}: {}", preview(body)),
+        )),
     }
 }
 
@@ -488,6 +527,36 @@ mod tests {
         .unwrap();
         assert_eq!(answer, ["FOO (unknown)"]);
         assert_eq!(Instant::now() - start, RETRY_DELAY * (1 + 2 + 4));
+    }
+
+    /// A 418 or a 429 turns this IP away, which asking again escalates: it
+    /// ends the asking at once. Any other failure is no answer.
+    #[tokio::test(start_paused = true)]
+    async fn a_venue_that_turns_this_ip_away_is_not_asked_again() {
+        for status in [418, 429] {
+            let refusal = br#"{"code":-1003,"msg":"Way too much request weight used"}"#;
+            let error = binance_spot("BTCUSDT", status, refusal).unwrap_err();
+            assert!(error.is::<Barred>(), "{status}: {error}");
+            assert!(coinbase("BTC-USD", status, b"").unwrap_err().is::<Barred>());
+            assert!(no_listing(status, String::new()).is::<Barred>());
+        }
+        for status in [403, 500, 502, 503] {
+            assert!(
+                !no_listing(status, String::new()).is::<Barred>(),
+                "{status}"
+            );
+        }
+
+        let mut attempts = 0;
+        let start = Instant::now();
+        let error = patiently(PATIENCE, || {
+            attempts += 1;
+            async { Err(no_listing(418, "exchangeInfo answered 418".to_owned())) }
+        })
+        .await
+        .unwrap_err();
+        assert!(error.is::<Barred>(), "{error:#}");
+        assert_eq!((attempts, Instant::now() - start), (1, Duration::ZERO));
     }
 
     #[tokio::test(start_paused = true)]
