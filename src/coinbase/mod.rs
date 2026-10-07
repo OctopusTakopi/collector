@@ -78,10 +78,10 @@ impl Consumer for Coinbase {
                 self.books
                     .admit(frame.socket, product, kind == "snapshot", frame.recv_time)
             }
-            _ => match routing::coinbase_sequence_key(&route) {
-                Some(key) => !self.recorder.dedup.is_duplicate_by(|| key),
-                None => !self.recorder.dedup.is_duplicate(&frame.data),
-            },
+            _ => !self.recorder.dedup.is_duplicate_by(|| {
+                routing::coinbase_sequence_key(&route)
+                    .unwrap_or_else(|| xxhash_rust::xxh3::xxh3_128(&frame.data))
+            }),
         };
         if !keep {
             return Ok(());
